@@ -1,16 +1,18 @@
 """Worker: the consumer side. Pulls jobs and runs a processor over them.
 
 Reliability model (this is the core — see DESIGN.md):
-  * A blocking BLMOVE atomically moves a job id from `wait` to `active`, so a
-    job is never lost in the gap between "pop" and "start working".
-  * On pickup the worker locks the job: `<id>:lock = <token> PX lockDuration`.
-    Only the token owner can renew or finish it. A per-job renewer extends the
-    lock every lockDuration/2.
-  * If a worker dies, its lock expires; a background mark-and-sweep moves the
-    job back to `wait` (or to `failed` after maxStalledCount). This gives an
-    at-least-once guarantee: a handler may run more than once, but the
-    token-guarded finish scripts ensure a result is committed exactly once.
-  * A background task promotes due delayed jobs into `wait`.
+  * A blocking BLMOVE wakes the worker and moves a job id from `wait` to
+    `active`. `MOVE_TO_ACTIVE` then locks + loads it.
+  * Job acquisition (lock + load) funnels through ONE Lua routine, shared by the
+    blocking path and by fetch-next. That routine is the seed of a future
+    `moveToActive`: to add priorities/markers we change only which job it picks.
+  * Fetch-next: the finish scripts commit the current job AND acquire the next
+    one in the same round trip, so a busy worker loops without going back to the
+    blocking pop. It only re-blocks when the queue drains.
+  * On pickup the worker locks the job (`<id>:lock = <token> PX lockDuration`)
+    and a renewer extends it. If a worker dies, its lock expires and a background
+    mark-and-sweep recovers the job. Token-guarded finishes guarantee a result
+    is committed exactly once even though a handler may run more than once.
 """
 from __future__ import annotations
 
@@ -32,6 +34,14 @@ Processor = Callable[[Job], Awaitable[Any]]
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _pairs(flat: list | None) -> dict:
+    """Turn a flat HGETALL array [k, v, k, v, ...] into a dict."""
+    if not flat:
+        return {}
+    it = iter(flat)
+    return dict(zip(it, it, strict=False))
 
 
 class Worker:
@@ -69,7 +79,7 @@ class Worker:
         self._running = False
         self._tasks: list[asyncio.Task] = []
 
-        self._lock_job = self.redis.register_script(scripts.LOCK_JOB)
+        self._move_to_active = self.redis.register_script(scripts.MOVE_TO_ACTIVE)
         self._extend_lock = self.redis.register_script(scripts.EXTEND_LOCK)
         self._move_to_completed = self.redis.register_script(scripts.MOVE_TO_COMPLETED)
         self._move_to_failed = self.redis.register_script(scripts.MOVE_TO_FAILED)
@@ -106,6 +116,123 @@ class Worker:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.redis.aclose()
+
+    # ---- the hot path -----------------------------------------------------
+
+    async def _process_loop(self) -> None:
+        while self._running:
+            try:
+                job_id = await self.redis.blmove(
+                    self.keys.wait, self.keys.active, self.block_timeout, "RIGHT", "LEFT"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(0.1)
+                continue
+            if job_id is None:
+                continue
+            loaded = await self._acquire(str(job_id))
+            # Keep processing as long as each finish hands us the next job.
+            while loaded is not None and self._running:
+                loaded = await self._handle(loaded)
+
+    async def _acquire(self, job_id: str) -> tuple[str, dict] | None:
+        """Lock + load a job already on `active` (the blocking-wakeup path)."""
+        res = await self._move_to_active(
+            keys=[self.keys.stalled, self.keys.base],
+            args=[job_id, self.token, self.lock_duration, _now_ms()],
+        )
+        return self._loaded(res)
+
+    def _loaded(self, res) -> tuple[str, dict] | None:
+        if not res:
+            return None
+        fields = _pairs(res[0])
+        if not fields:
+            return None
+        return (res[1], fields)
+
+    async def _handle(self, loaded: tuple[str, dict]) -> tuple[str, dict] | None:
+        job_id, fields = loaded
+        job = Job.from_hash(job_id, fields)
+        renewer = (
+            asyncio.create_task(self._renew_loop(job_id)) if self.renew_locks else None
+        )
+        try:
+            result = await self.processor(job)
+        except Exception as exc:
+            nxt = await self._finish_failed(job, exc)
+        else:
+            nxt = await self._finish_completed(job, result)
+        finally:
+            if renewer is not None:
+                renewer.cancel()
+        return nxt
+
+    async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict] | None:
+        res = await self._move_to_completed(
+            keys=[
+                self.keys.active, self.keys.completed, self.keys.job(job.id),
+                self.keys.lock(job.id), self.keys.wait, self.keys.stalled, self.keys.base,
+            ],
+            args=[
+                job.id, json.dumps(result), _now_ms(), self.token,
+                self._fetch_flag(), self.lock_duration,
+            ],
+        )
+        if isinstance(res, int):  # -2 lock lost / -3 not active
+            self._emit("lock-lost", job.id)
+            return None
+        job.returnvalue = result
+        self._emit("completed", job, result)
+        return self._next_from(res)
+
+    async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict] | None:
+        res = await self._move_to_failed(
+            keys=[
+                self.keys.active, self.keys.wait, self.keys.delayed, self.keys.failed,
+                self.keys.job(job.id), self.keys.lock(job.id), self.keys.stalled, self.keys.base,
+            ],
+            args=[
+                job.id, str(exc), _now_ms(), job.attempts_made, job.opts.attempts,
+                self._backoff_delay(job), self.token, self._fetch_flag(), self.lock_duration,
+            ],
+        )
+        if isinstance(res, int):  # -2 lock lost / -3 not active
+            self._emit("lock-lost", job.id)
+            return None
+        job.failed_reason = str(exc)
+        self._emit("failed" if res[0] == 1 else "retrying", job, exc)
+        return self._next_from(res)
+
+    def _fetch_flag(self) -> str:
+        # Don't fetch a next job while shutting down — let the queue drain cleanly.
+        return "1" if self._running else "0"
+
+    def _next_from(self, res) -> tuple[str, dict] | None:
+        if isinstance(res, (list, tuple)) and len(res) >= 3:
+            return (res[2], _pairs(res[1]))
+        return None
+
+    # ---- locks & recovery -------------------------------------------------
+
+    async def _renew_loop(self, job_id: str) -> None:
+        interval = self.lock_renew_time / 1000
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                ok = await self._extend_lock(
+                    keys=[self.keys.lock(job_id), self.keys.stalled],
+                    args=[self.token, self.lock_duration, job_id],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover
+                ok = 0
+            if not ok:
+                self._emit("lock-lost", job_id)
+                return
 
     async def _promote_loop(self) -> None:
         while self._running:
@@ -152,99 +279,6 @@ class Worker:
         failed = list(res[0]) if res else []
         recovered = list(res[1]) if res and len(res) > 1 else []
         return failed, recovered
-
-    async def _process_loop(self) -> None:
-        while self._running:
-            try:
-                job_id = await self.redis.blmove(
-                    self.keys.wait, self.keys.active, self.block_timeout, "RIGHT", "LEFT"
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await asyncio.sleep(0.1)
-                continue
-            if job_id is None:
-                continue
-            await self._handle(str(job_id))
-
-    async def _handle(self, job_id: str) -> None:
-        # Lock the job to this worker the instant after the blocking pop.
-        attempts_made = await self._lock_job(
-            keys=[self.keys.job(job_id), self.keys.lock(job_id), self.keys.stalled],
-            args=[self.token, self.lock_duration, _now_ms(), job_id],
-        )
-
-        h = await self.redis.hgetall(self.keys.job(job_id))
-        job = Job.from_hash(job_id, h)
-        job.attempts_made = attempts_made
-
-        # Keep the lock alive while the handler runs.
-        renewer = (
-            asyncio.create_task(self._renew_loop(job_id)) if self.renew_locks else None
-        )
-        try:
-            result = await self.processor(job)
-        except Exception as exc:
-            await self._finish_failed(job, exc)
-        else:
-            await self._finish_completed(job, result)
-        finally:
-            if renewer is not None:
-                renewer.cancel()
-
-    async def _renew_loop(self, job_id: str) -> None:
-        interval = self.lock_renew_time / 1000
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                ok = await self._extend_lock(
-                    keys=[self.keys.lock(job_id), self.keys.stalled],
-                    args=[self.token, self.lock_duration, job_id],
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover
-                ok = 0
-            if not ok:
-                # Lock lost: another worker now owns this job. Our eventual
-                # finish will be rejected by the token guard.
-                self._emit("lock-lost", job_id)
-                return
-
-    async def _finish_completed(self, job: Job, result: Any) -> None:
-        res = await self._move_to_completed(
-            keys=[
-                self.keys.active, self.keys.completed,
-                self.keys.job(job.id), self.keys.lock(job.id),
-            ],
-            args=[job.id, json.dumps(result), _now_ms(), self.token],
-        )
-        if res == 1:
-            job.returnvalue = result
-            self._emit("completed", job, result)
-        else:
-            self._emit("lock-lost", job.id)  # taken over; do not double-commit
-
-    async def _finish_failed(self, job: Job, exc: Exception) -> None:
-        backoff_ms = self._backoff_delay(job)
-        res = await self._move_to_failed(
-            keys=[
-                self.keys.active, self.keys.wait, self.keys.delayed,
-                self.keys.failed, self.keys.job(job.id), self.keys.lock(job.id),
-            ],
-            args=[
-                job.id, str(exc), _now_ms(),
-                job.attempts_made, job.opts.attempts, backoff_ms, self.token,
-            ],
-        )
-        job.failed_reason = str(exc)
-        if res == 1:
-            self._emit("failed", job, exc)
-        elif res == 0:
-            self._emit("retrying", job, exc)
-        else:
-            self._emit("lock-lost", job.id)  # taken over; do not double-commit
 
     def _backoff_delay(self, job: Job) -> int:
         """Translate the job's backoff option into a delay in ms for the next try."""

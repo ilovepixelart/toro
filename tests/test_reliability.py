@@ -75,9 +75,9 @@ async def test_live_lock_is_not_recovered(q):
     w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
     await q.redis.lrem(q.keys.wait, 0, jid)
     await q.redis.rpush(q.keys.active, jid)
-    await w._lock_job(
-        keys=[q.keys.job(jid), q.keys.lock(jid), q.keys.stalled],
-        args=[w.token, 30000, _now_ms(), jid],
+    await w._move_to_active(
+        keys=[q.keys.stalled, q.keys.base],
+        args=[jid, w.token, 30000, _now_ms()],
     )
     await w.check_stalled(throttle_ms=0)  # mark
     failed, recovered = await w.check_stalled(throttle_ms=0)  # lock alive -> skip
@@ -92,20 +92,68 @@ async def test_lost_lock_cannot_commit(q):
     w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
     await q.redis.lrem(q.keys.wait, 0, jid)
     await q.redis.rpush(q.keys.active, jid)
-    await w._lock_job(
-        keys=[q.keys.job(jid), q.keys.lock(jid), q.keys.stalled],
-        args=[w.token, 30000, _now_ms(), jid],
+    await w._move_to_active(
+        keys=[q.keys.stalled, q.keys.base],
+        args=[jid, w.token, 30000, _now_ms()],
     )
     # Someone else steals the lock.
     await q.redis.set(q.keys.lock(jid), "another-worker-token")
 
     res = await w._move_to_completed(
-        keys=[q.keys.active, q.keys.completed, q.keys.job(jid), q.keys.lock(jid)],
-        args=[jid, "{}", _now_ms(), w.token],
+        keys=[
+            q.keys.active, q.keys.completed, q.keys.job(jid), q.keys.lock(jid),
+            q.keys.wait, q.keys.stalled, q.keys.base,
+        ],
+        args=[jid, "{}", _now_ms(), w.token, "0", 30000],
     )
     assert res == -2  # lock lost
     assert await q.redis.zcard(q.keys.completed) == 0
     assert jid in await q.redis.lrange(q.keys.active, 0, -1)  # nothing committed
+
+
+async def test_fetch_next_in_finish(q):
+    """Completing a job with fetch=1 commits it AND hands back the next waiting
+    job, already moved to active and locked to us — no extra round trip."""
+    cur = await q.add("cur", {})
+    nxt = await q.add("nxt", {})
+    w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
+
+    await q.redis.lrem(q.keys.wait, 0, cur.id)
+    await q.redis.rpush(q.keys.active, cur.id)
+    await w._move_to_active(
+        keys=[q.keys.stalled, q.keys.base],
+        args=[cur.id, w.token, 30000, _now_ms()],
+    )
+    res = await w._move_to_completed(
+        keys=[
+            q.keys.active, q.keys.completed, q.keys.job(cur.id), q.keys.lock(cur.id),
+            q.keys.wait, q.keys.stalled, q.keys.base,
+        ],
+        args=[cur.id, "{}", _now_ms(), w.token, "1", 30000],
+    )
+    assert isinstance(res, list) and res[0] == 1
+    assert len(res) == 3 and res[2] == nxt.id          # next handed back
+    assert nxt.id in await q.redis.lrange(q.keys.active, 0, -1)
+    assert await q.redis.get(q.keys.lock(nxt.id)) == w.token   # locked to us
+    assert cur.id not in await q.redis.lrange(q.keys.active, 0, -1)
+    assert await q.redis.zscore(q.keys.completed, cur.id) is not None
+
+
+async def test_drains_many_via_fetch_next(q):
+    """A single worker drains a backlog by looping through fetch-next."""
+    n = 50
+    for i in range(n):
+        await q.add("j", {"i": i})
+    w = Worker(QUEUE, _noop, prefix=PREFIX, concurrency=1)
+    t = asyncio.create_task(w.run())
+    for _ in range(100):
+        if await q.redis.zcard(q.keys.completed) >= n:
+            break
+        await asyncio.sleep(0.05)
+    assert await q.redis.zcard(q.keys.completed) == n
+    assert await q.redis.llen(q.keys.active) == 0
+    await w.stop()
+    t.cancel()
 
 
 async def test_zombie_worker_recovered_and_completed_once(q):

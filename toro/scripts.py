@@ -31,19 +31,35 @@ end
 return jobId
 """
 
-# Acquire a job that the worker has just blocking-popped onto `active`.
-# Sets the lock to our token, stamps processedOn, bumps attemptsMade, and clears
-# any stale `stalled` membership. Done in one script so a job is never "active
-# but unlocked" from the worker's point of view for longer than necessary.
-# KEYS[1] = job hash   KEYS[2] = lock key   KEYS[3] = stalled set
-# ARGV[1] = token  ARGV[2] = lockDuration(ms)  ARGV[3] = now(ms)  ARGV[4] = jobId
-# Returns the new attemptsMade.
-LOCK_JOB = """
-redis.call("SET", KEYS[2], ARGV[1], "PX", tonumber(ARGV[2]))
-redis.call("SREM", KEYS[3], ARGV[4])
-local attemptsMade = redis.call("HINCRBY", KEYS[1], "attemptsMade", 1)
-redis.call("HSET", KEYS[1], "processedOn", ARGV[3], "state", "active")
-return attemptsMade
+# Shared job-acquisition routine. ALL paths that take ownership of a job funnel
+# through here, so there is exactly one place that defines "claim + lock + load":
+#   * lockAndLoad — lock a job already on `active` (the blocking-wakeup path)
+#   * acquireNext — pop the next waiting job, then lockAndLoad it (fetch-next)
+# This is the seed of a the reference engine-style `moveToActive`: today acquireNext just
+# RPOPLPUSHes from `wait`; to add priorities/markers later we only change *which*
+# job acquireNext picks — lockAndLoad and every caller stay untouched.
+_ACQUIRE = """
+local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
+  local jobKey = base .. jobId
+  redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
+  redis.call("SREM", stalledKey, jobId)
+  redis.call("HINCRBY", jobKey, "attemptsMade", 1)
+  redis.call("HSET", jobKey, "processedOn", now, "state", "active")
+  return {redis.call("HGETALL", jobKey), jobId}
+end
+local function acquireNext(waitKey, activeKey, stalledKey, base, token, lockMs, now)
+  local jobId = redis.call("RPOPLPUSH", waitKey, activeKey)
+  if not jobId then return false end
+  return lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
+end
+"""
+
+# Lock + load a job already moved onto `active` by the blocking wakeup.
+# KEYS[1] = stalled set   KEYS[2] = key base (job hash = base .. id)
+# ARGV[1] = jobId  ARGV[2] = token  ARGV[3] = lockDuration(ms)  ARGV[4] = now(ms)
+# Returns {jobHash, jobId} (jobHash is a flat [field, value, ...] array).
+MOVE_TO_ACTIVE = _ACQUIRE + """
+return lockAndLoad(ARGV[1], KEYS[1], KEYS[2], ARGV[2], tonumber(ARGV[3]), ARGV[4])
 """
 
 # Renew a lock we still own. Token-guarded: we can NEVER renew a lock another
@@ -61,15 +77,19 @@ end
 return 0
 """
 
-# Move a finished job out of `active` into `completed`.
+# Commit a completed job, then (when fetch=1) acquire the next waiting job in the
+# SAME round trip — the the reference engine-style "finish hands you the next job".
 # Token-guarded: if we no longer own the lock (a stalled sweep handed the job to
 # another worker) we commit NOTHING and report it, so a result can't be written
 # twice. This is what makes "at-least-once handler runs" still mean
 # "exactly-once result commit".
-# KEYS[1] = active list  KEYS[2] = completed zset  KEYS[3] = job hash  KEYS[4] = lock key
-# ARGV[1] = jobId  ARGV[2] = returnvalue(json)  ARGV[3] = now(ms)  ARGV[4] = token
-# Returns 1 on success, -2 if the lock was lost, -3 if the job was not active.
-MOVE_TO_COMPLETED = """
+# KEYS[1] active  KEYS[2] completed  KEYS[3] job hash  KEYS[4] lock
+# KEYS[5] wait  KEYS[6] stalled  KEYS[7] key base
+# ARGV[1] jobId  ARGV[2] returnvalue(json)  ARGV[3] now(ms)  ARGV[4] token
+# ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)
+# Returns -2 lock lost, -3 not active, {1} committed,
+#         {1, nextHash, nextId} committed + next job acquired (already locked).
+MOVE_TO_COMPLETED = _ACQUIRE + """
 if redis.call("GET", KEYS[4]) ~= ARGV[4] then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
@@ -78,25 +98,30 @@ redis.call("HSET", KEYS[3],
   "returnvalue", ARGV[2],
   "finishedOn", ARGV[3],
   "state", "completed")
-return 1
+if ARGV[5] == "1" then
+  local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], ARGV[4], tonumber(ARGV[6]), ARGV[3])
+  if nxt then return {1, nxt[1], nxt[2]} end
+end
+return {1}
 """
 
-# Decide a failed job's fate: retry (wait/delayed) or move to `failed`.
-# Token-guarded like MOVE_TO_COMPLETED: a worker that lost its lock can't push
-# the job to retry/failed on top of whoever took it over.
-# KEYS[1] = active  KEYS[2] = wait  KEYS[3] = delayed  KEYS[4] = failed
-# KEYS[5] = job hash  KEYS[6] = lock key
-# ARGV[1] = jobId  ARGV[2] = failedReason  ARGV[3] = now(ms)
-# ARGV[4] = attemptsMade  ARGV[5] = maxAttempts  ARGV[6] = backoff(ms)  ARGV[7] = token
-# Returns 1 if permanently failed, 0 if scheduled for retry,
-#         -2 if the lock was lost, -3 if the job was not active.
-MOVE_TO_FAILED = """
+# Decide a failed job's fate (retry vs `failed`), then fetch-next like the
+# completed script. Token-guarded the same way.
+# KEYS[1] active  KEYS[2] wait  KEYS[3] delayed  KEYS[4] failed
+# KEYS[5] job hash  KEYS[6] lock  KEYS[7] stalled  KEYS[8] key base
+# ARGV[1] jobId  ARGV[2] failedReason  ARGV[3] now(ms)  ARGV[4] attemptsMade
+# ARGV[5] maxAttempts  ARGV[6] backoff(ms)  ARGV[7] token  ARGV[8] fetch(1/0)
+# ARGV[9] lockDuration(ms)
+# Returns -2 lock lost, -3 not active, else {outcome} or {outcome, nextHash, nextId}
+#   outcome: 1 permanently failed, 0 scheduled for retry.
+MOVE_TO_FAILED = _ACQUIRE + """
 if redis.call("GET", KEYS[6]) ~= ARGV[7] then return -2 end
 redis.call("DEL", KEYS[6])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local attemptsMade = tonumber(ARGV[4])
 local maxAttempts = tonumber(ARGV[5])
 redis.call("HSET", KEYS[5], "failedReason", ARGV[2], "attemptsMade", attemptsMade)
+local outcome
 if attemptsMade < maxAttempts then
   local backoff = tonumber(ARGV[6])
   if backoff > 0 then
@@ -106,11 +131,17 @@ if attemptsMade < maxAttempts then
     redis.call("HSET", KEYS[5], "state", "wait")
     redis.call("LPUSH", KEYS[2], ARGV[1])
   end
-  return 0
+  outcome = 0
+else
+  redis.call("ZADD", KEYS[4], tonumber(ARGV[3]), ARGV[1])
+  redis.call("HSET", KEYS[5], "finishedOn", ARGV[3], "state", "failed")
+  outcome = 1
 end
-redis.call("ZADD", KEYS[4], tonumber(ARGV[3]), ARGV[1])
-redis.call("HSET", KEYS[5], "finishedOn", ARGV[3], "state", "failed")
-return 1
+if ARGV[8] == "1" then
+  local nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], ARGV[7], tonumber(ARGV[9]), ARGV[3])
+  if nxt then return {outcome, nxt[1], nxt[2]} end
+end
+return {outcome}
 """
 
 # Re-queue a failed job for another attempt (admin/dashboard action).

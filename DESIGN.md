@@ -67,11 +67,22 @@ jobs to `wait`.
 wasteful). Upgrade path: single `asyncio` timer re-armed via a pub/sub
 subscriber. Also adopt the packed score for correct same-ms ordering.
 
-### 5. Fetch-next-in-finish
-The finish script can pop + lock the next job in the same round-trip, saving a
-hop — skipped when paused/closing/rate-limited.
+### 5. Fetch-next-in-finish  ✅ done
+The finish script commits the current job and pops + locks the next one in the
+same round trip — skipped when shutting down (fetch flag), so the queue drains
+cleanly.
 
-→ **toro:** optimization for later; correctness doesn't depend on it.
+→ **toro:** implemented. All job acquisition funnels through one shared Lua
+routine (`lockAndLoad` / `acquireNext` in `scripts.py`), used by both the
+blocking-wakeup path (`MOVE_TO_ACTIVE`) and the fetch-next tail of
+`MOVE_TO_COMPLETED` / `MOVE_TO_FAILED`. This routine is the seed of a future
+`moveToActive`: to add priorities/markers we change only *which* job
+`acquireNext` picks — `lockAndLoad` and every caller stay untouched.
+
+**Measured:** process throughput went ~6,080 → ~13,900 jobs/s (~2.3×) at
+concurrency 20. Notably cmds/job barely changed (13 → 12) — the win is fewer
+*round trips* (the old `BLMOVE` + `MOVE_TO_ACTIVE` + `HGETALL` per job collapse
+into the finish call), not less server work.
 
 ## Higher-level features (roadmap)
 - **Priorities:** a `priority` ZSET + insert-time `LINSERT` into `wait`. Consume
