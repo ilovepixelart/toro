@@ -11,9 +11,13 @@ class JobOptions:
     delay: int = 0            # ms to wait before the job becomes processable
     attempts: int = 1         # total tries before the job is considered failed
     backoff: Any = None       # int ms, or {"type": "fixed"|"exponential", "delay": ms}
+    priority: int = 0         # higher = more urgent (global order); 0 = default, FIFO
 
     def to_dict(self) -> dict:
-        return {"delay": self.delay, "attempts": self.attempts, "backoff": self.backoff}
+        return {
+            "delay": self.delay, "attempts": self.attempts,
+            "backoff": self.backoff, "priority": self.priority,
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> JobOptions:
@@ -21,6 +25,7 @@ class JobOptions:
             delay=d.get("delay", 0),
             attempts=d.get("attempts", 1),
             backoff=d.get("backoff"),
+            priority=d.get("priority", 0),
         )
 
 

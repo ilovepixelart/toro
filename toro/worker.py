@@ -122,26 +122,28 @@ class Worker:
     async def _process_loop(self) -> None:
         while self._running:
             try:
-                job_id = await self.redis.blmove(
-                    self.keys.wait, self.keys.active, self.block_timeout, "RIGHT", "LEFT"
-                )
+                # The marker only wakes us; the real claim is the atomic
+                # MOVE_TO_ACTIVE below. A timeout (None) is fine — we still try
+                # to acquire, so a missed marker can never strand a job.
+                await self.redis.bzpopmin(self.keys.marker, self.block_timeout)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 await asyncio.sleep(0.1)
                 continue
-            if job_id is None:
-                continue
-            loaded = await self._acquire(str(job_id))
+            loaded = await self._acquire()
             # Keep processing as long as each finish hands us the next job.
             while loaded is not None and self._running:
                 loaded = await self._handle(loaded)
 
-    async def _acquire(self, job_id: str) -> tuple[str, dict] | None:
-        """Lock + load a job already on `active` (the blocking-wakeup path)."""
+    async def _acquire(self) -> tuple[str, dict] | None:
+        """Pop the highest-priority job into `active`, lock + load it."""
         res = await self._move_to_active(
-            keys=[self.keys.stalled, self.keys.base],
-            args=[job_id, self.token, self.lock_duration, _now_ms()],
+            keys=[
+                self.keys.prioritized, self.keys.active, self.keys.marker,
+                self.keys.stalled, self.keys.base, self.keys.pc,
+            ],
+            args=[self.token, self.lock_duration, _now_ms()],
         )
         return self._loaded(res)
 
@@ -174,7 +176,8 @@ class Worker:
         res = await self._move_to_completed(
             keys=[
                 self.keys.active, self.keys.completed, self.keys.job(job.id),
-                self.keys.lock(job.id), self.keys.wait, self.keys.stalled, self.keys.base,
+                self.keys.lock(job.id), self.keys.prioritized, self.keys.marker,
+                self.keys.stalled, self.keys.base, self.keys.pc,
             ],
             args=[
                 job.id, json.dumps(result), _now_ms(), self.token,
@@ -191,8 +194,9 @@ class Worker:
     async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict] | None:
         res = await self._move_to_failed(
             keys=[
-                self.keys.active, self.keys.wait, self.keys.delayed, self.keys.failed,
-                self.keys.job(job.id), self.keys.lock(job.id), self.keys.stalled, self.keys.base,
+                self.keys.active, self.keys.prioritized, self.keys.delayed, self.keys.failed,
+                self.keys.job(job.id), self.keys.lock(job.id), self.keys.marker,
+                self.keys.stalled, self.keys.base, self.keys.pc,
             ],
             args=[
                 job.id, str(exc), _now_ms(), job.attempts_made, job.opts.attempts,
@@ -238,7 +242,10 @@ class Worker:
         while self._running:
             try:
                 await self._promote_delayed(
-                    keys=[self.keys.delayed, self.keys.wait, self.keys.base],
+                    keys=[
+                        self.keys.delayed, self.keys.prioritized, self.keys.marker,
+                        self.keys.base, self.keys.pc,
+                    ],
                     args=[_now_ms()],
                 )
             except asyncio.CancelledError:
@@ -271,8 +278,9 @@ class Worker:
         throttle = self.stalled_interval if throttle_ms is None else throttle_ms
         res = await self._move_stalled(
             keys=[
-                self.keys.stalled, self.keys.active, self.keys.wait,
+                self.keys.stalled, self.keys.active, self.keys.prioritized,
                 self.keys.failed, self.keys.stalled_check, self.keys.base,
+                self.keys.marker, self.keys.pc,
             ],
             args=[self.max_stalled_count, _now_ms(), throttle],
         )

@@ -85,8 +85,16 @@ concurrency 20. Notably cmds/job barely changed (13 → 12) — the win is fewer
 into the finish call), not less server work.
 
 ## Higher-level features (roadmap)
-- **Priorities:** a `priority` ZSET + insert-time `LINSERT` into `wait`. Consume
-  stays a uniform blocking pop. O(N) insert, O(1) pop.
+- **Priorities:** ✅ done — and we deliberately *diverge* from the common approach. The usual design
+  inserts into `wait` with `LINSERT` (O(N)) and keeps a separate `wait`
+  fast-lane that strictly beats `prioritized` (priority-0 jobs can starve
+  prioritized ones). toro instead puts **every** job in one `prioritized` ZSET
+  scored `(PRIORITY_OFFSET - priority) * 2^32 + seq` — a single GLOBAL order,
+  higher priority = more urgent, FIFO within a level, no fast lane. Because a
+  single ZSET can't be `BLMOVE`'d, this brings in the base marker: producers
+  `ZADD marker 0 "0"` (idempotent), idle workers `BZPOPMIN marker`, and the
+  atomic `MOVE_TO_ACTIVE` does `ZPOPMIN prioritized` → active → lock. The 1s
+  delay poll still promotes delayed → prioritized (delay-marker is future work).
 - **Repeatable/cron:** a `repeat` ZSET of schedule entries; each occurrence
   schedules its successor as a *delayed* job with a deterministic id. Port with
   `croniter`.

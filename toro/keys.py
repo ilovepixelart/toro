@@ -17,8 +17,19 @@ class Keys:
         return f"{self.base}id"
 
     @property
-    def wait(self) -> str:
-        return f"{self.base}wait"
+    def prioritized(self) -> str:
+        # The single global-priority-ordered store of waiting jobs.
+        return f"{self.base}prioritized"
+
+    @property
+    def marker(self) -> str:
+        # Wakeup signal: idle workers BZPOPMIN here; producers ZADD an idempotent base marker.
+        return f"{self.base}marker"
+
+    @property
+    def pc(self) -> str:
+        # Priority sequence counter — breaks priority ties in FIFO order.
+        return f"{self.base}pc"
 
     @property
     def active(self) -> str:

@@ -16,6 +16,10 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _clamp_priority(p: int) -> int:
+    return max(0, min(int(p), scripts.PRIORITY_OFFSET))
+
+
 class Queue:
     def __init__(
         self,
@@ -32,22 +36,23 @@ class Queue:
         self._retry_job = self.redis.register_script(scripts.RETRY_JOB)
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
 
-    # States backed by a Redis LIST vs a ZSET — affects how we page through them.
-    _LIST_STATES = {"wait", "active"}
-    _ZSET_STATES = {"delayed", "completed", "failed"}
-
     async def add(self, name: str, data: Any = None, **opts: Any) -> Job:
-        """Enqueue a job. Returns the created Job (with its server-assigned id)."""
+        """Enqueue a job. Returns the created Job (with its server-assigned id).
+
+        `priority`: higher = more urgent (global order across the whole queue);
+        the default 0 is the least-urgent band, processed FIFO among itself.
+        """
         options = JobOptions(**opts)
+        options.priority = _clamp_priority(options.priority)
         now = _now_ms()
         job_id = await self._add_job(
-            keys=[self.keys.id, self.keys.wait, self.keys.delayed, self.keys.base],
+            keys=[
+                self.keys.id, self.keys.prioritized, self.keys.marker,
+                self.keys.delayed, self.keys.base, self.keys.pc,
+            ],
             args=[
-                name,
-                json.dumps(data),
-                json.dumps(options.to_dict()),
-                now,
-                options.delay,
+                name, json.dumps(data), json.dumps(options.to_dict()),
+                now, options.delay, options.priority,
             ],
         )
         job_id = str(job_id)
@@ -61,9 +66,10 @@ class Queue:
         return Job.from_hash(job_id, h)
 
     async def counts(self) -> dict[str, int]:
-        """Quick snapshot of how many jobs sit in each state."""
+        """Quick snapshot of how many jobs sit in each state. `wait` = waiting
+        jobs in the prioritized set."""
         pipe = self.redis.pipeline()
-        pipe.llen(self.keys.wait)
+        pipe.zcard(self.keys.prioritized)
         pipe.llen(self.keys.active)
         pipe.zcard(self.keys.delayed)
         pipe.zcard(self.keys.completed)
@@ -75,19 +81,18 @@ class Queue:
         }
 
     async def get_jobs(self, state: str, start: int = 0, end: int = 20) -> list[Job]:
-        """Page through job ids in a given state and hydrate them into Jobs."""
-        key = getattr(self.keys, state, None)
-        if key is None:
-            raise ValueError(f"unknown state: {state}")
-        if state in self._LIST_STATES:
-            ids = await self.redis.lrange(key, start, end)
+        """Page through job ids in a given state and hydrate them into Jobs.
+        `wait` returns jobs in global priority order (most urgent first)."""
+        if state in ("wait", "prioritized"):
+            ids = await self.redis.zrange(self.keys.prioritized, start, end)
+        elif state == "active":
+            ids = await self.redis.lrange(self.keys.active, start, end)
+        elif state == "delayed":
+            ids = await self.redis.zrange(self.keys.delayed, start, end)
+        elif state in ("completed", "failed"):
+            ids = await self.redis.zrevrange(getattr(self.keys, state), start, end)
         else:
-            # newest first for finished states; ascending time for delayed
-            ids = await (
-                self.redis.zrange(key, start, end)
-                if state == "delayed"
-                else self.redis.zrevrange(key, start, end)
-            )
+            raise ValueError(f"unknown state: {state}")
         jobs = []
         for job_id in ids:
             job = await self.get_job(job_id)
@@ -96,9 +101,12 @@ class Queue:
         return jobs
 
     async def retry_job(self, job_id: str) -> bool:
-        """Move a failed job back to wait for another attempt."""
+        """Move a failed job back to the queue for another attempt."""
         res = await self._retry_job(
-            keys=[self.keys.failed, self.keys.wait, self.keys.job(job_id)],
+            keys=[
+                self.keys.failed, self.keys.prioritized, self.keys.marker,
+                self.keys.job(job_id), self.keys.pc,
+            ],
             args=[job_id],
         )
         return bool(res)
@@ -107,7 +115,7 @@ class Queue:
         """Delete a job from every state and drop its hash."""
         res = await self._remove_job(
             keys=[
-                self.keys.wait, self.keys.active, self.keys.delayed,
+                self.keys.prioritized, self.keys.active, self.keys.delayed,
                 self.keys.completed, self.keys.failed, self.keys.job(job_id),
             ],
             args=[job_id],
