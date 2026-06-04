@@ -1,0 +1,34 @@
+[project]
+name = "toro"
+version = "0.0.1"
+description = "An async-first, Redis-backed job queue for Python."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "redis>=5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Managed with uv (https://astral.sh/uv). Dev tooling lives in a uv dependency group.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
