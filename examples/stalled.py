@@ -2,6 +2,7 @@
 
 Run a Redis on localhost:6379, then:  python examples/stalled.py
 """
+
 import asyncio
 
 from toro import Queue, Worker
@@ -26,16 +27,20 @@ async def main():
         return {"by": "healthy"}
 
     # A zombie: short lock, never renews, doesn't run stalled checks.
-    zombie = Worker("recovery_demo", hangs, lock_duration=500,
-                    renew_locks=False, stalled_interval=0)
+    zombie = Worker(
+        "recovery_demo", hangs, lock_duration=500, renew_locks=False, stalled_interval=0
+    )
     # A healthy worker that sweeps for stalled jobs every 500ms.
     healthy = Worker("recovery_demo", works, stalled_interval=500, max_stalled_count=3)
     healthy.on("stalled", lambda jid: print(f"  [healthy] detected #{jid} stalled -> requeued"))
     healthy.on("completed", lambda j, r: print(f"  ✓ #{j.id} completed by {r['by']}"))
-    zombie.on("lock-lost", lambda jid: print(f"  [zombie] woke up, but #{jid} was taken — finish rejected"))
+    zombie.on(
+        "lock-lost",
+        lambda jid: print(f"  [zombie] woke up, but #{jid} was taken — finish rejected"),
+    )
 
     zt = asyncio.create_task(zombie.run())
-    await asyncio.sleep(0.4)            # let the zombie grab the job
+    await asyncio.sleep(0.4)  # let the zombie grab the job
     ht = asyncio.create_task(healthy.run())
 
     await asyncio.sleep(3)

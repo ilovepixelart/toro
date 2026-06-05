@@ -2,6 +2,7 @@
 
 Run a Redis on localhost:6379, then:  python examples/basic.py
 """
+
 import asyncio
 
 from toro import Queue, Worker

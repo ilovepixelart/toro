@@ -5,6 +5,7 @@ Compares against the pre-fetch-next baseline we recorded (~6,080 jobs/s,
 
 Usage:  uv run python bench/bench.py [N] [concurrency]
 """
+
 import asyncio
 import sys
 import time
