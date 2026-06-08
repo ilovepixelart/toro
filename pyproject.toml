@@ -2,7 +2,7 @@
 # PyPI distribution name — plain `toro` is taken (abandoned). The import package
 # stays `toro` (e.g. `pip install toro-queue` then `import toro`).
 name = "toro-queue"
-version = "0.0.1"
+version = "0.1.0"
 description = "An async-first, Redis-backed job queue for Python."
 readme = "README.md"
 requires-python = ">=3.10"

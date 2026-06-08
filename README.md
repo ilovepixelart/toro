@@ -8,7 +8,7 @@ pip install toro-queue      # the import name is `toro`
 ```
 
 > Installed as **`toro-queue`** on PyPI (the name `toro` was taken), but you
-> `import toro`. See [DESIGN.md](./DESIGN.md) for the architecture and the
+> `import toro`. See [DESIGN.md](https://github.com/ilovepixelart/toro/blob/main/DESIGN.md) for the architecture and the
 > at-least-once reliability model.
 
 ## Why toro
@@ -97,4 +97,4 @@ and `-m load` (the open-loop benchmark harness in `tests/load/`).
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](https://github.com/ilovepixelart/toro/blob/main/LICENSE)
