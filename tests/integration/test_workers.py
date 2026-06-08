@@ -2,6 +2,7 @@
 tracks throughput, reports what it's running, deregisters on shutdown, and stale
 records (a crashed worker that never deregistered) get pruned on read.
 """
+
 import asyncio
 import time
 
@@ -27,6 +28,7 @@ async def test_running_worker_registers_its_presence(q, run_worker, run_until):
         assert rec["host"]
         assert rec["started"] > 0
         assert rec["heartbeat"] >= rec["started"]
+        assert rec["state"] == "running"
 
     assert await q.workers() == []  # deregistered on graceful shutdown
 
@@ -88,14 +90,28 @@ async def test_graceful_shutdown_is_recorded_as_stopped(q, run_worker, run_until
     assert any(d["id"] == token and d["reason"] == "stopped" for d in departed)
 
 
+async def test_clear_departed_drops_the_history(q):
+    await q.redis.lpush(q.keys.departed, '{"id": "w1", "reason": "stopped"}')
+    assert await q.departed_workers()  # recorded
+    assert await q.clear_departed() == 1  # returns how many were cleared
+    assert await q.departed_workers() == []  # history gone
+    assert await q.redis.exists(q.keys.departed) == 0
+
+
 async def test_lost_worker_is_recorded_when_pruned(q):
     old = int(time.time() * 1000) - 60_000  # 60s stale
     await q.redis.zadd(q.keys.workers, {"ghost": old})
     await q.redis.hset(
         q.keys.worker("ghost"),
         mapping={
-            "heartbeat": old, "started": old, "host": "node-7", "pid": 4242,
-            "concurrency": 3, "processed": 99, "failed": 5,
+            "heartbeat": old,
+            "started": old,
+            "host": "node-7",
+            "pid": 4242,
+            "concurrency": 3,
+            "processed": 99,
+            "failed": 5,
+            "current": '["210", "211"]',  # it was mid-flight on these when it vanished
         },
     )
     assert await q.workers() == []  # pruned
@@ -107,3 +123,6 @@ async def test_lost_worker_is_recorded_when_pruned(q):
     assert rec["host"] == "node-7"
     assert rec["pid"] == 4242
     assert rec["processed"] == 99
+    # the death record froze WHAT IT WAS RUNNING — the whole point of the post-mortem
+    assert rec["current"] == ["210", "211"]
+    assert rec["last_seen"] < rec["at"]  # last heartbeat vs when the sweep detected it

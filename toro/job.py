@@ -4,7 +4,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, Protocol, cast
+
+from redis.asyncio import Redis
+
+# The lifecycle states a job can be in (also the queryable states for get_jobs).
+JobState = Literal["wait", "active", "delayed", "completed", "failed"]
+
+
+class SupportsResult(Protocol):
+    """The slice of Queue that `Job.result()` needs. Typing `_queue` against this
+    (not the concrete Queue) keeps the domain object from importing the queue/redis
+    layer — dependency inversion, and no circular import to dodge.
+    """
+
+    async def result(self, job_id: str, *, timeout: float = ...) -> Any: ...
 
 
 @dataclass
@@ -59,6 +73,19 @@ class JobOptions:
         return (-1, -1)
 
 
+@dataclass(frozen=True, slots=True)
+class JobContext:
+    """Worker-side handles attached to a Job while its processor runs, so the handler
+    can report progress / append logs.
+    """
+
+    redis: Redis
+    job_key: str
+    events_key: str
+    logs_key: str
+    job_id: str
+
+
 @dataclass
 class Job:
     """A snapshot of one job: its id, data, options, state and lifecycle timestamps."""
@@ -71,17 +98,17 @@ class Job:
     timestamp: int | None = None
     returnvalue: Any = None
     failed_reason: str | None = None
-    state: str | None = None
+    state: JobState | None = None
     processed_on: int | None = None
     finished_on: int | None = None
     progress: Any = None
     stacktrace: str | None = None
     # Back-reference to the owning Queue, set on jobs returned by Queue.add() so
     # producers can `await job.result()`. Not part of the job's data/identity.
-    _queue: Any = field(default=None, repr=False, compare=False)
-    # Worker-side context (redis, jobKey, eventsKey, logsKey, jobId), set while a
-    # processor runs so the handler can report progress and append logs.
-    _ctx: Any = field(default=None, repr=False, compare=False)
+    _queue: SupportsResult | None = field(default=None, repr=False, compare=False)
+    # Worker-side context, set while a processor runs so the handler can report
+    # progress and append logs.
+    _ctx: JobContext | None = field(default=None, repr=False, compare=False)
 
     async def result(self, *, timeout: float = 30.0) -> Any:
         """Wait for this job to finish; return its value or raise JobFailedError."""
@@ -93,19 +120,19 @@ class Job:
         """Report progress (a number 0-100 or any JSON value) from a processor."""
         if self._ctx is None:
             raise RuntimeError("update_progress() is only available inside a worker processor")
-        redis, job_key, events_key, _logs_key, jid = self._ctx
+        ctx = self._ctx
         self.progress = value
-        await redis.hset(job_key, "progress", json.dumps(value))
-        await redis.publish(
-            events_key, json.dumps({"jobId": jid, "event": "progress", "progress": value})
+        await ctx.redis.hset(ctx.job_key, "progress", json.dumps(value))
+        await ctx.redis.publish(
+            ctx.events_key,
+            json.dumps({"jobId": ctx.job_id, "event": "progress", "progress": value}),
         )
 
     async def log(self, message: str) -> None:
         """Append a log line to this job (visible in the dashboard)."""
         if self._ctx is None:
             raise RuntimeError("log() is only available inside a worker processor")
-        redis, _job_key, _events_key, logs_key, _jid = self._ctx
-        await redis.rpush(logs_key, message)
+        await self._ctx.redis.rpush(self._ctx.logs_key, message)
 
     @classmethod
     def from_hash(cls, job_id: str, h: dict) -> Job:
@@ -119,7 +146,7 @@ class Job:
             timestamp=int(h["timestamp"]) if h.get("timestamp") else None,
             returnvalue=json.loads(h["returnvalue"]) if h.get("returnvalue") else None,
             failed_reason=h.get("failedReason"),
-            state=h.get("state"),
+            state=cast("JobState | None", h.get("state")),  # Redis stores it untyped
             processed_on=int(h["processedOn"]) if h.get("processedOn") else None,
             finished_on=int(h["finishedOn"]) if h.get("finishedOn") else None,
             progress=json.loads(h["progress"]) if h.get("progress") else None,

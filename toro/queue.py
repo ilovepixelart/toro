@@ -7,13 +7,14 @@ import json
 import time
 from typing import Any, cast
 
-import redis.asyncio as aioredis
+from redis.asyncio import Redis
 
 from . import scripts
+from .connection import connect
 from .errors import JobFailedError
-from .job import Job, JobOptions
+from .job import Job, JobOptions, JobState
 from .keys import Keys
-from .scheduler import next_run
+from .scheduler import next_run, valid_cron
 
 
 def _now_ms() -> int:
@@ -31,7 +32,7 @@ class Queue:
         self,
         name: str,
         *,
-        connection: aioredis.Redis | None = None,
+        connection: Redis | None = None,
         url: str = "redis://localhost:6379",
         prefix: str = "toro",
         default_job_options: dict | None = None,
@@ -43,7 +44,7 @@ class Queue:
         self.keys = Keys(name, prefix)
         # NB: created with decode_responses=True, so every command returns str —
         # redis-py's async client isn't generic over that, hence the casts below.
-        self.redis = connection or aioredis.from_url(url, decode_responses=True)
+        self.redis = connection or connect(url)
         self._add_job = self.redis.register_script(scripts.ADD_JOB)
         self._retry_job = self.redis.register_script(scripts.RETRY_JOB)
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
@@ -112,6 +113,10 @@ class Queue:
                 ],
             )
         )
+        # Signal the change so a live dashboard refreshes on enqueue, not only when a
+        # job finishes (completed/failed publish from the Lua side). result() and the
+        # dashboard both tolerate this event type.
+        await self.redis.publish(self.keys.events, json.dumps({"jobId": new_id, "event": "added"}))
         return Job(
             id=new_id,
             name=name,
@@ -137,7 +142,7 @@ class Queue:
                 return job.returnvalue
             if job is not None and job.state == "failed":
                 raise JobFailedError(job.failed_reason)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()  # correct idiom inside a coroutine
             deadline = loop.time() + timeout
             while True:
                 remaining = deadline - loop.time()
@@ -149,9 +154,12 @@ class Queue:
                 data = json.loads(msg["data"])
                 if str(data.get("jobId")) != str(job_id):
                     continue
-                if data.get("event") == "completed":
+                event = data.get("event")
+                if event == "completed":
                     return data.get("result")
-                raise JobFailedError(data.get("reason"))
+                if event == "failed":
+                    raise JobFailedError(data.get("reason"))
+                # ignore non-terminal events (e.g. "added") and keep waiting
         finally:
             await pubsub.aclose()
 
@@ -174,8 +182,21 @@ class Queue:
         job; each occurrence mints its successor when a worker picks it up.
         Re-calling with the same id updates the schedule.
         """
+        scheduler_id = str(scheduler_id)
+        if not scheduler_id or ":" in scheduler_id or any(ord(c) < 0x20 for c in scheduler_id):
+            # it's interpolated into Redis keys ({base}repeat:<id>) and the occurrence
+            # id (repeat:<id>:<when>); ':' or control chars let one scheduler collide
+            # with another's keys — same class of guard as custom job_id.
+            raise ValueError(
+                "scheduler_id must be a non-empty string with no ':' or control "
+                "characters (it's used as a Redis key segment) — try e.g. 'nightly-rollup'"
+            )
         if (every is None) == (cron is None):
             raise ValueError("pass exactly one of `every` or `cron`")
+        if cron is not None and not valid_cron(cron):
+            # fail at enqueue, not later inside a worker's _schedule_next (a silent
+            # scheduler that errors on the backend)
+            raise ValueError(f"invalid cron expression: {cron!r}")
         opts = JobOptions(priority=_clamp_priority(priority), **job_opts).to_dict()
         template = {
             "name": name or scheduler_id,
@@ -216,12 +237,26 @@ class Queue:
             await self.remove_job(f"repeat:{scheduler_id}:{int(score)}")
 
     async def trigger_scheduler(self, scheduler_id: str) -> bool:
-        """Enqueue one immediate occurrence of a scheduler (a manual 'run now')."""
+        """Enqueue one immediate occurrence of a scheduler (a manual 'run now').
+
+        Carries the scheduler's configured options (priority/attempts/backoff/
+        auto-removal) so a manual run matches a scheduled one — but runs immediately
+        (`delay` is omitted, not taken from the stored opts).
+        """
         t = await self.redis.hgetall(self.keys.scheduler(scheduler_id))
         if not t:
             return False
         name = cast("str", t.get("name", scheduler_id))
-        await self.add(name, json.loads(t.get("data") or "null"))
+        opts = JobOptions.from_dict(json.loads(t.get("opts") or "{}"))
+        await self.add(
+            name,
+            json.loads(t.get("data") or "null"),
+            attempts=opts.attempts,
+            backoff=opts.backoff,
+            priority=opts.priority,
+            remove_on_complete=opts.remove_on_complete,
+            remove_on_fail=opts.remove_on_fail,
+        )
         return True
 
     async def schedulers(self) -> list[dict]:
@@ -232,7 +267,7 @@ class Queue:
         )
         if not entries:
             return []
-        pipe = self.redis.pipeline()
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for sid, _ in entries:
             pipe.hgetall(self.keys.scheduler(sid))
         templates = cast("list[dict[str, str]]", await pipe.execute())
@@ -262,7 +297,7 @@ class Queue:
         """Quick snapshot of how many jobs sit in each state. `wait` = waiting
         jobs in the prioritized set.
         """
-        pipe = self.redis.pipeline()
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         pipe.zcard(self.keys.prioritized)
         pipe.llen(self.keys.active)
         pipe.zcard(self.keys.delayed)
@@ -286,7 +321,7 @@ class Queue:
         ids = cast("list[str]", await self.redis.zrange(self.keys.workers, 0, -1))
         if not ids:
             return []
-        pipe = self.redis.pipeline()
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for wid in ids:
             pipe.hgetall(self.keys.worker(wid))
         hashes = cast("list[dict]", await pipe.execute())
@@ -309,11 +344,14 @@ class Queue:
                     "processed": int(h.get("processed", 0)),
                     "failed": int(h.get("failed", 0)),
                     "current": json.loads(h.get("current", "[]")),
+                    "state": h.get("state", "running"),
                 }
             )
         if dead:
             # A stale worker crashed/was killed without deregistering — log it as
             # "lost" (vs a graceful "stopped") before pruning, so its death is visible.
+            # Kept transactional: record-then-prune must be atomic, else a partial
+            # failure leaves a worker re-recorded (duplicate death) or pruned silently.
             pipe = self.redis.pipeline()
             for wid, h in dead:
                 if h:
@@ -330,6 +368,7 @@ class Queue:
                                 "failed": int(h.get("failed", 0)),
                                 "started": int(h.get("started", 0)),
                                 "last_seen": int(h.get("heartbeat", 0)),
+                                "current": json.loads(h.get("current", "[]")),
                                 "reason": "lost",
                                 "at": now,
                             }
@@ -350,7 +389,15 @@ class Queue:
         raw = cast("list[str]", await self.redis.lrange(self.keys.departed, 0, limit - 1))
         return [json.loads(r) for r in raw]
 
-    async def get_jobs(self, state: str, start: int = 0, end: int = 20) -> list[Job]:
+    async def clear_departed(self) -> int:
+        """Drop the recorded worker departures (the post-mortem log). Returns the count
+        cleared. Live workers re-appear via their heartbeats; this only clears history.
+        """
+        n = await self.redis.llen(self.keys.departed)
+        await self.redis.delete(self.keys.departed)
+        return n
+
+    async def get_jobs(self, state: JobState, start: int = 0, end: int = 20) -> list[Job]:
         """Page through job ids in a given state and hydrate them into Jobs.
         `wait` returns jobs in global priority order (most urgent first).
         """
@@ -367,7 +414,7 @@ class Queue:
         if not ids:
             return []
         # Hydrate the whole page in one round trip instead of one HGETALL per job.
-        pipe = self.redis.pipeline()
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for job_id in ids:
             pipe.hgetall(self.keys.job(cast("str", job_id)))
         hashes = await pipe.execute()
@@ -418,7 +465,7 @@ class Queue:
         )
         return bool(res)
 
-    async def _ids(self, state: str, limit: int) -> list[str]:
+    async def _ids(self, state: JobState, limit: int) -> list[str]:
         if state in ("wait", "prioritized"):
             return cast("list[str]", await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
         if state == "active":
@@ -428,7 +475,7 @@ class Queue:
             return cast("list[str]", await self.redis.zrange(zset, 0, limit - 1))
         raise ValueError(f"unknown state: {state}")
 
-    async def search(self, state: str, query: str, scan_limit: int = 500) -> list[Job]:
+    async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:
         """Substring-search `name`/`data` within a state's most recent `scan_limit`
         jobs (Redis hashes aren't queryable, so this is a bounded scan + filter).
         Returns the matches; the caller should surface the scan bound honestly.
@@ -436,7 +483,7 @@ class Queue:
         ids = await self._ids(state, scan_limit)
         if not ids:
             return []
-        pipe = self.redis.pipeline()
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for job_id in ids:
             pipe.hgetall(self.keys.job(job_id))
         hashes = await pipe.execute()
@@ -454,11 +501,30 @@ class Queue:
             await self.retry_job(job_id)
         return len(ids)
 
-    async def clean(self, state: str, limit: int = 1000) -> int:
-        """Remove every job in a state. Returns how many were removed."""
+    async def clean(self, state: JobState, limit: int = 1000) -> int:
+        """Remove every job in a state (up to `limit`). Returns how many were removed.
+
+        Pipelines the per-job removals — one round trip per batch, not one per job —
+        so clearing a large state stays fast (thousands of jobs in well under a second).
+        """
         ids = await self._ids(state, limit)
+        if not ids:
+            return 0
+        sha = await self.redis.script_load(scripts.REMOVE_JOB)  # ensure loaded for EVALSHA
+        pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:
-            await self.remove_job(job_id)
+            pipe.evalsha(
+                sha,
+                6,
+                self.keys.prioritized,
+                self.keys.active,
+                self.keys.delayed,
+                self.keys.completed,
+                self.keys.failed,
+                self.keys.job(job_id),
+                job_id,
+            )
+        await pipe.execute()
         return len(ids)
 
     # ---- queue control ----------------------------------------------------

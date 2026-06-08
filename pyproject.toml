@@ -74,6 +74,7 @@ ignore = [
     "D102",                        # docstrings on every public method is too granular here
     "PLR0913",                     # Worker/Queue are config constructors — many kwargs is fine
     "BLE001", "S110", "S112",      # deliberate best-effort excepts in worker/redis cleanup paths
+    "TC001", "TC002", "TC003",     # prefer normal runtime imports over TYPE_CHECKING blocks
 ]
 
 [tool.ruff.lint.per-file-ignores]

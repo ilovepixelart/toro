@@ -4,9 +4,25 @@ Each asserts the resulting state AND the negative case (acting on a missing job
 returns False rather than silently succeeding).
 """
 
+import pytest
+
 
 async def _count(q, state):
     return (await q.counts())[state]
+
+
+@pytest.mark.parametrize("bad", ["", "a:b", "repeat:x", "ctrl\x01", "\n"])
+async def test_add_scheduler_rejects_unsafe_id(q, bad):
+    # scheduler_id is a Redis key segment — ':'/control chars enable key collisions
+    with pytest.raises(ValueError, match="scheduler_id"):
+        await q.add_scheduler(bad, cron="0 0 * * *")
+
+
+@pytest.mark.parametrize("bad", ["not a cron", "* * *", "99 * * * *"])
+async def test_add_scheduler_rejects_invalid_cron(q, bad):
+    # bad cron must fail at enqueue, not silently inside a worker later
+    with pytest.raises(ValueError, match="cron"):
+        await q.add_scheduler("sched", cron=bad)
 
 
 async def test_remove_job_deletes_it_everywhere(q):
@@ -82,6 +98,16 @@ async def test_trigger_scheduler_enqueues_one_immediately(q):
 
 async def test_trigger_missing_scheduler_returns_false(q):
     assert await q.trigger_scheduler("nope") is False
+
+
+async def test_trigger_scheduler_carries_configured_opts(q):
+    # a manual "run now" must match a scheduled occurrence's options, not defaults
+    await q.add_scheduler("nightly", cron="0 0 * * *", name="rollup", priority=7, attempts=5)
+    assert await q.trigger_scheduler("nightly") is True
+    job = (await q.get_jobs("wait", 0, 0))[0]
+    assert job.name == "rollup"
+    assert job.opts.priority == 7
+    assert job.opts.attempts == 5
 
 
 async def _all_failed(q, n):

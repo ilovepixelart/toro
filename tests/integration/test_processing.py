@@ -3,6 +3,18 @@
 import asyncio
 
 
+async def test_add_publishes_a_change_event(q):
+    # Enqueuing must emit a signal on the events channel (like completion/failure does),
+    # so a live dashboard refreshes when a job is *added*, not only when one finishes.
+    ps = q.redis.pubsub()
+    await ps.subscribe(q.keys.events)
+    await ps.get_message(timeout=1)  # drain the subscribe ack
+    await q.add("newjob", {"x": 1})
+    msg = await ps.get_message(ignore_subscribe_messages=True, timeout=2)
+    assert msg is not None  # enqueue published a change signal
+    await ps.aclose()
+
+
 async def test_processes_job_and_records_full_outcome(q, run_worker, run_until):
     async def proc(job):
         return {"echo": job.data["n"] * 2}

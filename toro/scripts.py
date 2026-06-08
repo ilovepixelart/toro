@@ -34,6 +34,12 @@ would require hash-tagging the keys (e.g. `{queue}`) so a queue's keys share a s
 PRIORITY_OFFSET = 1048576  # 2^20  — max priority (most urgent)
 SEQ_MOD = 4294967296  # 2^32  — sequence wrap window
 
+# Lua → Python return protocol: sentinels the scripts emit, decoded in worker.py.
+RL_SENTINEL = "__rl__"  # ACQUIRE hit the rate limiter; res[1] = ms until a token frees
+LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already reclaimed)
+NOT_ACTIVE = -3  # a finish script: the job was no longer in `active`
+OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will retry)
+
 # Shared routines, prepended to every script that enqueues or acquires a job.
 # This is the single definition of "how a job is ordered, woken, claimed":
 #   priorityScore  — (priority, seq) -> ZSET score (lower score = sooner)

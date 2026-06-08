@@ -28,10 +28,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
-import redis.asyncio as aioredis
+from redis.asyncio import Redis
 
 from . import scripts
-from .job import Job, JobOptions
+from .connection import connect
+from .job import Job, JobContext, JobOptions
 from .keys import Keys
 from .scheduler import next_run
 
@@ -73,7 +74,7 @@ class Worker:
         name: str,
         processor: Processor,
         *,
-        connection: aioredis.Redis | None = None,
+        connection: Redis | None = None,
         url: str = "redis://localhost:6379",
         prefix: str = "toro",
         concurrency: int = 1,
@@ -90,7 +91,7 @@ class Worker:
         self.name = name
         self.processor = processor
         self.keys = Keys(name, prefix)
-        self.redis = connection or aioredis.from_url(url, decode_responses=True)
+        self.redis = connection or connect(url)
         self.concurrency = concurrency
         # Queue-wide rate limit, shared by all workers via one token bucket in Redis.
         # `{"max": N, "duration": ms}` = at most N jobs per duration. All workers on a
@@ -122,6 +123,10 @@ class Worker:
         self._processed = 0
         self._failed = 0
         self._current: set[str] = set()
+        # "running" until a graceful stop flips it to "stopping" — the dashboard shows
+        # a live "draining" state, and a worker that then vanishes was mid-shutdown,
+        # not a crash. (The only honest way to know graceful; absence can't say why.)
+        self._state = "running"
 
         self._move_to_active = self.redis.register_script(scripts.MOVE_TO_ACTIVE)
         self._extend_lock = self.redis.register_script(scripts.EXTEND_LOCK)
@@ -164,6 +169,11 @@ class Worker:
         """
         grace = self.grace_period if grace_period is None else grace_period
         self._running = False
+        # Flip to "stopping" (shown as "draining" in the dashboard) and flush it now, so
+        # this worker reads as shutting down in real time (a later vanish = graceful, not crash).
+        self._state = "stopping"
+        with contextlib.suppress(Exception):
+            await self._write_heartbeat()
         # Wake an idle worker parked on BZPOPMIN so it notices the shutdown.
         with contextlib.suppress(Exception):  # pragma: no cover
             await self.redis.zadd(self.keys.marker, {"0": 0})
@@ -202,6 +212,7 @@ class Worker:
                 "processed": self._processed,
                 "failed": self._failed,
                 "current": json.dumps(sorted(self._current)),
+                "state": self._state,
             },
         )
         await self.redis.zadd(self.keys.workers, {self.token: now})
@@ -225,6 +236,7 @@ class Worker:
                 "failed": self._failed,
                 "started": self.started_at,
                 "last_seen": now,
+                "current": sorted(self._current),  # what it was running at the end
                 "reason": reason,
                 "at": now,
             }
@@ -268,7 +280,7 @@ class Worker:
             ],
             args=[self.token, self.lock_duration, _now_ms(), self.rl_max, self.rl_duration],
         )
-        if res and res[0] == "__rl__":
+        if res and res[0] == scripts.RL_SENTINEL:
             await self._on_rate_limited(int(res[1]))
             return None
         return self._loaded(res)
@@ -296,12 +308,12 @@ class Worker:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
         # Give the handler the ability to report progress and append logs.
-        job._ctx = (  # noqa: SLF001  — the worker injects the job's runtime context
-            self.redis,
-            self.keys.job(job_id),
-            self.keys.events,
-            self.keys.logs(job_id),
-            job_id,
+        job._ctx = JobContext(  # noqa: SLF001  — the worker injects the job's runtime context
+            redis=self.redis,
+            job_key=self.keys.job(job_id),
+            events_key=self.keys.events,
+            logs_key=self.keys.logs(job_id),
+            job_id=job_id,
         )
         # A scheduler job mints its successor on first pickup, so the schedule
         # stays on time regardless of how long (or whether) this run succeeds.
@@ -352,7 +364,7 @@ class Worker:
                 self.rl_duration,
             ],
         )
-        if isinstance(res, int):  # -2 lock lost / -3 not active
+        if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             self._emit("lock-lost", job.id)
             return None
         job.returnvalue = result
@@ -391,11 +403,11 @@ class Worker:
                 self.rl_duration,
             ],
         )
-        if isinstance(res, int):  # -2 lock lost / -3 not active
+        if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             self._emit("lock-lost", job.id)
             return None
         job.failed_reason = str(exc)
-        self._emit("failed" if res[0] == 1 else "retrying", job, exc)
+        self._emit("failed" if res[0] == scripts.OUTCOME_FAILED else "retrying", job, exc)
         return self._next_from(res)
 
     async def _schedule_next(self, scheduler_id: str) -> None:

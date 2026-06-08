@@ -10,6 +10,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
+def valid_cron(cron: str) -> bool:
+    """Whether `cron` parses as a cron expression — validate before storing a schedule."""
+    try:
+        from croniter import croniter  # noqa: PLC0415  — optional dep, imported lazily
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("cron schedules need croniter: pip install croniter") from exc
+    return bool(croniter.is_valid(cron))
+
+
 def next_run(now_ms: int, *, every: int | None = None, cron: str | None = None) -> int:
     """Next occurrence (epoch ms) strictly after now_ms."""
     if every:
