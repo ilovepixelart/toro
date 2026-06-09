@@ -3,6 +3,18 @@
 An **async-first**, Redis-backed job queue for Python. Every state transition is
 an atomic Lua script; producing and processing are `asyncio` end to end.
 
+[![PyPI](https://img.shields.io/pypi/v/toro-queue)](https://pypi.org/project/toro-queue/)
+[![Downloads](https://img.shields.io/pypi/dm/toro-queue)](https://pypi.org/project/toro-queue/)
+[![Python](https://img.shields.io/pypi/pyversions/toro-queue)](https://pypi.org/project/toro-queue/)
+[![License](https://img.shields.io/github/license/ilovepixelart/toro)](https://github.com/ilovepixelart/toro/blob/main/LICENSE)
+\
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=ilovepixelart_toro&metric=coverage)](https://sonarcloud.io/summary/new_code?id=ilovepixelart_toro)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=ilovepixelart_toro&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=ilovepixelart_toro)
+\
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=ilovepixelart_toro&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=ilovepixelart_toro)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=ilovepixelart_toro&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=ilovepixelart_toro)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=ilovepixelart_toro&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=ilovepixelart_toro)
+
 ```bash
 pip install toro-queue      # the import name is `toro`
 ```
