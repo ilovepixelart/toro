@@ -1,11 +1,12 @@
 """Worker: the consumer side. Pulls jobs and runs a processor over them.
 
 Reliability model (this is the core — see DESIGN.md):
-  * A blocking BLMOVE wakes the worker and moves a job id from `wait` to
-    `active`. `MOVE_TO_ACTIVE` then locks + loads it.
-  * Job acquisition (lock + load) funnels through ONE Lua routine, shared by the
-    blocking path and by fetch-next. That routine is the seed of a future
-    `moveToActive`: to add priorities/markers we change only which job it picks.
+  * Jobs live in one `prioritized` ZSET (global priority order). A parked worker
+    wakes on `BZPOPMIN` of a 0-scored base marker; the atomic claim is
+    `MOVE_TO_ACTIVE` (`ZPOPMIN prioritized` → `active` → lock + load). The marker
+    only wakes us — a missed marker can't strand a job, since the claim is atomic.
+  * Job acquisition (claim + lock + load) funnels through ONE Lua routine, shared
+    by the blocking-wakeup path and by fetch-next.
   * Fetch-next: the finish scripts commit the current job AND acquire the next
     one in the same round trip, so a busy worker loops without going back to the
     blocking pop. It only re-blocks when the queue drains.

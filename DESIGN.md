@@ -31,8 +31,12 @@ the id is still on `active` and the stalled sweep (principle 3) recovers it. The
 blocking call should use a **separate** Redis connection, since a blocked
 connection can't issue other commands.
 
-→ **toro:** uses `BLMOVE wait active RIGHT LEFT`. TODO: isolate the blocking pop
-on its own connection.
+→ **toro:** the `wait` list became a single `prioritized` ZSET (see *Priorities*),
+so the blocking wake is `BZPOPMIN` on a 0-scored base **marker** and the claim is
+the atomic `MOVE_TO_ACTIVE` (`ZPOPMIN prioritized` → `active` → lock + load). A
+missed marker can't strand a job — the claim is atomic and idempotent. The
+blocking pop still shares the worker's connection; a dedicated connection is a
+possible refinement.
 
 ### 3. Locks + token + stalled recovery — the at-least-once guarantee
 - On move-to-active, set `<q>:<id>:lock = <token>  PX lockDuration` (default 30s).
@@ -52,9 +56,12 @@ handler may run more than once (bounded by `maxStalledCount`). Exactly-once
 *result commit* is enforced by the token-guarded lock at finish time, not by
 preventing duplicate handler execution.
 
-→ **toro:** NOT YET IMPLEMENTED. Top priority after the core. Plan: per-job lock
-key + token, an `asyncio` lock-renewal task per in-flight job, and a background
-`_stalled_loop` running a mark-and-sweep Lua script.
+→ **toro:** ✅ implemented as described — a per-job `<id>:lock = <token>`, a
+lock-renewal task per in-flight job, and a background `_stalled_loop` running the
+`MOVE_STALLED` mark-and-sweep script every `stalled_interval`. Tune it with
+`Worker(stalled_interval=, max_stalled_count=, lock_duration=, renew_locks=)`;
+`examples/stalled.py` demonstrates exactly-once result commit when a worker dies
+mid-job.
 
 ### 4. One delay timer, pub/sub-woken
 Delayed jobs live in a ZSET scored `(ts << 12) | (counter & 0xFFF)` — low 12 bits
@@ -84,7 +91,8 @@ concurrency 20. Notably cmds/job barely changed (13 → 12) — the win is fewer
 *round trips* (the old `BLMOVE` + `MOVE_TO_ACTIVE` + `HGETALL` per job collapse
 into the finish call), not less server work.
 
-## Higher-level features (roadmap)
+## Higher-level features
+
 - **Priorities:** ✅ done — and we deliberately *diverge* from the common approach. The usual design
   inserts into `wait` with `LINSERT` (O(N)) and keeps a separate `wait`
   fast-lane that strictly beats `prioritized` (priority-0 jobs can starve
@@ -95,15 +103,20 @@ into the finish call), not less server work.
   `ZADD marker 0 "0"` (idempotent), idle workers `BZPOPMIN marker`, and the
   atomic `MOVE_TO_ACTIVE` does `ZPOPMIN prioritized` → active → lock. The 1s
   delay poll still promotes delayed → prioritized (delay-marker is future work).
-- **Repeatable/cron:** a `repeat` ZSET of schedule entries; each occurrence
-  schedules its successor as a *delayed* job with a deterministic id. Port with
-  `croniter`.
-- **Rate limiting:** a `PSETEX`/`INCR` counter per window (optionally per group);
-  limited jobs parked in `delayed`. Disables fetch-next.
-- **Events:** Redis pub/sub or Streams. Streams give replay + consumer groups,
-  which suits an async dashboard.
-- **Auto-removal:** `removeOnComplete`/`removeOnFail` (bool/count/{count,age})
-  enforced inside the finish script, not by a sweeper.
+- **Repeatable/cron:** ✅ done — `add_scheduler(every=ms | cron=...)` validates the
+  schedule (`croniter` for cron) and enqueues the first occurrence as a delayed
+  job; each occurrence mints its successor with a deterministic id when a worker
+  picks it up. `trigger_scheduler` runs one now, `remove_scheduler` stops it.
+- **Rate limiting:** ✅ done — a queue-wide token bucket in Redis
+  (`Worker(rate_limit={"max": N, "duration": ms})`), shared by every worker on the
+  queue. An over-limit claim returns a sentinel and the worker waits out the retry
+  window instead of busy-spinning.
+- **Events:** ✅ done — Redis pub/sub on an `events` channel: `add`, progress,
+  `completed` and `failed` publish; `Queue.result()` subscribes and awaits the
+  terminal event, and `Worker.on(event, fn)` exposes lifecycle hooks. Streams
+  (replay + consumer groups) remain a possible upgrade.
+- **Auto-removal:** ✅ done — `remove_on_complete` / `remove_on_fail`
+  (bool / count / `{count, age}`) enforced inside the finish script, not by a sweeper.
 
 ## Python-specific choices
 - **async-first**: `redis.asyncio`, `async def` processors, one event loop.
