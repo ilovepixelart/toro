@@ -3,9 +3,10 @@
 An **async-first**, Redis-backed job queue for Python. Every state transition is
 an atomic Lua script; producing and processing are `asyncio` end to end.
 
-[![PyPI](https://img.shields.io/pypi/v/toro-queue)](https://pypi.org/project/toro-queue/)
-[![Downloads](https://img.shields.io/pypi/dm/toro-queue)](https://pypi.org/project/toro-queue/)
 [![Python](https://img.shields.io/pypi/pyversions/toro-queue)](https://pypi.org/project/toro-queue/)
+\
+[![PyPI](https://img.shields.io/pypi/v/toro-queue)](https://pypi.org/project/toro-queue/)
+[![Downloads](https://static.pepy.tech/badge/toro-queue)](https://pepy.tech/project/toro-queue)
 [![License](https://img.shields.io/github/license/ilovepixelart/toro)](https://github.com/ilovepixelart/toro/blob/main/LICENSE)
 \
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=ilovepixelart_toro&metric=coverage)](https://sonarcloud.io/summary/new_code?id=ilovepixelart_toro)
