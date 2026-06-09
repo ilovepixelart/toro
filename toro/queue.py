@@ -25,6 +25,11 @@ def _clamp_priority(p: int) -> int:
     return max(0, min(int(p), scripts.PRIORITY_OFFSET))
 
 
+def _str_list(reply: Any) -> list[str]:
+    """Type a Redis list/zset reply (decode_responses is on) as list[str]."""
+    return cast("list[str]", reply)
+
+
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -291,7 +296,7 @@ class Queue:
         return Job.from_hash(job_id, h)
 
     async def get_logs(self, job_id: str, start: int = 0, end: int = -1) -> list[str]:
-        return cast("list[str]", await self.redis.lrange(self.keys.logs(job_id), start, end))
+        return _str_list(await self.redis.lrange(self.keys.logs(job_id), start, end))
 
     async def counts(self) -> dict[str, int]:
         """Quick snapshot of how many jobs sit in each state. `wait` = waiting
@@ -318,7 +323,7 @@ class Queue:
         so a crashed worker (which never deregistered) disappears on its own.
         """
         now = _now_ms()
-        ids = cast("list[str]", await self.redis.zrange(self.keys.workers, 0, -1))
+        ids = _str_list(await self.redis.zrange(self.keys.workers, 0, -1))
         if not ids:
             return []
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
@@ -386,7 +391,7 @@ class Queue:
         lost heartbeats ("lost"). A bounded death-log so the dashboard can show what
         left, when, and why, instead of workers silently vanishing.
         """
-        raw = cast("list[str]", await self.redis.lrange(self.keys.departed, 0, limit - 1))
+        raw = _str_list(await self.redis.lrange(self.keys.departed, 0, limit - 1))
         return [json.loads(r) for r in raw]
 
     async def clear_departed(self) -> int:
@@ -467,12 +472,12 @@ class Queue:
 
     async def _ids(self, state: JobState, limit: int) -> list[str]:
         if state in ("wait", "prioritized"):
-            return cast("list[str]", await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
+            return _str_list(await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
         if state == "active":
-            return cast("list[str]", await self.redis.lrange(self.keys.active, 0, limit - 1))
+            return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
         if state in ("delayed", "completed", "failed"):
             zset = getattr(self.keys, state)
-            return cast("list[str]", await self.redis.zrange(zset, 0, limit - 1))
+            return _str_list(await self.redis.zrange(zset, 0, limit - 1))
         raise ValueError(f"unknown state: {state}")
 
     async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:
