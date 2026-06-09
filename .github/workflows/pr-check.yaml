@@ -1,12 +1,25 @@
-name: CI
+name: PR check
 
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - main
+      - feature*
   pull_request:
+    types: [opened, synchronize, reopened]
+
+# Read-only by default — nothing here writes to the repo. SonarCloud PR
+# decoration comes from the SonarCloud GitHub App, not GITHUB_TOKEN write scopes.
+permissions:
+  contents: read
 
 jobs:
   check:
+    name: Lint, types, tests & Sonar
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       redis:
         image: redis:7-alpine
@@ -43,8 +56,8 @@ jobs:
       - name: Tests (unit + integration)
         run: uv run pytest -m "unit or integration" --cov=toro --cov-report=xml
 
-      # Runs only when SONAR_TOKEN is set (skipped on forks / before setup, so CI
-      # stays green). Config is passed inline; there is no sonar-project.properties.
+      # Runs only when SONAR_TOKEN is set (skipped on forks / before setup, so the
+      # check stays green). Config is passed inline; there is no sonar-project.properties.
       - name: SonarCloud scan
         if: env.SONAR_TOKEN
         uses: SonarSource/sonarqube-scan-action@v8.0.0
