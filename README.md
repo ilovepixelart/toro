@@ -21,8 +21,8 @@ pip install toro-queue      # the import name is `toro`
 ```
 
 > Installed as **`toro-queue`** on PyPI (the name `toro` was taken), but you
-> `import toro`. See [DESIGN.md](https://github.com/ilovepixelart/toro/blob/main/DESIGN.md) for the architecture and the
-> at-least-once reliability model.
+> `import toro`. See the [docs](https://github.com/ilovepixelart/toro/tree/main/docs) for the
+> architecture, the reliability model, and the detailed guides.
 
 Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web dashboard for your queues.
 
@@ -109,11 +109,6 @@ uv run python examples/basic.py
 
 The suite is a pyramid — `-m unit` (fast, no Redis), `-m integration` (Redis),
 and `-m load` (the open-loop benchmark harness in `tests/load/`).
-
-## Related
-
-- **[matador](https://github.com/ilovepixelart/matador)** — a live, server-rendered web dashboard for toro queues; mount it into your app or run it standalone.
-- **toro-matador-example** — a small FastAPI app that wires toro and matador together end to end.
 
 ## License
 
