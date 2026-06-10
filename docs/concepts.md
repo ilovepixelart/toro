@@ -78,7 +78,7 @@ processors `await`-y.
 ## Events
 
 toro publishes events to a Redis pub/sub channel: `added` when a job is enqueued
-(from the producer in `Queue.add`), `progress` from a running processor
+(published by the add script, atomically with the enqueue), `progress` from a running processor
 (`job.update_progress`), and `completed` / `failed`, which the finish Lua scripts
 publish atomically with the state change. `failed` fires only on terminal failure,
 not on a retry. Two things consume the channel:
