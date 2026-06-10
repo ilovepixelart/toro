@@ -9,11 +9,12 @@ import time
 from typing import Any, cast
 
 from redis.asyncio import Redis
+from redis.asyncio.client import PubSub
 
 from . import scripts
 from .connection import connect
 from .errors import JobFailedError
-from .job import Job, JobOptions, JobState
+from .job import Deduplication, Job, JobOptions, JobState
 from .keys import Keys
 from .scheduler import next_run, valid_cron
 
@@ -31,6 +32,11 @@ def _str_list(reply: Any) -> list[str]:
     return cast("list[str]", reply)
 
 
+def _str_dict(reply: Any) -> dict[str, str]:
+    """Type a Redis hash reply (decode_responses is on) as dict[str, str]."""
+    return cast("dict[str, str]", reply)
+
+
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -41,7 +47,7 @@ class Queue:
         connection: Redis | None = None,
         url: str = "redis://localhost:6379",
         prefix: str = "toro",
-        default_job_options: dict | None = None,
+        default_job_options: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         # Defaults merged into every add() (per-call options win) — e.g.
@@ -60,9 +66,9 @@ class Queue:
         # dispatcher task routes each terminal event to the futures registered
         # for that jobId. One pubsub per waiter would cost waiters x events
         # client work and cap concurrent waiters at the connection pool size.
-        self._result_waiters: dict[str, list[asyncio.Future]] = {}
-        self._events_pubsub = None
-        self._events_task: asyncio.Task | None = None
+        self._result_waiters: dict[str, list[asyncio.Future[Any]]] = {}
+        self._events_pubsub: PubSub | None = None
+        self._events_task: asyncio.Task[None] | None = None
         self._dispatcher_lock = asyncio.Lock()
 
     async def add(
@@ -71,7 +77,7 @@ class Queue:
         data: Any = None,
         *,
         job_id: str | None = None,
-        deduplication: dict | None = None,
+        deduplication: Deduplication | None = None,
         **opts: Any,
     ) -> Job:
         """Enqueue a job. Returns the created Job (with its id).
@@ -150,7 +156,7 @@ class Queue:
         """
         job_id = str(job_id)
         await self._ensure_dispatcher()
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._result_waiters.setdefault(job_id, []).append(fut)
         try:
             job = await self.get_job(job_id)
@@ -185,7 +191,7 @@ class Queue:
             self._events_pubsub = pubsub
             self._events_task = asyncio.create_task(self._dispatch_events(pubsub))
 
-    async def _dispatch_events(self, pubsub: Any) -> None:
+    async def _dispatch_events(self, pubsub: PubSub) -> None:
         """Consume the shared events subscription and route each message."""
         try:
             while True:
@@ -250,6 +256,10 @@ class Queue:
             )
         if (every is None) == (cron is None):
             raise ValueError("pass exactly one of `every` or `cron`")
+        if every is not None and int(every) <= 0:
+            # 0 would otherwise surface as a confusing "needs either" error and a
+            # negative interval as garbage grid math — fail clearly at the source.
+            raise ValueError("`every` must be a positive number of milliseconds")
         if cron is not None and not valid_cron(cron):
             # fail at enqueue, not later inside a worker's _schedule_next (a silent
             # scheduler that errors on the backend)
@@ -269,7 +279,9 @@ class Queue:
         await self._enqueue_occurrence(scheduler_id, when, template)
         return scheduler_id
 
-    async def _enqueue_occurrence(self, scheduler_id: str, when: int, template: dict) -> None:
+    async def _enqueue_occurrence(
+        self, scheduler_id: str, when: int, template: dict[str, str]
+    ) -> None:
         opts = json.loads(template["opts"])
         await self._add_scheduled(
             keys=[self.keys.delayed, self.keys.base],
@@ -316,7 +328,7 @@ class Queue:
         )
         return True
 
-    async def schedulers(self) -> list[dict]:
+    async def schedulers(self) -> list[dict[str, Any]]:
         """List active schedulers (for the dashboard)."""
         entries = cast(
             "list[tuple[str, float]]",
@@ -342,7 +354,7 @@ class Queue:
         return out
 
     async def get_job(self, job_id: str) -> Job | None:
-        h = await self.redis.hgetall(self.keys.job(job_id))
+        h = _str_dict(await self.redis.hgetall(self.keys.job(job_id)))
         if not h:
             return None
         return Job.from_hash(job_id, h)
@@ -369,7 +381,7 @@ class Queue:
             "failed": failed,
         }
 
-    async def workers(self, *, stale_after: int = 30_000) -> list[dict]:
+    async def workers(self, *, stale_after: int = 30_000) -> list[dict[str, Any]]:
         """Live workers, from the presence records their heartbeats write. An entry
         with no heartbeat for `stale_after` ms is treated as dead and pruned here,
         so a crashed worker (which never deregistered) disappears on its own.
@@ -381,9 +393,9 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for wid in ids:
             pipe.hgetall(self.keys.worker(wid))
-        hashes = cast("list[dict]", await pipe.execute())
-        live: list[dict] = []
-        dead: list[tuple[str, dict]] = []
+        hashes = cast("list[dict[str, str]]", await pipe.execute())
+        live: list[dict[str, Any]] = []
+        dead: list[tuple[str, dict[str, Any]]] = []
         for wid, h in zip(ids, hashes, strict=True):
             heartbeat = int(h.get("heartbeat", 0)) if h else 0
             if not h or now - heartbeat > stale_after:
@@ -438,7 +450,7 @@ class Queue:
         live.sort(key=lambda w: w["started"])
         return live
 
-    async def departed_workers(self, limit: int = 20) -> list[dict]:
+    async def departed_workers(self, limit: int = 20) -> list[dict[str, Any]]:
         """Recent worker departures, newest first — graceful stops ("stopped") and
         lost heartbeats ("lost"). A bounded death-log so the dashboard can show what
         left, when, and why, instead of workers silently vanishing.
@@ -522,22 +534,29 @@ class Queue:
         )
         return bool(res)
 
-    async def _ids(self, state: JobState, limit: int) -> list[str]:
+    async def _ids(self, state: JobState, limit: int, *, newest: bool = False) -> list[str]:
+        """Ids in a state. `newest=True` mirrors get_jobs()'s ordering — finished
+        states come newest-first (what a dashboard shows as "recent"); the other
+        states have one natural order (priority / claim / due-time) either way.
+        """
         if state in ("wait", "prioritized"):
             return _str_list(await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
         if state in ("delayed", "completed", "failed"):
             zset = getattr(self.keys, state)
+            if newest and state in ("completed", "failed"):
+                return _str_list(await self.redis.zrevrange(zset, 0, limit - 1))
             return _str_list(await self.redis.zrange(zset, 0, limit - 1))
         raise ValueError(f"unknown state: {state}")
 
     async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:
         """Substring-search `name`/`data` within a state's most recent `scan_limit`
         jobs (Redis hashes aren't queryable, so this is a bounded scan + filter).
-        Returns the matches; the caller should surface the scan bound honestly.
+        Scans the same end of the set get_jobs() pages — newest first for finished
+        states. Returns the matches; the caller should surface the scan bound honestly.
         """
-        ids = await self._ids(state, scan_limit)
+        ids = await self._ids(state, scan_limit, newest=True)
         if not ids:
             return []
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
@@ -556,8 +575,10 @@ class Queue:
 
         Pipelines the per-job RETRY_JOB scripts — one round trip per batch, not
         one per job (same shape as clean(); ~17x faster than a serial loop).
+        When `limit` truncates, the newest failures go first — the ones a
+        dashboard is showing.
         """
-        ids = await self._ids("failed", limit)
+        ids = await self._ids("failed", limit, newest=True)
         if not ids:
             return 0
         sha = await self.redis.script_load(scripts.RETRY_JOB)  # ensure loaded for EVALSHA
@@ -577,7 +598,9 @@ class Queue:
         return sum(1 for r in res if r)
 
     async def clean(self, state: JobState, limit: int = 1000) -> int:
-        """Remove every job in a state (up to `limit`). Returns how many were removed.
+        """Remove every job in a state (up to `limit`, oldest first — when the
+        limit truncates, old history goes before recent results). Returns how
+        many were removed.
 
         Pipelines the per-job removals — one round trip per batch, not one per job —
         so clearing a large state stays fast (thousands of jobs in well under a second).

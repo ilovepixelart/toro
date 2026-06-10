@@ -21,30 +21,42 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import socket
 import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
 
 from . import scripts
 from .connection import connect
-from .job import Job, JobContext, JobOptions
+from .job import Backoff, Job, JobContext, JobOptions
 from .keys import Keys
 from .scheduler import next_run
 
 Processor = Callable[[Job], Awaitable[Any]]
+
+logger = logging.getLogger(__name__)
+
+
+class RateLimit(TypedDict):
+    """The queue-wide token bucket: ``{"max": N, "duration": ms}`` — at most N
+    job starts per duration, shared by every worker on the queue.
+    """
+
+    max: int
+    duration: int
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _pairs(flat: list | None) -> dict:
+def _pairs(flat: list[str] | None) -> dict[str, str]:
     """Turn a flat HGETALL array [k, v, k, v, ...] into a dict."""
     if not flat:
         return {}
@@ -52,7 +64,7 @@ def _pairs(flat: list | None) -> dict:
     return dict(zip(it, it, strict=False))
 
 
-def compute_backoff(backoff: Any, attempts_made: int) -> int:
+def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
     """Delay (ms) before the next attempt. `backoff` is None/0, an int (fixed ms),
     or {"type": "fixed"|"exponential", "delay": ms}. Exponential doubles per attempt.
     Pure function so it can be unit-tested without a Redis-bound Worker.
@@ -79,7 +91,7 @@ class Worker:
         url: str = "redis://localhost:6379",
         prefix: str = "toro",
         concurrency: int = 1,
-        rate_limit: dict | None = None,
+        rate_limit: RateLimit | None = None,
         block_timeout: float = 5.0,
         lock_duration: int = 30000,
         lock_renew_time: int | None = None,
@@ -119,8 +131,8 @@ class Worker:
         self.heartbeat_interval = heartbeat_interval
 
         self._running = False
-        self._tasks: list[asyncio.Task] = []
-        self._process_tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[None]] = []
+        self._process_tasks: list[asyncio.Task[None]] = []
 
         # Presence + throughput for the "workers" view; flushed to Redis each heartbeat.
         self.started_at = 0
@@ -141,14 +153,19 @@ class Worker:
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
 
         # Simple event callbacks: worker.on("completed", fn)
-        self._handlers: dict[str, list[Callable]] = {}
+        self._handlers: dict[str, list[Callable[..., Any]]] = {}
 
-    def on(self, event: str, fn: Callable) -> None:
+    def on(self, event: str, fn: Callable[..., Any]) -> None:
         self._handlers.setdefault(event, []).append(fn)
 
     def _emit(self, event: str, *args: Any) -> None:
         for fn in self._handlers.get(event, []):
-            fn(*args)
+            try:
+                fn(*args)
+            except Exception:  # noqa: PERF203 — per-callback isolation is the point
+                # A user callback must never hurt the worker: the job outcome is
+                # already committed by the time events fire, so log and move on.
+                logger.exception("%r event handler raised", event)
 
     async def run(self) -> None:
         """Start processing until stop() is called. Awaitable forever."""
@@ -165,7 +182,12 @@ class Worker:
             bg.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks = [*self._process_tasks, *bg]
         with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(*self._tasks)
+            # return_exceptions: one freak task failure must not crash run() and
+            # take every other slot down with it (each loop also guards itself).
+            results = await asyncio.gather(*self._tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.error("worker task died: %r", res)
 
     async def stop(self, grace_period: float | None = None) -> None:
         """Graceful shutdown: stop fetching new jobs, let in-flight jobs finish
@@ -251,25 +273,29 @@ class Worker:
     # ---- the hot path -----------------------------------------------------
 
     async def _process_loop(self) -> None:
+        # One guard around the WHOLE iteration: a transient Redis error, a corrupt
+        # job hash, or anything else unexpected costs one beat, never the slot. A
+        # job interrupted mid-flight stays locked in `active` until its lock
+        # expires and the stalled sweep recovers it — the normal at-least-once path.
         while self._running:
             try:
                 # The marker only wakes us; the real claim is the atomic
                 # MOVE_TO_ACTIVE below. A timeout (None) is fine — we still try
                 # to acquire, so a missed marker can never strand a job.
                 await self.redis.bzpopmin(self.keys.marker, self.block_timeout)
+                if not self._running:
+                    break  # shutting down — don't claim a new job
+                loaded = await self._acquire()
+                # Keep processing as long as each finish hands us the next job.
+                while loaded is not None and self._running:
+                    loaded = await self._handle(loaded)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                logger.exception("process loop hiccup; the slot lives on")
                 await asyncio.sleep(0.1)
-                continue
-            if not self._running:
-                break  # shutting down — don't claim a new job
-            loaded = await self._acquire()
-            # Keep processing as long as each finish hands us the next job.
-            while loaded is not None and self._running:
-                loaded = await self._handle(loaded)
 
-    async def _acquire(self) -> tuple[str, dict] | None:
+    async def _acquire(self) -> tuple[str, dict[str, str]] | None:
         """Pop the highest-priority job into `active`, lock + load it."""
         res = await self._move_to_active(
             keys=[
@@ -300,7 +326,7 @@ class Worker:
             with contextlib.suppress(Exception):  # pragma: no cover
                 await self.redis.zadd(self.keys.marker, {"0": 0})
 
-    def _loaded(self, res: list | None) -> tuple[str, dict] | None:
+    def _loaded(self, res: list[Any] | None) -> tuple[str, dict[str, str]] | None:
         if not res:
             return None
         fields = _pairs(res[0])
@@ -308,7 +334,9 @@ class Worker:
             return None
         return (res[1], fields)
 
-    async def _handle(self, loaded: tuple[str, dict]) -> tuple[str, dict] | None:
+    async def _handle(
+        self, loaded: tuple[str, dict[str, str]]
+    ) -> tuple[str, dict[str, str]] | None:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
         # Give the handler the ability to report progress and append logs.
@@ -340,7 +368,7 @@ class Worker:
                 renewer.cancel()
         return nxt
 
-    async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict] | None:
+    async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_completed(
             keys=[
                 self.keys.active,
@@ -375,7 +403,7 @@ class Worker:
         self._emit("completed", job, result)
         return self._next_from(res)
 
-    async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict] | None:
+    async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_failed(
             keys=[
                 self.keys.active,
@@ -443,7 +471,7 @@ class Worker:
         # Don't fetch a next job while shutting down — let the queue drain cleanly.
         return "1" if self._running else "0"
 
-    def _next_from(self, res: Any) -> tuple[str, dict] | None:
+    def _next_from(self, res: Any) -> tuple[str, dict[str, str]] | None:
         if isinstance(res, (list, tuple)) and len(res) >= 3:
             return (res[2], _pairs(res[1]))
         return None
