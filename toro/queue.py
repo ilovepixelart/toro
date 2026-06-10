@@ -66,9 +66,9 @@ class Queue:
         # dispatcher task routes each terminal event to the futures registered
         # for that jobId. One pubsub per waiter would cost waiters x events
         # client work and cap concurrent waiters at the connection pool size.
-        self._result_waiters: dict[str, list[asyncio.Future]] = {}
+        self._result_waiters: dict[str, list[asyncio.Future[Any]]] = {}
         self._events_pubsub: PubSub | None = None
-        self._events_task: asyncio.Task | None = None
+        self._events_task: asyncio.Task[None] | None = None
         self._dispatcher_lock = asyncio.Lock()
 
     async def add(
@@ -156,7 +156,7 @@ class Queue:
         """
         job_id = str(job_id)
         await self._ensure_dispatcher()
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._result_waiters.setdefault(job_id, []).append(fut)
         try:
             job = await self.get_job(job_id)
@@ -393,7 +393,7 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for wid in ids:
             pipe.hgetall(self.keys.worker(wid))
-        hashes = cast("list[dict]", await pipe.execute())
+        hashes = cast("list[dict[str, str]]", await pipe.execute())
         live: list[dict[str, Any]] = []
         dead: list[tuple[str, dict[str, Any]]] = []
         for wid, h in zip(ids, hashes, strict=True):

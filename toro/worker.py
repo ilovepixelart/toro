@@ -131,8 +131,8 @@ class Worker:
         self.heartbeat_interval = heartbeat_interval
 
         self._running = False
-        self._tasks: list[asyncio.Task] = []
-        self._process_tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[None]] = []
+        self._process_tasks: list[asyncio.Task[None]] = []
 
         # Presence + throughput for the "workers" view; flushed to Redis each heartbeat.
         self.started_at = 0
@@ -153,9 +153,9 @@ class Worker:
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
 
         # Simple event callbacks: worker.on("completed", fn)
-        self._handlers: dict[str, list[Callable]] = {}
+        self._handlers: dict[str, list[Callable[..., Any]]] = {}
 
-    def on(self, event: str, fn: Callable) -> None:
+    def on(self, event: str, fn: Callable[..., Any]) -> None:
         self._handlers.setdefault(event, []).append(fn)
 
     def _emit(self, event: str, *args: Any) -> None:
