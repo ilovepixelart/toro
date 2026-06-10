@@ -82,7 +82,7 @@ frees (emitting a `rate-limited` event with the wait).
 | Event | Args | When |
 |---|---|---|
 | `completed` | `job, result` | A job committed successfully. |
-| `failed` | `job, exc` | A job failed terminally (also fired by the sweep for stall-failed jobs, with the job id). |
+| `failed` | `job, exc` | A job failed terminally. The sweep fires it too for stall-failed jobs — there with the job *id* (not a `Job`) and a `RuntimeError("job stalled too many times")`, while the job hash's `failedReason` reads `"job stalled more than allowable limit"`. |
 | `retrying` | `job, exc` | A failure with attempts left was re-queued. |
 | `stalled` | `job_id` | The sweep recovered one of this queue's jobs. |
 | `lock-lost` | `job_id` | This worker's lock was taken over; its result was dropped. |
