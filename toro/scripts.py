@@ -34,6 +34,11 @@ would require hash-tagging the keys (e.g. `{queue}`) so a queue's keys share a s
 PRIORITY_OFFSET = 1048576  # 2^20  — max priority (most urgent)
 SEQ_MOD = 4294967296  # 2^32  — sequence wrap window
 
+# Max due jobs one PROMOTE_DELAYED call moves (~6 Redis commands each). Bounds
+# how long a sweep can block Redis (~3ms a batch); callers loop until a short
+# batch signals the backlog is drained.
+PROMOTE_BATCH = 1000
+
 # Lua → Python return protocol: sentinels the scripts emit, decoded in worker.py.
 RL_SENTINEL = "__rl__"  # ACQUIRE hit the rate limiter; res[1] = ms until a token frees
 LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already reclaimed)
@@ -138,14 +143,21 @@ end
 # Add a job. With no custom id, generates one server-side (INCR) so concurrent
 # producers never collide. With a custom id, the add is IDEMPOTENT: if a job with
 # that id already exists it's returned unchanged (dedup).
+# Publishes the "added" event from HERE (not a second client round trip) so a
+# single round trip covers enqueue + dashboard wakeup; every return path
+# announces, matching the previous always-publish behavior.
 # KEYS[1] id counter  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] delayed
-# KEYS[5] key base  KEYS[6] pc (priority counter)
+# KEYS[5] key base  KEYS[6] pc (priority counter)  KEYS[7] events channel
 # ARGV[1] name  ARGV[2] data(json)  ARGV[3] opts(json)
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
 ADD_JOB = (
     _LIB
     + """
+local function announce(jobId)
+  redis.call("PUBLISH", KEYS[7],
+    '{"jobId":' .. cjson.encode(tostring(jobId)) .. ',"event":"added"}')
+end
 local base = KEYS[5]
 -- Throttle dedup: within the TTL window, a repeat dedup id is ignored and the
 -- already-queued job's id is returned (self-expiring, no finish-side cleanup).
@@ -153,12 +165,16 @@ local dedupKey
 if ARGV[8] ~= "" then
   dedupKey = base .. "de:" .. ARGV[8]
   local existing = redis.call("GET", dedupKey)
-  if existing then return existing end
+  if existing then
+    announce(existing)
+    return existing
+  end
 end
 local jobId = ARGV[7]
 if jobId == "" then
   jobId = redis.call("INCR", KEYS[1])
 elseif redis.call("EXISTS", base .. jobId) == 1 then
+  announce(jobId)
   return jobId
 end
 local jobKey = base .. jobId
@@ -177,6 +193,7 @@ else
   redis.call("HSET", jobKey, "state", "wait")
   enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
 end
+announce(jobId)
 return jobId
 """
 )
@@ -414,13 +431,15 @@ return {failed, recovered}
 """
 )
 
-# Move every delayed job whose time has come into `prioritized` (at its priority).
+# Move delayed jobs whose time has come into `prioritized` (at their priority),
+# at most ARGV[2] per call so a big due-backlog can't block Redis for one long
+# sweep — callers loop while a full batch comes back (see Worker._promote_loop).
 # KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] key base  KEYS[5] pc
-# ARGV[1] now(ms)
+# ARGV[1] now(ms)  ARGV[2] max jobs per call
 PROMOTE_DELAYED = (
     _LIB
     + """
-local jobs = redis.call("ZRANGEBYSCORE", KEYS[1], 0, ARGV[1])
+local jobs = redis.call("ZRANGEBYSCORE", KEYS[1], 0, ARGV[1], "LIMIT", 0, tonumber(ARGV[2]))
 for _, jobId in ipairs(jobs) do
   redis.call("ZREM", KEYS[1], jobId)
   local jobKey = KEYS[4] .. jobId

@@ -1,6 +1,6 @@
 """Worker: the consumer side. Pulls jobs and runs a processor over them.
 
-Reliability model (this is the core — see DESIGN.md):
+Reliability model (this is the core — see docs/architecture.md):
   * Jobs live in one `prioritized` ZSET (global priority order). A parked worker
     wakes on `BZPOPMIN` of a 0-scored base marker; the atomic claim is
     `MOVE_TO_ACTIVE` (`ZPOPMIN prioritized` → `active` → lock + load). The marker
@@ -92,7 +92,10 @@ class Worker:
         self.name = name
         self.processor = processor
         self.keys = Keys(name, prefix)
-        self.redis = connection or connect(url)
+        # Each process loop PARKS a connection inside BZPOPMIN, so the pool must
+        # exceed the concurrency or loops starve waiting for connections. A
+        # caller-provided connection must be sized accordingly by the caller.
+        self.redis = connection or connect(url, max_connections=max(50, concurrency + 10))
         self.concurrency = concurrency
         # Queue-wide rate limit, shared by all workers via one token bucket in Redis.
         # `{"max": N, "duration": ms}` = at most N jobs per duration. All workers on a
@@ -467,16 +470,21 @@ class Worker:
     async def _promote_loop(self) -> None:
         while self._running:
             try:
-                await self._promote_delayed(
-                    keys=[
-                        self.keys.delayed,
-                        self.keys.prioritized,
-                        self.keys.marker,
-                        self.keys.base,
-                        self.keys.pc,
-                    ],
-                    args=[_now_ms()],
-                )
+                # Drain in bounded chunks: a full batch means more may be due, so
+                # go again at once — each call blocks Redis ~ms, not the whole sweep.
+                while self._running:
+                    promoted = await self._promote_delayed(
+                        keys=[
+                            self.keys.delayed,
+                            self.keys.prioritized,
+                            self.keys.marker,
+                            self.keys.base,
+                            self.keys.pc,
+                        ],
+                        args=[_now_ms(), scripts.PROMOTE_BATCH],
+                    )
+                    if int(promoted) < scripts.PROMOTE_BATCH:
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - best-effort background sweep
