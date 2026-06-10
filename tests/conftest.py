@@ -4,12 +4,18 @@ Layout: tests/unit (pure, no I/O) · tests/integration (Redis-backed) · tests/l
 Tests are auto-marked by their folder, so `pytest -m unit` runs the fast layer and
 `-m integration` the Redis layer. Integration/load tests skip cleanly when no Redis
 is reachable on localhost:6379.
+
+The load layer runs CI-sized volumes by default; set TORO_LOAD_SCALE to multiply
+the dataset sizes for a real volume run (e.g. `TORO_LOAD_SCALE=10 pytest -m load -s`
+sweeps 500k delayed jobs and a 1M-entry active list). Sustained-rate load lives in
+tests/load/harness.py (open-loop, arbitrary λ).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -57,6 +63,16 @@ def _require_redis(request):
     )
     if needs_redis and not _redis_reachable():
         pytest.skip("needs a Redis on localhost:6379")
+
+
+@pytest.fixture(scope="session")
+def load_scale() -> float:
+    """Volume multiplier for the load layer (TORO_LOAD_SCALE, default 1).
+
+    Tests multiply their dataset sizes by this, so the same suite serves as a
+    fast CI guardrail and, dialed up, a genuine volume run.
+    """
+    return max(1.0, float(os.environ.get("TORO_LOAD_SCALE", "1")))
 
 
 # ---- fixtures & helpers ----------------------------------------------------------
