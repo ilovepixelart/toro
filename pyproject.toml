@@ -110,5 +110,9 @@ skip_covered = true
 [tool.ty.environment]
 python-version = "3.10"
 
+# Strictest ty: every rule, including the warn-by-default ones, fails the build.
+[tool.ty.rules]
+all = "error"
+
 [tool.ty.src]
 include = ["toro"]

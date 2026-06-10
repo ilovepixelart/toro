@@ -53,7 +53,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Lint (ruff)
         run: uv run ruff check .
