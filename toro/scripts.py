@@ -130,8 +130,15 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
   redis.call("HSET", jobKey, prop, val, "finishedOn", now, "state", state)
   if keepAge >= 0 then
     local cutoff = now - keepAge * 1000
-    delJobs(redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff), base)
-    redis.call("ZREMRANGEBYSCORE", setKey, "-inf", "(" .. cutoff)
+    -- Bounded per call: enabling an age limit on a deep finished backlog must
+    -- not sweep it all in one Redis-blocking pass — the remainder amortizes
+    -- over subsequent finishes (same idea as PROMOTE_DELAYED's batch).
+    local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
+                               "LIMIT", 0, 1000)
+    if #expired > 0 then
+      delJobs(expired, base)
+      redis.call("ZREM", setKey, unpack(expired))
+    end
   end
   if keepCount > 0 then
     delJobs(redis.call("ZREVRANGE", setKey, keepCount, -1), base)

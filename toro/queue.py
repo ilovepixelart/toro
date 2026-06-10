@@ -250,6 +250,10 @@ class Queue:
             )
         if (every is None) == (cron is None):
             raise ValueError("pass exactly one of `every` or `cron`")
+        if every is not None and int(every) <= 0:
+            # 0 would otherwise surface as a confusing "needs either" error and a
+            # negative interval as garbage grid math — fail clearly at the source.
+            raise ValueError("`every` must be a positive number of milliseconds")
         if cron is not None and not valid_cron(cron):
             # fail at enqueue, not later inside a worker's _schedule_next (a silent
             # scheduler that errors on the backend)
@@ -522,22 +526,29 @@ class Queue:
         )
         return bool(res)
 
-    async def _ids(self, state: JobState, limit: int) -> list[str]:
+    async def _ids(self, state: JobState, limit: int, *, newest: bool = False) -> list[str]:
+        """Ids in a state. `newest=True` mirrors get_jobs()'s ordering — finished
+        states come newest-first (what a dashboard shows as "recent"); the other
+        states have one natural order (priority / claim / due-time) either way.
+        """
         if state in ("wait", "prioritized"):
             return _str_list(await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
         if state in ("delayed", "completed", "failed"):
             zset = getattr(self.keys, state)
+            if newest and state in ("completed", "failed"):
+                return _str_list(await self.redis.zrevrange(zset, 0, limit - 1))
             return _str_list(await self.redis.zrange(zset, 0, limit - 1))
         raise ValueError(f"unknown state: {state}")
 
     async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:
         """Substring-search `name`/`data` within a state's most recent `scan_limit`
         jobs (Redis hashes aren't queryable, so this is a bounded scan + filter).
-        Returns the matches; the caller should surface the scan bound honestly.
+        Scans the same end of the set get_jobs() pages — newest first for finished
+        states. Returns the matches; the caller should surface the scan bound honestly.
         """
-        ids = await self._ids(state, scan_limit)
+        ids = await self._ids(state, scan_limit, newest=True)
         if not ids:
             return []
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
@@ -556,8 +567,10 @@ class Queue:
 
         Pipelines the per-job RETRY_JOB scripts — one round trip per batch, not
         one per job (same shape as clean(); ~17x faster than a serial loop).
+        When `limit` truncates, the newest failures go first — the ones a
+        dashboard is showing.
         """
-        ids = await self._ids("failed", limit)
+        ids = await self._ids("failed", limit, newest=True)
         if not ids:
             return 0
         sha = await self.redis.script_load(scripts.RETRY_JOB)  # ensure loaded for EVALSHA
@@ -577,7 +590,9 @@ class Queue:
         return sum(1 for r in res if r)
 
     async def clean(self, state: JobState, limit: int = 1000) -> int:
-        """Remove every job in a state (up to `limit`). Returns how many were removed.
+        """Remove every job in a state (up to `limit`, oldest first — when the
+        limit truncates, old history goes before recent results). Returns how
+        many were removed.
 
         Pipelines the per-job removals — one round trip per batch, not one per job —
         so clearing a large state stays fast (thousands of jobs in well under a second).
