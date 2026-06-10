@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast
 
 from redis.asyncio import Redis
 
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
 JobState = Literal["wait", "active", "delayed", "completed", "failed"]
+
+
+class BackoffOpts(TypedDict, total=False):
+    """Retry backoff as a dict: ``{"type": "fixed"|"exponential", "delay": ms}``."""
+
+    type: Literal["fixed", "exponential"]
+    delay: int
+
+
+class Deduplication(TypedDict):
+    """``Queue.add()``'s throttle window: ``{"id": str, "ttl": ms}``."""
+
+    id: str
+    ttl: int
+
+
+# What the `backoff` option accepts: nothing, fixed ms, or a BackoffOpts dict.
+# (String aliases: evaluated only by type checkers, never at import time.)
+Backoff: TypeAlias = "int | float | BackoffOpts | None"
+# Auto-removal: None/False keep all · True remove at once · int keep the newest N ·
+# {"count": N, "age": seconds} bound both.
+RemoveOption: TypeAlias = "bool | int | dict[str, int] | None"
 
 
 class SupportsResult(Protocol):
@@ -27,14 +49,12 @@ class JobOptions:
 
     delay: int = 0  # ms to wait before the job becomes processable
     attempts: int = 1  # total tries before the job is considered failed
-    backoff: Any = None  # int ms, or {"type": "fixed"|"exponential", "delay": ms}
+    backoff: Backoff = None  # int ms, or {"type": "fixed"|"exponential", "delay": ms}
     priority: int = 0  # higher = more urgent (global order); 0 = default, FIFO
-    # Auto-removal: None/False keep all · True remove on finish · int keep last N ·
-    # {"count": N, "age": seconds} keep within count and/or age.
-    remove_on_complete: Any = None
-    remove_on_fail: Any = None
+    remove_on_complete: RemoveOption = None
+    remove_on_fail: RemoveOption = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "delay": self.delay,
             "attempts": self.attempts,
@@ -45,7 +65,7 @@ class JobOptions:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> JobOptions:
+    def from_dict(cls, d: dict[str, Any]) -> JobOptions:
         return cls(
             delay=d.get("delay", 0),
             attempts=d.get("attempts", 1),
@@ -56,7 +76,7 @@ class JobOptions:
         )
 
     @staticmethod
-    def keep_args(opt: Any) -> tuple[int, int]:
+    def keep_args(opt: RemoveOption) -> tuple[int, int]:
         """Map a remove option to (keepCount, keepAge_seconds) for the Lua side.
 
         keepCount: -1 keep all · 0 remove immediately · N keep newest N.
@@ -135,7 +155,7 @@ class Job:
         await self._ctx.redis.rpush(self._ctx.logs_key, message)
 
     @classmethod
-    def from_hash(cls, job_id: str, h: dict) -> Job:
+    def from_hash(cls, job_id: str, h: dict[str, str]) -> Job:
         """Build a Job from a decoded Redis hash (str keys/values)."""
         return cls(
             id=job_id,

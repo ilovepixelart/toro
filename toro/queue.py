@@ -9,11 +9,12 @@ import time
 from typing import Any, cast
 
 from redis.asyncio import Redis
+from redis.asyncio.client import PubSub
 
 from . import scripts
 from .connection import connect
 from .errors import JobFailedError
-from .job import Job, JobOptions, JobState
+from .job import Deduplication, Job, JobOptions, JobState
 from .keys import Keys
 from .scheduler import next_run, valid_cron
 
@@ -31,6 +32,11 @@ def _str_list(reply: Any) -> list[str]:
     return cast("list[str]", reply)
 
 
+def _str_dict(reply: Any) -> dict[str, str]:
+    """Type a Redis hash reply (decode_responses is on) as dict[str, str]."""
+    return cast("dict[str, str]", reply)
+
+
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -41,7 +47,7 @@ class Queue:
         connection: Redis | None = None,
         url: str = "redis://localhost:6379",
         prefix: str = "toro",
-        default_job_options: dict | None = None,
+        default_job_options: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         # Defaults merged into every add() (per-call options win) — e.g.
@@ -61,7 +67,7 @@ class Queue:
         # for that jobId. One pubsub per waiter would cost waiters x events
         # client work and cap concurrent waiters at the connection pool size.
         self._result_waiters: dict[str, list[asyncio.Future]] = {}
-        self._events_pubsub = None
+        self._events_pubsub: PubSub | None = None
         self._events_task: asyncio.Task | None = None
         self._dispatcher_lock = asyncio.Lock()
 
@@ -71,7 +77,7 @@ class Queue:
         data: Any = None,
         *,
         job_id: str | None = None,
-        deduplication: dict | None = None,
+        deduplication: Deduplication | None = None,
         **opts: Any,
     ) -> Job:
         """Enqueue a job. Returns the created Job (with its id).
@@ -185,7 +191,7 @@ class Queue:
             self._events_pubsub = pubsub
             self._events_task = asyncio.create_task(self._dispatch_events(pubsub))
 
-    async def _dispatch_events(self, pubsub: Any) -> None:
+    async def _dispatch_events(self, pubsub: PubSub) -> None:
         """Consume the shared events subscription and route each message."""
         try:
             while True:
@@ -273,7 +279,9 @@ class Queue:
         await self._enqueue_occurrence(scheduler_id, when, template)
         return scheduler_id
 
-    async def _enqueue_occurrence(self, scheduler_id: str, when: int, template: dict) -> None:
+    async def _enqueue_occurrence(
+        self, scheduler_id: str, when: int, template: dict[str, str]
+    ) -> None:
         opts = json.loads(template["opts"])
         await self._add_scheduled(
             keys=[self.keys.delayed, self.keys.base],
@@ -320,7 +328,7 @@ class Queue:
         )
         return True
 
-    async def schedulers(self) -> list[dict]:
+    async def schedulers(self) -> list[dict[str, Any]]:
         """List active schedulers (for the dashboard)."""
         entries = cast(
             "list[tuple[str, float]]",
@@ -346,7 +354,7 @@ class Queue:
         return out
 
     async def get_job(self, job_id: str) -> Job | None:
-        h = await self.redis.hgetall(self.keys.job(job_id))
+        h = _str_dict(await self.redis.hgetall(self.keys.job(job_id)))
         if not h:
             return None
         return Job.from_hash(job_id, h)
@@ -373,7 +381,7 @@ class Queue:
             "failed": failed,
         }
 
-    async def workers(self, *, stale_after: int = 30_000) -> list[dict]:
+    async def workers(self, *, stale_after: int = 30_000) -> list[dict[str, Any]]:
         """Live workers, from the presence records their heartbeats write. An entry
         with no heartbeat for `stale_after` ms is treated as dead and pruned here,
         so a crashed worker (which never deregistered) disappears on its own.
@@ -386,8 +394,8 @@ class Queue:
         for wid in ids:
             pipe.hgetall(self.keys.worker(wid))
         hashes = cast("list[dict]", await pipe.execute())
-        live: list[dict] = []
-        dead: list[tuple[str, dict]] = []
+        live: list[dict[str, Any]] = []
+        dead: list[tuple[str, dict[str, Any]]] = []
         for wid, h in zip(ids, hashes, strict=True):
             heartbeat = int(h.get("heartbeat", 0)) if h else 0
             if not h or now - heartbeat > stale_after:
@@ -442,7 +450,7 @@ class Queue:
         live.sort(key=lambda w: w["started"])
         return live
 
-    async def departed_workers(self, limit: int = 20) -> list[dict]:
+    async def departed_workers(self, limit: int = 20) -> list[dict[str, Any]]:
         """Recent worker departures, newest first — graceful stops ("stopped") and
         lost heartbeats ("lost"). A bounded death-log so the dashboard can show what
         left, when, and why, instead of workers silently vanishing.

@@ -28,13 +28,13 @@ import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
 
 from . import scripts
 from .connection import connect
-from .job import Job, JobContext, JobOptions
+from .job import Backoff, Job, JobContext, JobOptions
 from .keys import Keys
 from .scheduler import next_run
 
@@ -43,11 +43,20 @@ Processor = Callable[[Job], Awaitable[Any]]
 logger = logging.getLogger(__name__)
 
 
+class RateLimit(TypedDict):
+    """The queue-wide token bucket: ``{"max": N, "duration": ms}`` — at most N
+    job starts per duration, shared by every worker on the queue.
+    """
+
+    max: int
+    duration: int
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _pairs(flat: list | None) -> dict:
+def _pairs(flat: list[str] | None) -> dict[str, str]:
     """Turn a flat HGETALL array [k, v, k, v, ...] into a dict."""
     if not flat:
         return {}
@@ -55,7 +64,7 @@ def _pairs(flat: list | None) -> dict:
     return dict(zip(it, it, strict=False))
 
 
-def compute_backoff(backoff: Any, attempts_made: int) -> int:
+def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
     """Delay (ms) before the next attempt. `backoff` is None/0, an int (fixed ms),
     or {"type": "fixed"|"exponential", "delay": ms}. Exponential doubles per attempt.
     Pure function so it can be unit-tested without a Redis-bound Worker.
@@ -82,7 +91,7 @@ class Worker:
         url: str = "redis://localhost:6379",
         prefix: str = "toro",
         concurrency: int = 1,
-        rate_limit: dict | None = None,
+        rate_limit: RateLimit | None = None,
         block_timeout: float = 5.0,
         lock_duration: int = 30000,
         lock_renew_time: int | None = None,
@@ -286,7 +295,7 @@ class Worker:
                 logger.exception("process loop hiccup; the slot lives on")
                 await asyncio.sleep(0.1)
 
-    async def _acquire(self) -> tuple[str, dict] | None:
+    async def _acquire(self) -> tuple[str, dict[str, str]] | None:
         """Pop the highest-priority job into `active`, lock + load it."""
         res = await self._move_to_active(
             keys=[
@@ -317,7 +326,7 @@ class Worker:
             with contextlib.suppress(Exception):  # pragma: no cover
                 await self.redis.zadd(self.keys.marker, {"0": 0})
 
-    def _loaded(self, res: list | None) -> tuple[str, dict] | None:
+    def _loaded(self, res: list[Any] | None) -> tuple[str, dict[str, str]] | None:
         if not res:
             return None
         fields = _pairs(res[0])
@@ -325,7 +334,9 @@ class Worker:
             return None
         return (res[1], fields)
 
-    async def _handle(self, loaded: tuple[str, dict]) -> tuple[str, dict] | None:
+    async def _handle(
+        self, loaded: tuple[str, dict[str, str]]
+    ) -> tuple[str, dict[str, str]] | None:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
         # Give the handler the ability to report progress and append logs.
@@ -357,7 +368,7 @@ class Worker:
                 renewer.cancel()
         return nxt
 
-    async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict] | None:
+    async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_completed(
             keys=[
                 self.keys.active,
@@ -392,7 +403,7 @@ class Worker:
         self._emit("completed", job, result)
         return self._next_from(res)
 
-    async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict] | None:
+    async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_failed(
             keys=[
                 self.keys.active,
@@ -460,7 +471,7 @@ class Worker:
         # Don't fetch a next job while shutting down — let the queue drain cleanly.
         return "1" if self._running else "0"
 
-    def _next_from(self, res: Any) -> tuple[str, dict] | None:
+    def _next_from(self, res: Any) -> tuple[str, dict[str, str]] | None:
         if isinstance(res, (list, tuple)) and len(res) >= 3:
             return (res[2], _pairs(res[1]))
         return None
