@@ -71,7 +71,7 @@ async def test_age_trim_is_bounded_per_finish(q):
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[job.id, "null", int(time.time() * 1000), token, "0", 30_000, -1, 3600, 0, 0],
+        args=[job.id, "null", int(time.time() * 1000), token, "0", 30_000, -1, 3600, 0, 0, 60_000],
     )
     assert out == [1]
 
