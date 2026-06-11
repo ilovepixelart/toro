@@ -37,6 +37,11 @@ def _str_dict(reply: Any) -> dict[str, str]:
     return cast("dict[str, str]", reply)
 
 
+def _hash_replies(reply: Any) -> list[dict[str, str]]:
+    """Type a pipeline's list of hash replies as list[dict[str, str]]."""
+    return cast("list[dict[str, str]]", reply)
+
+
 class MetricsPoint(TypedDict):
     """One minute of queue activity: counts + summed processing duration."""
 
@@ -348,7 +353,7 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for sid, _ in entries:
             pipe.hgetall(self.keys.scheduler(sid))
-        templates = cast("list[dict[str, str]]", await pipe.execute())
+        templates = _hash_replies(await pipe.execute())
         out = []
         for (sid, when), t in zip(entries, templates, strict=False):
             out.append(
@@ -403,7 +408,7 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for ts in stamps:
             pipe.hgetall(self.keys.metrics_bucket(ts))
-        hashes = cast("list[dict[str, str]]", await pipe.execute())
+        hashes = _hash_replies(await pipe.execute())
         return [
             MetricsPoint(
                 timestamp=ts,
@@ -440,7 +445,7 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for wid in ids:
             pipe.hgetall(self.keys.worker(wid))
-        hashes = cast("list[dict[str, str]]", await pipe.execute())
+        hashes = _hash_replies(await pipe.execute())
         live: list[dict[str, Any]] = []
         dead: list[tuple[str, dict[str, Any]]] = []
         for wid, h in zip(ids, hashes, strict=True):
