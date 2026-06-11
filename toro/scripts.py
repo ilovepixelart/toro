@@ -122,13 +122,20 @@ local function delJobs(ids, base)
   end
 end
 -- Per-minute metrics bucket: one small hash per (queue, minute) holding
--- `completed` / `failed` counts and `ms` (summed processing duration), each
--- bucket self-expiring after retentionMs. Written here, inside the finish
--- scripts, so a counter can never disagree with the transition it counts.
-local function recordMetrics(base, field, now, durMs, retentionMs)
+-- `added` / `completed` / `failed` counts and `ms` (summed processing
+-- duration), each bucket self-expiring after retentionMs. Written here,
+-- inside the same scripts as the transitions, so a counter can never
+-- disagree with the transition it counts. When a job name is given, the
+-- same counts also land in per-name fields ("completed:<name>", ...) so
+-- a dashboard can answer "which job is responsible".
+local function recordMetrics(base, field, now, durMs, retentionMs, name)
   local bucket = base .. "metrics:" .. tostring(math.floor(now / 60000) * 60000)
   redis.call("HINCRBY", bucket, field, 1)
   if durMs > 0 then redis.call("HINCRBY", bucket, "ms", durMs) end
+  if name then
+    redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
+    if durMs > 0 then redis.call("HINCRBY", bucket, "ms:" .. name, durMs) end
+  end
   redis.call("PEXPIRE", bucket, retentionMs)
 end
 -- Record a terminal job in a finished set, applying auto-removal:
@@ -172,6 +179,7 @@ end
 # ARGV[1] name  ARGV[2] data(json)  ARGV[3] opts(json)
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
+# ARGV[10] metricsRetention(ms)
 ADD_JOB = (
     _LIB
     + """
@@ -214,6 +222,8 @@ else
   redis.call("HSET", jobKey, "state", "wait")
   enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
 end
+-- only real inserts count (dedup hits and id replays returned above)
+recordMetrics(base, "added", tonumber(ARGV[4]), 0, tonumber(ARGV[10]))
 announce(jobId)
 return jobId
 """
@@ -265,11 +275,12 @@ if redis.call("GET", KEYS[4]) ~= ARGV[4] then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[3])
--- duration must be read BEFORE recordFinished (remove-on-complete may DEL the hash)
-local startedOn = tonumber(redis.call("HGET", KEYS[3], "processedOn")) or now
+-- read BEFORE recordFinished (remove-on-complete may DEL the hash)
+local meta = redis.call("HMGET", KEYS[3], "processedOn", "name")
+local startedOn = tonumber(meta[1]) or now
 recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now,
   "returnvalue", ARGV[2], "completed", tonumber(ARGV[7]), tonumber(ARGV[8]))
-recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]))
+recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]), meta[2])
 redis.call("PUBLISH", KEYS[10],
   '{"jobId":' .. cjson.encode(ARGV[1]) .. ',"event":"completed","result":' .. ARGV[2] .. '}')
 if ARGV[5] == "1" then
@@ -321,11 +332,12 @@ if attemptsMade < maxAttempts then
   outcome = 0
 else
   local now = tonumber(ARGV[3])
-  -- duration must be read BEFORE recordFinished (remove-on-fail may DEL the hash)
-  local startedOn = tonumber(redis.call("HGET", KEYS[5], "processedOn")) or now
+  -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+  local meta = redis.call("HMGET", KEYS[5], "processedOn", "name")
+  local startedOn = tonumber(meta[1]) or now
   recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now,
     "failedReason", ARGV[2], "failed", tonumber(ARGV[10]), tonumber(ARGV[11]))
-  recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]))
+  recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]), meta[2])
   redis.call("PUBLISH", KEYS[11], '{"jobId":' .. cjson.encode(ARGV[1])
     .. ',"event":"failed","reason":' .. cjson.encode(ARGV[2]) .. '}')
   outcome = 1
@@ -438,7 +450,8 @@ if #stalling > 0 then
           redis.call("HSET", jobKey, "state", "failed",
             "failedReason", "job stalled more than allowable limit",
             "finishedOn", ARGV[2])
-          recordMetrics(KEYS[6], "failed", tonumber(ARGV[2]), 0, tonumber(ARGV[4]))
+          recordMetrics(KEYS[6], "failed", tonumber(ARGV[2]), 0, tonumber(ARGV[4]),
+                        redis.call("HGET", jobKey, "name"))
           table.insert(failed, jobId)
         else
           local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0

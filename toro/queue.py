@@ -46,9 +46,19 @@ class MetricsPoint(TypedDict):
     """One minute of queue activity: counts + summed processing duration."""
 
     timestamp: int  # minute bucket start (ms since epoch)
+    added: int  # jobs enqueued this minute (the leading signal; dedup hits don't count)
     completed: int
     failed: int  # terminal failures only (retries don't count, stall-failures do)
     ms: int  # summed processing duration of jobs finished this minute
+
+
+class NameMetrics(TypedDict):
+    """One job name's totals over a metrics window."""
+
+    name: str
+    completed: int
+    failed: int
+    ms: int  # summed processing duration
 
 
 class Queue:
@@ -145,6 +155,7 @@ class Queue:
                     job_id or "",
                     dedup_id,
                     dedup_ttl,
+                    scripts.METRICS_RETENTION_MS,
                 ],
             )
         )
@@ -412,12 +423,37 @@ class Queue:
         return [
             MetricsPoint(
                 timestamp=ts,
+                added=int(h.get("added", 0)),
                 completed=int(h.get("completed", 0)),
                 failed=int(h.get("failed", 0)),
                 ms=int(h.get("ms", 0)),
             )
             for ts, h in zip(stamps, hashes, strict=True)
         ]
+
+    async def metrics_by_name(self, *, minutes: int = 60) -> list[NameMetrics]:
+        """Per-job-name totals over the window, failures first — the triage
+        order ("which job is responsible"), not the volume order. Names come
+        from the per-name fields the finish scripts write into the same
+        minute buckets ("completed:<name>", "failed:<name>", "ms:<name>").
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for i in range(minutes):
+            pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
+        totals: dict[str, dict[str, int]] = {}
+        for h in _hash_replies(await pipe.execute()):
+            for field, value in h.items():
+                kind, sep, name = field.partition(":")
+                if not sep or kind not in ("completed", "failed", "ms"):
+                    continue  # queue-level field, not a per-name one
+                totals.setdefault(name, {"completed": 0, "failed": 0, "ms": 0})[kind] += int(value)
+        out = [
+            NameMetrics(name=n, completed=t["completed"], failed=t["failed"], ms=t["ms"])
+            for n, t in totals.items()
+        ]
+        return sorted(out, key=lambda t: (-t["failed"], -t["completed"], t["name"]))
 
     async def latency(self) -> int:
         """Age (ms) of the next-to-run waiting job — 0 when nothing is waiting.

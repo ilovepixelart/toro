@@ -135,3 +135,59 @@ async def test_latency_is_age_of_next_waiting_job(q, run_worker, run_until):
     async with run_worker(q, _noop):
         assert await run_until(lambda: _count(q, "completed", 1))
     assert await q.latency() == 0  # drained
+
+
+async def test_added_jobs_count_in_current_minute(q):
+    for _ in range(3):
+        await q.add("m", {})
+    points = await q.metrics(minutes=2)
+    assert sum(p["added"] for p in points) == 3
+    assert sum(p["completed"] for p in points) == 0  # added, not yet processed
+
+
+async def test_dedup_suppressed_adds_do_not_count(q):
+    await q.add("m", {}, deduplication={"id": "once", "ttl": 60_000})
+    await q.add("m", {}, deduplication={"id": "once", "ttl": 60_000})  # suppressed
+    await q.add("m", {}, job_id="fixed-id")
+    await q.add("m", {}, job_id="fixed-id")  # idempotent replay, not a new job
+    points = await q.metrics(minutes=2)
+    assert sum(p["added"] for p in points) == 2  # one per real insert
+
+
+async def test_per_name_counts(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc):
+        await q.add("good", {})
+        await q.add("good", {})
+        await q.add("bad", {}, attempts=1)
+        assert await run_until(lambda: _count(q, "completed", 2))
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    names = await q.metrics_by_name(minutes=2)
+    by = {n["name"]: n for n in names}
+    assert by["good"]["completed"] == 2
+    assert by["good"]["failed"] == 0
+    assert by["bad"]["failed"] == 1
+    assert by["bad"]["completed"] == 0
+    assert by["good"]["ms"] >= 0
+
+
+async def test_metrics_by_name_sorts_failures_first(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "flaky":
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc):
+        for _ in range(5):
+            await q.add("busy", {})
+        await q.add("flaky", {}, attempts=1)
+        assert await run_until(lambda: _count(q, "completed", 5))
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    names = await q.metrics_by_name(minutes=2)
+    assert names[0]["name"] == "flaky"  # failure-first: triage order, not volume

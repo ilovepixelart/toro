@@ -2,7 +2,7 @@
 
 from .errors import JobFailedError, ToroError
 from .job import Backoff, BackoffOpts, Deduplication, Job, JobOptions, JobState, RemoveOption
-from .queue import MetricsPoint, Queue
+from .queue import MetricsPoint, NameMetrics, Queue
 from .worker import RateLimit, Worker
 
 __all__ = [
@@ -14,6 +14,7 @@ __all__ = [
     "JobOptions",
     "JobState",
     "MetricsPoint",
+    "NameMetrics",
     "Queue",
     "RateLimit",
     "RemoveOption",
