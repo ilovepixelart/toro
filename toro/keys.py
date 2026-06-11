@@ -99,8 +99,9 @@ class Keys:
         return f"{self.base}departed"
 
     def metrics_bucket(self, minute_ms: int) -> str:
-        # HASH of per-minute counters {completed, failed, ms} — written by the
-        # finish scripts, self-expiring after METRICS_RETENTION_MS.
+        # HASH of per-minute counters: added/completed/failed/ms at queue level
+        # plus per-name fields ("completed:<name>", ...). Written inside the
+        # add/finish scripts, self-expiring after METRICS_RETENTION_MS.
         return f"{self.base}metrics:{minute_ms}"
 
     def job(self, job_id: str | int) -> str:

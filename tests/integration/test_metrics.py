@@ -94,7 +94,10 @@ async def test_zero_fill_returns_continuous_minutes(q):
     stamps = [p["timestamp"] for p in points]
     assert stamps == sorted(stamps)
     assert all(b - a == 60_000 for a, b in itertools.pairwise(stamps))
-    assert all(p["completed"] == 0 and p["failed"] == 0 and p["ms"] == 0 for p in points)
+    assert all(
+        p["added"] == 0 and p["completed"] == 0 and p["failed"] == 0 and p["ms"] == 0
+        for p in points
+    )
 
 
 async def test_buckets_expire(q, run_worker, run_until):
@@ -191,3 +194,53 @@ async def test_metrics_by_name_sorts_failures_first(q, run_worker, run_until):
 
     names = await q.metrics_by_name(minutes=2)
     assert names[0]["name"] == "flaky"  # failure-first: triage order, not volume
+
+
+async def test_duration_recorded_even_when_hash_is_removed_on_complete(q, run_worker, run_until):
+    # recordMetrics must read processedOn BEFORE recordFinished deletes the
+    # hash, or remove_on_complete=True silently zeroes every duration
+    async def slow(job):
+        await asyncio.sleep(0.05)
+
+    async with run_worker(q, slow):
+        j = await q.add("m", {}, remove_on_complete=True)
+        assert await run_until(lambda: _bucket_total(q, "completed", 1))
+
+    assert await q.get_job(j.id) is None  # hash really gone
+    points = await q.metrics(minutes=2)
+    assert sum(p["ms"] for p in points) >= 40  # duration still captured
+
+
+async def test_added_counts_delayed_jobs(q):
+    await q.add("m", {}, delay=60_000)  # parks in delayed, not wait
+    points = await q.metrics(minutes=2)
+    assert sum(p["added"] for p in points) == 1
+
+
+async def test_per_name_survives_colons_in_the_name(q, run_worker, run_until):
+    async with run_worker(q, _noop):
+        await q.add("user:sync", {})
+        assert await run_until(lambda: _count(q, "completed", 1))
+
+    names = await q.metrics_by_name(minutes=2)
+    assert names[0]["name"] == "user:sync"  # split on FIRST colon only
+    assert names[0]["completed"] == 1
+
+
+async def test_stall_failure_records_the_job_name(q):
+    job = await q.add("stally", {})
+    w = Worker(QUEUE, _noop, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+    await q.redis.zrem(q.keys.prioritized, job.id)
+    await q.redis.rpush(q.keys.active, job.id)
+    await w.check_stalled(throttle_ms=0)
+    failed, _ = await w.check_stalled(throttle_ms=0)
+    assert failed == [job.id]
+
+    names = await q.metrics_by_name(minutes=2)
+    by = {n["name"]: n for n in names}
+    assert by["stally"]["failed"] == 1
+
+
+async def _bucket_total(q: Queue, field: str, want: int) -> bool:
+    points = await q.metrics(minutes=2)
+    return sum(p[field] for p in points) >= want

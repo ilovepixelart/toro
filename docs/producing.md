@@ -80,7 +80,8 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.search(state, query, scan_limit=500)` | Substring match over `name`/`data` within the most recent `scan_limit` jobs of a state. A bounded scan, not an index — surface the bound honestly in UIs. |
 | `await queue.workers()` | Live workers from their heartbeats; stale entries are pruned (and logged as `lost`) on read. |
 | `await queue.departed_workers()` | Recent departures, newest first: graceful `stopped` or crashed `lost`. |
-| `await queue.metrics(minutes=60)` | Per-minute `{timestamp, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the finish scripts (a count can never disagree with the transition it counts); `failed` means terminal failures — retries don't count, stall-failures do. Buckets expire after 8 hours. |
+| `await queue.metrics(minutes=60)` | Per-minute `{timestamp, added, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the same atomic scripts as the transitions (a count can never disagree with the state change it counts); `added` counts real inserts (dedup hits and id replays don't count), `failed` means terminal failures — retries don't count, stall-failures do. Buckets expire after 8 hours. |
+| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms}` totals over the window, failures first — the triage order ("which job is responsible"), not the volume order. |
 | `await queue.latency()` | Age (ms) of the next-to-run waiting job, `0` when nothing waits. Depth says how much is queued; latency says how far behind the workers are. |
 
 ## Admin operations
