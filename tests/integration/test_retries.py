@@ -1,4 +1,4 @@
-"""Integration: retry lifecycle — exhaustion, recovery, backoff routing, events."""
+"""Integration: retry lifecycle - exhaustion, recovery, backoff routing, events."""
 
 
 async def _count(q, state):

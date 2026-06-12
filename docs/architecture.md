@@ -12,9 +12,9 @@ Every state move (`wait→active`, `active→completed/failed/delayed`,
 `delayed→wait`) is a single Redis Lua script, run atomically, so multi-key
 "check-then-act" sequences can't interleave. That removes whole classes of race:
 
-- **pop-then-lock gap** — two workers claiming the same job: the claim pops from
+- **pop-then-lock gap** - two workers claiming the same job: the claim pops from
   the priority set and sets the lock inside one script.
-- **finish-after-steal** — a worker committing a result for a job a stalled sweep
+- **finish-after-steal** - a worker committing a result for a job a stalled sweep
   already re-queued: guarded by a token check plus `LREM active` returning 0.
 
 Scripts live in `scripts.py`, registered with `redis.asyncio`'s `register_script`.
@@ -23,7 +23,7 @@ The Python side only assembles KEYS/ARGV; the guarantees live in the Lua.
 ## Claiming a job: the prioritized set + a wakeup marker
 
 All waiting jobs live in one `prioritized` ZSET, scored
-`(PRIORITY_OFFSET - priority) * 2^32 + seq` — a single global order where higher
+`(PRIORITY_OFFSET - priority) * 2^32 + seq` - a single global order where higher
 priority is more urgent and ties stay FIFO (`seq` is a per-queue counter). This
 *is* the `wait` state; there is no separate fast-lane list, so a low-priority job
 can't starve a high-priority one.
@@ -74,19 +74,19 @@ due jobs into the prioritized set.
 
 ## Higher-level features
 
-- **Priorities** — every job is in the one prioritized ZSET above, so priority is
+- **Priorities** - every job is in the one prioritized ZSET above, so priority is
   a single global order with no starvation, FIFO within a band.
-- **Repeatable / cron** — `add_scheduler(every=ms | cron=...)` stores a template
+- **Repeatable / cron** - `add_scheduler(every=ms | cron=...)` stores a template
   and enqueues the first occurrence as a delayed job; each occurrence mints its
   successor with a deterministic id when a worker picks it up. `trigger_scheduler`
   runs one now, `remove_scheduler` stops the chain. See [Scheduling](scheduling.md).
-- **Rate limiting** — a queue-wide token bucket in Redis
+- **Rate limiting** - a queue-wide token bucket in Redis
   (`Worker(rate_limit={"max": N, "duration": ms})`), shared by every worker on the
   queue. An over-limit claim returns a sentinel and the worker waits out the window.
-- **Events** — Redis pub/sub on an `events` channel (`added`, `progress`,
+- **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
   `completed`, `failed`); `Queue.result()` awaits the terminal event and
   `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
-- **Auto-removal** — `remove_on_complete` / `remove_on_fail` (bool / count /
+- **Auto-removal** - `remove_on_complete` / `remove_on_fail` (bool / count /
   `{count, age}`) enforced inside the finish script, not by a separate sweeper.
 
 ## The Lua scripts
@@ -123,21 +123,21 @@ And the scripts themselves:
 
 Scripts signal outcomes with sentinels the worker decodes:
 
-- `RL_SENTINEL` (`"__rl__"`) — a claim hit the rate limiter; the second value is
+- `RL_SENTINEL` (`"__rl__"`) - a claim hit the rate limiter; the second value is
   ms until a token frees, so the worker waits instead of busy-spinning.
-- `LOCK_LOST` (`-2`) — a finish ran but the worker no longer held the lock (the
+- `LOCK_LOST` (`-2`) - a finish ran but the worker no longer held the lock (the
   job was reclaimed); the result is dropped.
-- `NOT_ACTIVE` (`-3`) — a finish ran but the job was no longer in `active`.
-- `OUTCOME_FAILED` (`1`) vs `0` — `MOVE_TO_FAILED` telling the worker whether the
+- `NOT_ACTIVE` (`-3`) - a finish ran but the job was no longer in `active`.
+- `OUTCOME_FAILED` (`1`) vs `0` - `MOVE_TO_FAILED` telling the worker whether the
   job terminally failed or will retry.
 
 Scores are packed under 2^53 (`PRIORITY_OFFSET = 2^20`, `SEQ_MOD = 2^32`) so ZSET
-double scores stay exact, and the scripts use only plain JSON and integer ARGV —
-no `cmsgpack` / `bit` / `cjson` — so they run on any Redis build.
+double scores stay exact, and the scripts use only plain JSON and integer ARGV -
+no `cmsgpack` / `bit` / `cjson` - so they run on any Redis build.
 
 ## Python-specific choices
 
-- **async-first** — `redis.asyncio`, `async def` processors, one event loop;
+- **async-first** - `redis.asyncio`, `async def` processors, one event loop;
   concurrency is N `asyncio` tasks sharing the loop.
-- **Cluster** — a `{braces}` hash-tag in the prefix keeps all of a queue's keys on
+- **Cluster** - a `{braces}` hash-tag in the prefix keeps all of a queue's keys on
   one slot, which the multi-key Lua scripts require.

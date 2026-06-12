@@ -1,8 +1,8 @@
 """Computing the next run time for repeatable schedules.
 
 Two modes:
-  * every=ms  — fixed interval, slot-aligned to the grid (no drift / backlog burst)
-  * cron="*/5 * * * *"  — cron expression (via croniter), evaluated in UTC
+  * every=ms  - fixed interval, slot-aligned to the grid (no drift / backlog burst)
+  * cron="*/5 * * * *"  - cron expression (via croniter), evaluated in UTC
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 
 def valid_cron(cron: str) -> bool:
-    """Whether `cron` parses as a cron expression — validate before storing a schedule."""
+    """Whether `cron` parses as a cron expression - validate before storing a schedule."""
     try:
         # croniter is an optional dep, imported lazily.
         from croniter import croniter  # noqa: PLC0415

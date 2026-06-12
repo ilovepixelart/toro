@@ -1,4 +1,4 @@
-"""Unit: Job.from_hash — decoding a Redis hash into a typed Job."""
+"""Unit: Job.from_hash - decoding a Redis hash into a typed Job."""
 
 import json
 
@@ -46,7 +46,7 @@ def test_from_hash_tolerates_a_sparse_hash():
 
 
 async def test_result_requires_a_queue_backed_job():
-    # A bare Job (e.g. built from a hash) has no owning queue — result() must refuse.
+    # A bare Job (e.g. built from a hash) has no owning queue - result() must refuse.
     with pytest.raises(RuntimeError):
         await Job(id="1", name="x", data={}).result()
 

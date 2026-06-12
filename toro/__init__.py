@@ -1,4 +1,4 @@
-"""toro — an async-first, Redis-backed job queue for Python."""
+"""toro - an async-first, Redis-backed job queue for Python."""
 
 from .errors import JobFailedError, ToroError
 from .job import Backoff, BackoffOpts, Deduplication, Job, JobOptions, JobState, RemoveOption

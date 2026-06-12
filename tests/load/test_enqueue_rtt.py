@@ -1,8 +1,8 @@
-"""@load — Queue.add() must enqueue in ONE round trip: the "added" event is
+"""@load - Queue.add() must enqueue in ONE round trip: the "added" event is
 published from inside the ADD_JOB script, not as a separate awaited PUBLISH.
 
 Compares single-coroutine add() throughput against the bare ADD_JOB script
-issued directly with identical args — add() may only cost client-side
+issued directly with identical args - add() may only cost client-side
 serialization on top of it. Baseline recorded on local Redis 7.4 when the
 publish was a second round trip: add() 2.9k jobs/s vs bare script 5.8k (the
 publish was 49% of enqueue latency).

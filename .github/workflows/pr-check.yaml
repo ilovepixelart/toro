@@ -9,7 +9,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# Read-only by default — nothing here writes to the repo. SonarCloud PR
+# Read-only by default - nothing here writes to the repo. SonarCloud PR
 # decoration comes from the SonarCloud GitHub App, not GITHUB_TOKEN write scopes.
 permissions:
   contents: read
@@ -68,7 +68,7 @@ jobs:
         run: uv run pytest -m "unit or integration" --cov=toro --cov-report=xml
 
       # Runs only when SONAR_TOKEN is set (skipped on forks / before setup, so the
-      # check stays green), and only once per matrix — one coverage upload.
+      # check stays green), and only once per matrix - one coverage upload.
       # Config is passed inline; there is no sonar-project.properties.
       - name: SonarCloud scan
         if: matrix.python-version == '3.13' && env.SONAR_TOKEN

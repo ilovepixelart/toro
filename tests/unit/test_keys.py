@@ -1,4 +1,4 @@
-"""Unit: Keys — the one place that knows the Redis key layout."""
+"""Unit: Keys - the one place that knows the Redis key layout."""
 
 from toro.keys import Keys
 

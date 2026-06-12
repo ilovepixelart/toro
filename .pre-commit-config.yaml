@@ -1,4 +1,4 @@
-# All hooks run through `uv run`, so versions come from the lockfile — one
+# All hooks run through `uv run`, so versions come from the lockfile - one
 # source of truth shared by pre-commit, CI and dev, nothing to drift.
 # Install once with:  uvx pre-commit install
 repos:

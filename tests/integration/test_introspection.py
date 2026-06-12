@@ -1,4 +1,4 @@
-"""Integration: read-side API — counts, ordering, lookup, search, pause state."""
+"""Integration: read-side API - counts, ordering, lookup, search, pause state."""
 
 
 async def test_counts_reflect_each_state(q):

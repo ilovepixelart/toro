@@ -1,4 +1,4 @@
-"""@load — result() waiters must share ONE events subscription (a per-Queue
+"""@load - result() waiters must share ONE events subscription (a per-Queue
 dispatcher that routes each event to the future waiting on that jobId), not
 one pubsub connection per waiter.
 

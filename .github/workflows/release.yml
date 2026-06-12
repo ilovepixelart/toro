@@ -1,7 +1,7 @@
 name: Release
 
 # A version tag (v*) builds and publishes to PyPI via trusted publishing (OIDC)
-# — no API tokens stored. The publish job runs in the `pypi` environment, which
+# - no API tokens stored. The publish job runs in the `pypi` environment, which
 # must match the trusted publisher registered on PyPI.
 on:
   push:

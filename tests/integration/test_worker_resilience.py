@@ -30,7 +30,7 @@ async def test_transient_error_in_the_loop_does_not_kill_the_slot(q, run_worker,
         done.append(job.id)
 
     # block_timeout=1: after the blip eats the wakeup marker, the loop re-parks
-    # for one short beat instead of the default 5s — keeps the test fast AND
+    # for one short beat instead of the default 5s - keeps the test fast AND
     # proves recovery doesn't depend on a fresh marker arriving.
     async with run_worker(q, proc, concurrency=1, stalled_interval=0, block_timeout=1.0) as w:
         original = w._acquire

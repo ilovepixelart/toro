@@ -7,7 +7,7 @@ and "act on state".
 Job ordering is a single GLOBAL priority order: every waiting job lives in the
 `prioritized` ZSET, scored by (priority, sequence). Higher `priority` number =
 more urgent; ties break FIFO by an enqueue sequence counter (`pc`). There is no
-separate "wait" fast lane — `priority 0` (the default) is simply the least urgent
+separate "wait" fast lane - `priority 0` (the default) is simply the least urgent
 band, ordered FIFO among itself.
 
 Wakeup uses a base marker: producers do an idempotent `ZADD marker 0 "0"`, and an
@@ -16,8 +16,8 @@ work"; the actual job move is the atomic `MOVE_TO_ACTIVE` (ZPOPMIN prioritized -
 active -> lock), so a job is never lost between wakeup and claim.
 
 Lua conventions (Redis best practices) followed here:
-  * No globals — every variable is `local` (Redis rejects globals).
-  * Deterministic — the clock (`now`) is always passed in via ARGV; scripts never
+  * No globals - every variable is `local` (Redis rejects globals).
+  * Deterministic - the clock (`now`) is always passed in via ARGV; scripts never
     call `TIME`/`random`, so they replicate and unit-test reproducibly.
   * `tonumber()` before any arithmetic on ARGV (which arrive as strings).
   * ZSET scores stay < 2^53 (the priority packing) so doubles stay exact.
@@ -31,8 +31,8 @@ would require hash-tagging the keys (e.g. `{queue}`) so a queue's keys share a s
 
 # Priority score packing constants (kept well under 2^53 so ZSET double scores
 # stay exact). priority in [0, PRIORITY_OFFSET]; sequence in [0, SEQ_MOD).
-PRIORITY_OFFSET = 1048576  # 2^20  — max priority (most urgent)
-SEQ_MOD = 4294967296  # 2^32  — sequence wrap window
+PRIORITY_OFFSET = 1048576  # 2^20  - max priority (most urgent)
+SEQ_MOD = 4294967296  # 2^32  - sequence wrap window
 
 # Max due jobs one PROMOTE_DELAYED call moves (~6 Redis commands each). Bounds
 # how long a sweep can block Redis (~3ms a batch); callers loop until a short
@@ -45,7 +45,7 @@ METRICS_RETENTION_MS = 8 * 60 * 60 * 1000
 
 # Duration histogram shape: log-scaled buckets so one set covers 20ms jobs and
 # 5-minute jobs alike. Bucket 0 is [0, 20ms); each next bucket grows 1.5x;
-# the last bucket absorbs everything past ~5.6 minutes. Successful jobs only —
+# the last bucket absorbs everything past ~5.6 minutes. Successful jobs only -
 # failures have unpredictable timing and would read as fake regressions.
 HIST_BASE_MS = 20
 HIST_GROWTH = 1.5
@@ -59,10 +59,10 @@ OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will ret
 
 # Shared routines, prepended to every script that enqueues or acquires a job.
 # This is the single definition of "how a job is ordered, woken, claimed":
-#   priorityScore  — (priority, seq) -> ZSET score (lower score = sooner)
-#   enqueue        — put a job into `prioritized` + arm the base marker
-#   lockAndLoad    — lock a job already on `active`, stamp it, return its hash
-#   acquireNext    — ZPOPMIN the next job into `active`, then lockAndLoad it
+#   priorityScore  - (priority, seq) -> ZSET score (lower score = sooner)
+#   enqueue        - put a job into `prioritized` + arm the base marker
+#   lockAndLoad    - lock a job already on `active`, stamp it, return its hash
+#   acquireNext    - ZPOPMIN the next job into `active`, then lockAndLoad it
 # To add markers-with-delay or grouping later, we change only these functions.
 _LIB = """
 local function priorityScore(priority, pcKey)
@@ -169,7 +169,7 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
   if keepAge >= 0 then
     local cutoff = now - keepAge * 1000
     -- Bounded per call: enabling an age limit on a deep finished backlog must
-    -- not sweep it all in one Redis-blocking pass — the remainder amortizes
+    -- not sweep it all in one Redis-blocking pass - the remainder amortizes
     -- over subsequent finishes (same idea as PROMOTE_DELAYED's batch).
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
                                "LIMIT", 0, 1000)
@@ -499,7 +499,7 @@ return {failed, recovered}
 
 # Move delayed jobs whose time has come into `prioritized` (at their priority),
 # at most ARGV[2] per call so a big due-backlog can't block Redis for one long
-# sweep — callers loop while a full batch comes back (see Worker._promote_loop).
+# sweep - callers loop while a full batch comes back (see Worker._promote_loop).
 # KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] key base  KEYS[5] pc
 # ARGV[1] now(ms)  ARGV[2] max jobs per call
 PROMOTE_DELAYED = (

@@ -1,4 +1,4 @@
-"""Integration: worker presence/heartbeat — a running worker registers itself,
+"""Integration: worker presence/heartbeat - a running worker registers itself,
 tracks throughput, reports what it's running, deregisters on shutdown, and stale
 records (a crashed worker that never deregistered) get pruned on read.
 """
@@ -67,7 +67,7 @@ async def test_worker_reports_the_job_it_is_running(q, run_worker, run_until):
 
 
 async def test_stale_worker_is_pruned_on_read(q):
-    old = int(time.time() * 1000) - 60_000  # 60s ago — well past the 30s default
+    old = int(time.time() * 1000) - 60_000  # 60s ago - well past the 30s default
     await q.redis.zadd(q.keys.workers, {"ghost": old})
     await q.redis.hset(
         q.keys.worker("ghost"),
@@ -123,6 +123,6 @@ async def test_lost_worker_is_recorded_when_pruned(q):
     assert rec["host"] == "node-7"
     assert rec["pid"] == 4242
     assert rec["processed"] == 99
-    # the death record froze WHAT IT WAS RUNNING — the whole point of the post-mortem
+    # the death record froze WHAT IT WAS RUNNING - the whole point of the post-mortem
     assert rec["current"] == ["210", "211"]
     assert rec["last_seen"] < rec["at"]  # last heartbeat vs when the sweep detected it

@@ -1,5 +1,5 @@
 [project]
-# PyPI distribution name — plain `toro` is taken (abandoned). The import package
+# PyPI distribution name - plain `toro` is taken (abandoned). The import package
 # stays `toro` (e.g. `pip install toro-queue` then `import toro`).
 name = "toro-queue"
 version = "0.2.0"
@@ -66,13 +66,13 @@ ignore = [
     "COM812", "ISC001",            # conflict with the formatter (per Ruff docs)
     "EM101", "EM102", "TRY003",    # inline exception messages read fine in this codebase
     "TRY300",                      # `else`-after-return reads worse than an early return here
-    "D203", "D213", "D205",        # docstring whitespace/placement niceties — not worth churn
+    "D203", "D213", "D205",        # docstring whitespace/placement niceties - not worth churn
     "D100", "D104", "D105", "D107", # don't require docstrings on modules/packages/dunder/__init__
     "ANN401",                      # `Any` is intentional at the Redis / JSON boundary
     "PLR2004",                     # small internal magic-number comparisons are clear in context
     "FBT001", "FBT002",            # boolean flags read fine in this API surface
     "D102",                        # docstrings on every public method is too granular here
-    "PLR0913",                     # Worker/Queue are config constructors — many kwargs is fine
+    "PLR0913",                     # Worker/Queue are config constructors - many kwargs is fine
     "BLE001", "S110", "S112",      # deliberate best-effort excepts in worker/redis cleanup paths
     "TC001", "TC002", "TC003",     # prefer normal runtime imports over TYPE_CHECKING blocks
 ]
@@ -94,7 +94,7 @@ asyncio_mode = "auto"
 # `-m integration` (needs Redis), or `-m load` (slow). conftest auto-marks by folder.
 addopts = "--strict-markers --import-mode=importlib"
 markers = [
-    "unit: pure-logic tests, no I/O — fast and deterministic",
+    "unit: pure-logic tests, no I/O - fast and deterministic",
     "integration: Redis-backed tests of real state transitions",
     "load: throughput / scalability tests (slow; opt-in)",
 ]

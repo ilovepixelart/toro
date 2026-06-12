@@ -1,10 +1,10 @@
 """Worker: the consumer side. Pulls jobs and runs a processor over them.
 
-Reliability model (this is the core — see docs/architecture.md):
+Reliability model (this is the core - see docs/architecture.md):
   * Jobs live in one `prioritized` ZSET (global priority order). A parked worker
     wakes on `BZPOPMIN` of a 0-scored base marker; the atomic claim is
     `MOVE_TO_ACTIVE` (`ZPOPMIN prioritized` → `active` → lock + load). The marker
-    only wakes us — a missed marker can't strand a job, since the claim is atomic.
+    only wakes us - a missed marker can't strand a job, since the claim is atomic.
   * Job acquisition (claim + lock + load) funnels through ONE Lua routine, shared
     by the blocking-wakeup path and by fetch-next.
   * Fetch-next: the finish scripts commit the current job AND acquire the next
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimit(TypedDict):
-    """The queue-wide token bucket: ``{"max": N, "duration": ms}`` — at most N
+    """The queue-wide token bucket: ``{"max": N, "duration": ms}`` - at most N
     job starts per duration, shared by every worker on the queue.
     """
 
@@ -139,7 +139,7 @@ class Worker:
         self._processed = 0
         self._failed = 0
         self._current: set[str] = set()
-        # "running" until a graceful stop flips it to "stopping" — the dashboard shows
+        # "running" until a graceful stop flips it to "stopping" - the dashboard shows
         # a live "draining" state, and a worker that then vanishes was mid-shutdown,
         # not a crash. (The only honest way to know graceful; absence can't say why.)
         self._state = "running"
@@ -162,7 +162,7 @@ class Worker:
         for fn in self._handlers.get(event, []):
             try:
                 fn(*args)
-            except Exception:  # noqa: PERF203 — per-callback isolation is the point
+            except Exception:  # noqa: PERF203 - per-callback isolation is the point
                 # A user callback must never hurt the worker: the job outcome is
                 # already committed by the time events fire, so log and move on.
                 logger.exception("%r event handler raised", event)
@@ -276,15 +276,15 @@ class Worker:
         # One guard around the WHOLE iteration: a transient Redis error, a corrupt
         # job hash, or anything else unexpected costs one beat, never the slot. A
         # job interrupted mid-flight stays locked in `active` until its lock
-        # expires and the stalled sweep recovers it — the normal at-least-once path.
+        # expires and the stalled sweep recovers it - the normal at-least-once path.
         while self._running:
             try:
                 # The marker only wakes us; the real claim is the atomic
-                # MOVE_TO_ACTIVE below. A timeout (None) is fine — we still try
+                # MOVE_TO_ACTIVE below. A timeout (None) is fine - we still try
                 # to acquire, so a missed marker can never strand a job.
                 await self.redis.bzpopmin(self.keys.marker, self.block_timeout)
                 if not self._running:
-                    break  # shutting down — don't claim a new job
+                    break  # shutting down - don't claim a new job
                 loaded = await self._acquire()
                 # Keep processing as long as each finish hands us the next job.
                 while loaded is not None and self._running:
@@ -340,7 +340,7 @@ class Worker:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
         # Give the handler the ability to report progress and append logs.
-        job._ctx = JobContext(  # noqa: SLF001  — the worker injects the job's runtime context
+        job._ctx = JobContext(  # noqa: SLF001  - the worker injects the job's runtime context
             redis=self.redis,
             job_key=self.keys.job(job_id),
             events_key=self.keys.events,
@@ -448,7 +448,7 @@ class Worker:
         """Enqueue the next occurrence of a scheduler (idempotent, stops if removed)."""
         template = await self.redis.hgetall(self.keys.scheduler(scheduler_id))
         if not template or await self.redis.zscore(self.keys.repeat, scheduler_id) is None:
-            return  # scheduler was removed — stop the chain
+            return  # scheduler was removed - stop the chain
         every = int(template["every"]) if template.get("every") else None
         cron = cast("str | None", template.get("cron") or None)
         now = _now_ms()
@@ -470,7 +470,7 @@ class Worker:
         )
 
     def _fetch_flag(self) -> str:
-        # Don't fetch a next job while shutting down — let the queue drain cleanly.
+        # Don't fetch a next job while shutting down - let the queue drain cleanly.
         return "1" if self._running else "0"
 
     def _next_from(self, res: Any) -> tuple[str, dict[str, str]] | None:
@@ -501,7 +501,7 @@ class Worker:
         while self._running:
             try:
                 # Drain in bounded chunks: a full batch means more may be due, so
-                # go again at once — each call blocks Redis ~ms, not the whole sweep.
+                # go again at once - each call blocks Redis ~ms, not the whole sweep.
                 while self._running:
                     promoted = await self._promote_delayed(
                         keys=[

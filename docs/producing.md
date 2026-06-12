@@ -11,7 +11,7 @@ job = await queue.add("welcome", {"user_id": 42})
 ```
 
 `add(name, data=None, *, job_id=None, deduplication=None, **options)` writes the
-job hash and enqueues (or delays) it in one atomic script — the `added` event is
+job hash and enqueues (or delays) it in one atomic script - the `added` event is
 published from inside that script, so an enqueue is a single round trip and the
 event can't be lost between the two.
 
@@ -35,19 +35,19 @@ Per-queue defaults go on the constructor and merge under per-call options:
 queue = Queue("emails", default_job_options={"remove_on_complete": 1000, "attempts": 3})
 ```
 
-Auto-removal is enforced inside the finish script itself — there is no separate
+Auto-removal is enforced inside the finish script itself - there is no separate
 cleanup process to run or forget.
 
 ## Custom ids and deduplication
 
 Two distinct tools, usable independently:
 
-- **`job_id="order-123"`** — id-based dedup. Adding a job whose id already
+- **`job_id="order-123"`** - id-based dedup. Adding a job whose id already
   exists is idempotent: nothing is enqueued and the existing job's id comes
   back. The id frees up when the job is removed (including by auto-removal).
-  Must be a non-empty, non-all-digits string — all-digit ids would collide with
+  Must be a non-empty, non-all-digits string - all-digit ids would collide with
   auto-generated ones.
-- **`deduplication={"id": "sync-user-42", "ttl": 60_000}`** — a throttle window.
+- **`deduplication={"id": "sync-user-42", "ttl": 60_000}`** - a throttle window.
   While the ttl lives, repeat adds with the same dedup id are ignored and the
   already-queued job's id is returned. Self-expiring; nothing to clean up at
   finish time.
@@ -65,7 +65,7 @@ value = await job.result(timeout=30)        # or queue.result(job.id)
 `result()` resolves with the processor's return value, raises `JobFailedError`
 on terminal failure, or `TimeoutError` after `timeout`. It registers for the
 job's events *before* checking state, so a job that finishes while you wait is
-never missed — and it works even when the job hash was auto-removed, as long as
+never missed - and it works even when the job hash was auto-removed, as long as
 `result()` was awaited before the job finished. A retrying job keeps you
 waiting; only the terminal outcome resolves the call.
 
@@ -77,11 +77,11 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.get_job(job_id)` | A `Job` snapshot, or `None`. |
 | `await queue.get_jobs(state, start, end)` | A page of jobs; `wait` comes back in global priority order, finished states newest-first. |
 | `await queue.get_logs(job_id)` | Log lines appended by the processor. |
-| `await queue.search(state, query, scan_limit=500)` | Substring match over `name`/`data` within the most recent `scan_limit` jobs of a state. A bounded scan, not an index — surface the bound honestly in UIs. |
+| `await queue.search(state, query, scan_limit=500)` | Substring match over `name`/`data` within the most recent `scan_limit` jobs of a state. A bounded scan, not an index - surface the bound honestly in UIs. |
 | `await queue.workers()` | Live workers from their heartbeats; stale entries are pruned (and logged as `lost`) on read. |
 | `await queue.departed_workers()` | Recent departures, newest first: graceful `stopped` or crashed `lost`. |
-| `await queue.metrics(minutes=60)` | Per-minute `{timestamp, added, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the same atomic scripts as the transitions (a count can never disagree with the state change it counts); `added` counts real inserts (dedup hits and id replays don't count), `failed` means terminal failures — retries don't count, stall-failures do. Buckets expire after 8 hours. |
-| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms}` totals over the window, failures first — the triage order ("which job is responsible"), not the volume order. |
+| `await queue.metrics(minutes=60)` | Per-minute `{timestamp, added, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the same atomic scripts as the transitions (a count can never disagree with the state change it counts); `added` counts real inserts (dedup hits and id replays don't count), `failed` means terminal failures - retries don't count, stall-failures do. Buckets expire after 8 hours. |
+| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms}` totals over the window, failures first - the triage order ("which job is responsible"), not the volume order. |
 | `await queue.latency()` | Age (ms) of the next-to-run waiting job, `0` when nothing waits. Depth says how much is queued; latency says how far behind the workers are. |
 
 ## Admin operations
@@ -96,7 +96,7 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.pause()` / `resume()` / `is_paused()` | Stop workers claiming new jobs (in-flight jobs finish); resume wakes idle workers. |
 
 These are the operations a dashboard such as
-[matador](https://github.com/ilovepixelart/matador) calls under its buttons —
+[matador](https://github.com/ilovepixelart/matador) calls under its buttons -
 they're ordinary public API.
 
 ## Lifecycle

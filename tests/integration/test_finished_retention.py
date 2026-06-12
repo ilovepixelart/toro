@@ -1,5 +1,5 @@
 """Auto-removal retention edges: scheduler input validation and the bounded
-age-trim — enabling `remove_on_complete={"age": ...}` on a queue with a deep
+age-trim - enabling `remove_on_complete={"age": ...}` on a queue with a deep
 finished backlog must not sweep it all in one Redis-blocking call.
 """
 
@@ -76,9 +76,9 @@ async def test_age_trim_is_bounded_per_finish(q):
     assert out == [1]
 
     # Exactly one bounded slice trimmed (oldest first), the rest left for the
-    # next finishes to amortize — plus the job that just completed.
+    # next finishes to amortize - plus the job that just completed.
     remaining = await q.redis.zcard(q.keys.completed)
     assert remaining == n - 1000 + 1, f"trim not bounded: {remaining} left of {n}"
-    # The trimmed slice was the oldest — its hashes are gone, newer ones remain.
+    # The trimmed slice was the oldest - its hashes are gone, newer ones remain.
     assert not await q.redis.exists(q.keys.job("old0"))
     assert await q.redis.exists(q.keys.job(f"old{n - 1}"))

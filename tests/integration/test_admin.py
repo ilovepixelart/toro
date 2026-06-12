@@ -1,4 +1,4 @@
-"""Integration: admin/dashboard actions — remove, promote, retry, clean, trigger.
+"""Integration: admin/dashboard actions - remove, promote, retry, clean, trigger.
 
 Each asserts the resulting state AND the negative case (acting on a missing job
 returns False rather than silently succeeding).
@@ -13,7 +13,7 @@ async def _count(q, state):
 
 @pytest.mark.parametrize("bad", ["", "a:b", "repeat:x", "ctrl\x01", "\n"])
 async def test_add_scheduler_rejects_unsafe_id(q, bad):
-    # scheduler_id is a Redis key segment — ':'/control chars enable key collisions
+    # scheduler_id is a Redis key segment - ':'/control chars enable key collisions
     with pytest.raises(ValueError, match="scheduler_id"):
         await q.add_scheduler(bad, cron="0 0 * * *")
 

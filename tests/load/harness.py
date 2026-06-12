@@ -1,14 +1,14 @@
-"""Open-loop load harness for toro — built to the benchmarking methodology.
+"""Open-loop load harness for toro - built to the benchmarking methodology.
 
 Why it's shaped this way (the methodology, enforced in code):
   * OPEN-LOOP load: the producer enqueues on a fixed wall-clock schedule (rate λ),
-    never gating on completions — what real producers do, and it avoids Coordinated
+    never gating on completions - what real producers do, and it avoids Coordinated
     Omission (a closed loop self-throttles and hides saturation).
   * Latency recorded with HdrHistogram and **CO-corrected** against the intended
     interval (1/λ), so a stall doesn't silently omit the slow samples it caused.
   * The wait clock starts at ENQUEUE, not dequeue (dequeue-start re-introduces CO).
   * A WARM-UP window is discarded; only the steady-state window is measured.
-  * Reports PERCENTILES (p50..p99.9, max) — never an average — plus achieved
+  * Reports PERCENTILES (p50..p99.9, max) - never an average - plus achieved
     throughput, backlog/drops, a Little's-Law cross-check, and Redis cost.
 
 Each worker records {enq, proc, fin} per job into a Redis list (reliable across
@@ -39,7 +39,7 @@ _RESULTS_KEY = f"{PREFIX}:{QUEUE}:bench-results"
 
 
 def _now_us() -> float:
-    return time.time() * 1e6  # system wall clock — comparable across processes
+    return time.time() * 1e6  # system wall clock - comparable across processes
 
 
 # ---- worker subprocess --------------------------------------------------------
@@ -62,7 +62,7 @@ async def _run_worker(url: str, concurrency: int, work_ms: float) -> None:
         QUEUE, processor, url=url, prefix=PREFIX, concurrency=concurrency, stalled_interval=0
     )
     task = asyncio.create_task(worker.run())
-    # Poll a Redis stop flag — a cross-process signal an asyncio.Event can't carry.
+    # Poll a Redis stop flag - a cross-process signal an asyncio.Event can't carry.
     while not await worker.redis.exists(_STOP_KEY):  # noqa: ASYNC110
         await asyncio.sleep(0.05)
     await worker.stop(grace_period=2.0)
@@ -154,7 +154,7 @@ def _report(args, res: dict) -> None:
 
     print("\n" + "=" * 70)
     print(
-        f" toro load — OPEN-LOOP   λ={args.rate:g}/s  workers={args.workers}  "
+        f" toro load - OPEN-LOOP   λ={args.rate:g}/s  workers={args.workers}  "
         f"concurrency={args.concurrency}  work={args.work_ms}ms"
     )
     print("=" * 70)
@@ -162,7 +162,7 @@ def _report(args, res: dict) -> None:
         f" enqueued(steady)={res['enqueued_steady']}  completed(steady)={measured}  "
         f"total_completed={res['completed']}"
     )
-    sat = "⚠️  PAST SATURATION (backlog growing)" if backlog > args.rate * 0.1 else "OK — kept up"
+    sat = "⚠️  PAST SATURATION (backlog growing)" if backlog > args.rate * 0.1 else "OK - kept up"
     print(f" achieved throughput ≈ {throughput:,.0f} jobs/s    backlog = {backlog}   {sat}")
 
     print(f"\n {'metric':<6}" + "".join(f"{f'p{p}':>10}" for p in pcts) + f"{'max':>10}   (ms)")
@@ -187,7 +187,7 @@ def _report(args, res: dict) -> None:
             " Redis cmd calls (Δ): "
             + "  ".join(f"{k.replace('cmdstat_', '')}={v:,}" for k, v in top)
         )
-    print(" (note: the harness adds 1 RPUSH/job for measurement — visible above)")
+    print(" (note: the harness adds 1 RPUSH/job for measurement - visible above)")
     print("=" * 70 + "\n")
 
 

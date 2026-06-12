@@ -60,13 +60,13 @@ class NameMetrics(TypedDict):
     completed: int
     failed: int
     ms: int  # summed processing duration
-    p50: int  # duration percentiles (ms, bucket upper bounds) — successful
+    p50: int  # duration percentiles (ms, bucket upper bounds) - successful
     p95: int  # jobs only, 0 when nothing completed in the window
     p99: int
 
 
 def bucket_upper_ms(idx: int) -> int:
-    """Upper bound (ms) of histogram bucket `idx` — see scripts.HIST_*."""
+    """Upper bound (ms) of histogram bucket `idx` - see scripts.HIST_*."""
     return int(scripts.HIST_BASE_MS * scripts.HIST_GROWTH**idx)
 
 
@@ -74,7 +74,7 @@ def bucket_estimate_ms(idx: int) -> int:
     """Estimate the representative duration for bucket `idx`: the geometric
     mean of its bounds. Reporting this instead of the upper bound halves the
     worst-case error (±22% instead of +50%) and removes the systematic upward
-    bias — the same choice DDSketch makes. True values can sit anywhere in
+    bias - the same choice DDSketch makes. True values can sit anywhere in
     the bucket, so any single number is an estimate either way.
     """
     return round(bucket_upper_ms(idx) / math.sqrt(scripts.HIST_GROWTH))
@@ -94,7 +94,7 @@ def _percentile(buckets: list[int], q: float) -> int:
         cum += count
         if cum >= target:
             return bucket_estimate_ms(idx)
-    return bucket_estimate_ms(len(buckets) - 1)  # pragma: no cover — cum reaches total above
+    return bucket_estimate_ms(len(buckets) - 1)  # pragma: no cover - cum reaches total above
 
 
 class Queue:
@@ -110,11 +110,11 @@ class Queue:
         default_job_options: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
-        # Defaults merged into every add() (per-call options win) — e.g.
+        # Defaults merged into every add() (per-call options win) - e.g.
         # default_job_options={"remove_on_complete": 1000} so you don't repeat it.
         self.default_job_options = dict(default_job_options or {})
         self.keys = Keys(name, prefix)
-        # NB: created with decode_responses=True, so every command returns str —
+        # NB: created with decode_responses=True, so every command returns str -
         # redis-py's async client isn't generic over that, hence the casts below.
         self.redis = connection or connect(url)
         self._add_job = self.redis.register_script(scripts.ADD_JOB)
@@ -146,11 +146,11 @@ class Queue:
         the default 0 is the least-urgent band, processed FIFO among itself.
 
         `job_id`: a custom id. Adding a second job with an id that already exists
-        is IDEMPOTENT — it's ignored, not duplicated (id-based dedup). Once the job
+        is IDEMPOTENT - it's ignored, not duplicated (id-based dedup). Once the job
         is removed, the id is free to reuse. Must be a non-empty, non-all-digits
         string (all-digit ids collide with auto-generated ones).
 
-        `deduplication`: `{"id": str, "ttl": ms}` — a throttle window. While the
+        `deduplication`: `{"id": str, "ttl": ms}` - a throttle window. While the
         ttl is live, repeat adds with the same dedup id are ignored and the
         already-queued job's id is returned. Self-expiring; independent of job_id.
         """
@@ -161,7 +161,7 @@ class Queue:
             if not job_id or job_id.isdigit():
                 raise ValueError(
                     "custom job_id must be a non-empty, non-all-digits string "
-                    "(digits collide with auto-generated ids) — try e.g. 'order-123'"
+                    "(digits collide with auto-generated ids) - try e.g. 'order-123'"
                 )
         dedup_id, dedup_ttl = "", 0
         if deduplication is not None:
@@ -318,16 +318,16 @@ class Queue:
         if not scheduler_id or ":" in scheduler_id or any(ord(c) < 0x20 for c in scheduler_id):
             # it's interpolated into Redis keys ({base}repeat:<id>) and the occurrence
             # id (repeat:<id>:<when>); ':' or control chars let one scheduler collide
-            # with another's keys — same class of guard as custom job_id.
+            # with another's keys - same class of guard as custom job_id.
             raise ValueError(
                 "scheduler_id must be a non-empty string with no ':' or control "
-                "characters (it's used as a Redis key segment) — try e.g. 'nightly-rollup'"
+                "characters (it's used as a Redis key segment) - try e.g. 'nightly-rollup'"
             )
         if (every is None) == (cron is None):
             raise ValueError("pass exactly one of `every` or `cron`")
         if every is not None and int(every) <= 0:
             # 0 would otherwise surface as a confusing "needs either" error and a
-            # negative interval as garbage grid math — fail clearly at the source.
+            # negative interval as garbage grid math - fail clearly at the source.
             raise ValueError("`every` must be a positive number of milliseconds")
         if cron is not None and not valid_cron(cron):
             # fail at enqueue, not later inside a worker's _schedule_next (a silent
@@ -378,7 +378,7 @@ class Queue:
         """Enqueue one immediate occurrence of a scheduler (a manual 'run now').
 
         Carries the scheduler's configured options (priority/attempts/backoff/
-        auto-removal) so a manual run matches a scheduled one — but runs immediately
+        auto-removal) so a manual run matches a scheduled one - but runs immediately
         (`delay` is omitted, not taken from the stored opts).
         """
         t = await self.redis.hgetall(self.keys.scheduler(scheduler_id))
@@ -476,7 +476,7 @@ class Queue:
         ]
 
     async def metrics_by_name(self, *, minutes: int = 60) -> list[NameMetrics]:
-        """Per-job-name totals over the window, failures first — the triage
+        """Per-job-name totals over the window, failures first - the triage
         order ("which job is responsible"), not the volume order. Names come
         from the per-name fields the finish scripts write into the same
         minute buckets ("completed:<name>", "failed:<name>", "ms:<name>").
@@ -497,7 +497,7 @@ class Queue:
                     totals.setdefault(rest, {"completed": 0, "failed": 0, "ms": 0})
                     totals[rest][kind] += int(value)
                 elif kind == "h":
-                    # "h:<name>:<idx>" — names may contain colons, idx never does
+                    # "h:<name>:<idx>" - names may contain colons, idx never does
                     name, _, idx = rest.rpartition(":")
                     hists.setdefault(name, [0] * scripts.HIST_BUCKETS)[int(idx)] += int(value)
         out = []
@@ -517,7 +517,7 @@ class Queue:
         return sorted(out, key=lambda t: (-t["failed"], -t["completed"], t["name"]))
 
     async def percentiles(self, *, minutes: int = 60) -> dict[str, int]:
-        """Queue-level p50/p95/p99 (ms) over the window — every job name's
+        """Queue-level p50/p95/p99 (ms) over the window - every job name's
         histogram merged into one. Successful jobs only; 0s when idle.
         """
         minutes = max(1, minutes)
@@ -537,7 +537,7 @@ class Queue:
         }
 
     async def latency(self) -> int:
-        """Age (ms) of the next-to-run waiting job — 0 when nothing is waiting.
+        """Age (ms) of the next-to-run waiting job - 0 when nothing is waiting.
 
         The queue-health headline number: depth says how much is queued,
         latency says how far behind the workers actually are.
@@ -586,7 +586,7 @@ class Queue:
                 }
             )
         if dead:
-            # A stale worker crashed/was killed without deregistering — log it as
+            # A stale worker crashed/was killed without deregistering - log it as
             # "lost" (vs a graceful "stopped") before pruning, so its death is visible.
             # Kept transactional: record-then-prune must be atomic, else a partial
             # failure leaves a worker re-recorded (duplicate death) or pruned silently.
@@ -620,7 +620,7 @@ class Queue:
         return live
 
     async def departed_workers(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Recent worker departures, newest first — graceful stops ("stopped") and
+        """Recent worker departures, newest first - graceful stops ("stopped") and
         lost heartbeats ("lost"). A bounded death-log so the dashboard can show what
         left, when, and why, instead of workers silently vanishing.
         """
@@ -704,7 +704,7 @@ class Queue:
         return bool(res)
 
     async def _ids(self, state: JobState, limit: int, *, newest: bool = False) -> list[str]:
-        """Ids in a state. `newest=True` mirrors get_jobs()'s ordering — finished
+        """Ids in a state. `newest=True` mirrors get_jobs()'s ordering - finished
         states come newest-first (what a dashboard shows as "recent"); the other
         states have one natural order (priority / claim / due-time) either way.
         """
@@ -722,7 +722,7 @@ class Queue:
     async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:
         """Substring-search `name`/`data` within a state's most recent `scan_limit`
         jobs (Redis hashes aren't queryable, so this is a bounded scan + filter).
-        Scans the same end of the set get_jobs() pages — newest first for finished
+        Scans the same end of the set get_jobs() pages - newest first for finished
         states. Returns the matches; the caller should surface the scan bound honestly.
         """
         ids = await self._ids(state, scan_limit, newest=True)
@@ -742,9 +742,9 @@ class Queue:
     async def retry_all_failed(self, limit: int = 1000) -> int:
         """Re-queue every failed job. Returns how many were retried.
 
-        Pipelines the per-job RETRY_JOB scripts — one round trip per batch, not
+        Pipelines the per-job RETRY_JOB scripts - one round trip per batch, not
         one per job (same shape as clean(); ~17x faster than a serial loop).
-        When `limit` truncates, the newest failures go first — the ones a
+        When `limit` truncates, the newest failures go first - the ones a
         dashboard is showing.
         """
         ids = await self._ids("failed", limit, newest=True)
@@ -767,11 +767,11 @@ class Queue:
         return sum(1 for r in res if r)
 
     async def clean(self, state: JobState, limit: int = 1000) -> int:
-        """Remove every job in a state (up to `limit`, oldest first — when the
+        """Remove every job in a state (up to `limit`, oldest first - when the
         limit truncates, old history goes before recent results). Returns how
         many were removed.
 
-        Pipelines the per-job removals — one round trip per batch, not one per job —
+        Pipelines the per-job removals - one round trip per batch, not one per job -
         so clearing a large state stays fast (thousands of jobs in well under a second).
         """
         ids = await self._ids(state, limit)

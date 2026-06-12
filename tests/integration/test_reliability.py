@@ -55,7 +55,7 @@ async def test_mark_and_sweep_recovers_then_fails(q):
     await q.redis.zrem(q.keys.prioritized, jid)
     await q.redis.rpush(q.keys.active, jid)
 
-    # Pass 1 only marks — a job stalled for less than one interval is not touched.
+    # Pass 1 only marks - a job stalled for less than one interval is not touched.
     failed, recovered = await w.check_stalled(throttle_ms=0)
     assert (failed, recovered) == ([], [])
     assert await q.redis.sismember(q.keys.stalled, jid)
@@ -120,7 +120,7 @@ async def test_lost_lock_cannot_commit(q):
 
 async def test_fetch_next_in_finish(q):
     """Completing a job with fetch=1 commits it AND hands back the next waiting
-    job, already moved to active and locked to us — no extra round trip."""
+    job, already moved to active and locked to us - no extra round trip."""
     cur = await q.add("cur", {})
     nxt = await q.add("nxt", {})
     w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
@@ -170,7 +170,7 @@ async def test_drains_many_via_fetch_next(q):
 
 async def test_global_priority_ordering(q):
     """Jobs are processed in one global order: higher priority first, FIFO within
-    a level — regardless of enqueue order."""
+    a level - regardless of enqueue order."""
     await q.add("a", {"p": 0}, priority=0)  # least urgent
     await q.add("b", {"p": 0}, priority=0)
     await q.add("c", {"p": 5}, priority=5)  # most urgent, added last
@@ -366,7 +366,7 @@ async def test_rate_limit_throttles_throughput(q):
     await w.stop()
     task.cancel()
 
-    # max=2/sec: a burst of 2 plus ~1-2 refilled in under a second — never the lot.
+    # max=2/sec: a burst of 2 plus ~1-2 refilled in under a second - never the lot.
     assert 2 <= len(done) <= 6
     assert len(done) < 12
     # The rest stay queued (rate limiting never fails or drops a job).
@@ -431,7 +431,7 @@ async def test_graceful_shutdown_finishes_inflight(q):
 
 async def test_zombie_worker_recovered_and_completed_once(q):
     """End to end: a hung worker's job is recovered and finished by another,
-    and the zombie's late finish is rejected — exactly one completion."""
+    and the zombie's late finish is rejected - exactly one completion."""
     await q.add("job", {"v": 1})
     seen: list[str] = []
 

@@ -28,12 +28,12 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 
 ## Why toro
 
-- **Async-native.** Enqueue and process with `async`/`await` — no thread pools,
+- **Async-native.** Enqueue and process with `async`/`await` - no thread pools,
   no sync bridge. A natural fit for FastAPI, aiohttp, or any asyncio app.
 - **Atomic by construction.** Claims, retries, promotions and finishes are Lua
   scripts, so a job can't be lost or double-committed between two round trips.
 - **At-least-once delivery.** Per-job locks + a background mark-and-sweep recover
-  jobs from workers that crashed — without the visibility-timeout double-delivery
+  jobs from workers that crashed - without the visibility-timeout double-delivery
   trap of some other queues.
 - **Typed.** Ships `py.typed`; the public API is fully annotated.
 
@@ -50,7 +50,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Reliability** | per-job locks, lock renewal, stalled-job recovery |
 | **Observability** | progress, per-job logs, lifecycle events, `await result()` |
 | **Lifecycle** | pause / resume, graceful shutdown that drains in-flight jobs |
-| **Dashboard** | [matador](https://github.com/ilovepixelart/matador) — a live web UI |
+| **Dashboard** | [matador](https://github.com/ilovepixelart/matador) - a live web UI |
 
 ## Quick start
 
@@ -107,7 +107,7 @@ uv run pytest -m "unit or integration"   # tests (integration needs Redis on :63
 uv run python examples/basic.py
 ```
 
-The suite is a pyramid — `-m unit` (fast, no Redis), `-m integration` (Redis),
+The suite is a pyramid - `-m unit` (fast, no Redis), `-m integration` (Redis),
 and `-m load` (the open-loop benchmark harness in `tests/load/`).
 
 ## License

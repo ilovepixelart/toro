@@ -1,4 +1,4 @@
-"""Integration: a worker actually processing jobs — result, progress, logs, concurrency."""
+"""Integration: a worker actually processing jobs - result, progress, logs, concurrency."""
 
 import asyncio
 
@@ -63,7 +63,7 @@ async def test_concurrency_runs_jobs_in_parallel(q, run_worker, run_until):
     async with run_worker(q, proc, concurrency=4):
         assert await run_until(lambda: _completed(q, n=6), timeout=8.0)
 
-    # With concurrency=4 the slots genuinely overlap — serial execution would peak at 1.
+    # With concurrency=4 the slots genuinely overlap - serial execution would peak at 1.
     assert peak >= 2, f"expected parallel execution, peak in-flight was {peak}"
 
 

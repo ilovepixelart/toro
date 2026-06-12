@@ -1,4 +1,4 @@
-"""Unit: next_run — the repeatable-schedule math (every-grid + cron), no Redis."""
+"""Unit: next_run - the repeatable-schedule math (every-grid + cron), no Redis."""
 
 import pytest
 
