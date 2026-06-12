@@ -300,6 +300,21 @@ class Queue:
         """Read child id -> failure reason recorded under ``on_fail="continue"``."""
         return _str_dict(await self.redis.hgetall(self.keys.cfail(job_id)))
 
+    async def flow_progress(self, parent_ids: list[str]) -> dict[str, tuple[int, int]]:
+        """For each flow parent id, ``(completed_children, failed_children)`` -
+        cheap pipelined HLEN reads of the ``:results`` / ``:cfail`` hashes (just
+        the counts, no values). Lets a dashboard show fan-in progress for a page
+        of parked parents without hydrating each tree.
+        """
+        if not parent_ids:
+            return {}
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for pid in parent_ids:
+            pipe.hlen(self.keys.results(pid))
+            pipe.hlen(self.keys.cfail(pid))
+        res = await pipe.execute()
+        return {pid: (int(res[2 * i]), int(res[2 * i + 1])) for i, pid in enumerate(parent_ids)}
+
     async def result(self, job_id: str, *, timeout: float = 30.0) -> Any:
         """Wait for a job to finish; return its return value, or raise JobFailedError.
 

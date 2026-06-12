@@ -668,3 +668,36 @@ async def test_retry_flow_recovers_a_nested_flow(q, run_worker, run_until):
 
 async def test_retry_flow_on_unknown_id_is_a_noop(q):
     assert await q.retry_flow("nope") == 0
+
+
+async def test_flow_progress_counts_settled_children(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "good":
+            return 1
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return None
+
+    async with run_worker(q, proc, concurrency=4):
+        # a delayed third child keeps the flow parked without a live worker task
+        parent = await q.add_flow(
+            "report",
+            {},
+            children=[
+                c("good", {}),
+                c("bad", {}, on_fail="continue"),
+                c("later", {}, delay=600_000),
+            ],
+        )
+        # one completed, one tolerated-failed, one still pending -> 1 done / 1 failed
+        assert await run_until(lambda: _flow_settled(q, parent.id, 1, 1))
+
+    prog = await q.flow_progress([parent.id, "nope"])
+    assert prog[parent.id] == (1, 1)  # (completed, failed)
+    assert prog["nope"] == (0, 0)  # unknown id is empty, not an error
+    assert await q.flow_progress([]) == {}
+
+
+async def _flow_settled(q, pid, done, failed):
+    p = await q.flow_progress([pid])
+    return p[pid] == (done, failed)
