@@ -22,6 +22,14 @@ def test_per_job_keys():
     assert k.job("order-7") == "toro:emails:order-7"
 
 
+def test_flow_keys():
+    k = Keys("emails", "toro")
+    assert k.waiting_children == "toro:emails:waiting-children"
+    assert k.deps(5) == "toro:emails:5:deps"
+    assert k.results(5) == "toro:emails:5:results"
+    assert k.cfail(5) == "toro:emails:5:cfail"
+
+
 def test_scheduler_key():
     assert Keys("emails", "toro").scheduler("nightly") == "toro:emails:repeat:nightly"
 

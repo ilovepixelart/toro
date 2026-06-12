@@ -44,6 +44,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Enqueue** | delayed jobs, global **priorities** (FIFO within a band) |
 | **Retries** | fixed or exponential **backoff**, capped attempts |
 | **Schedules** | repeatable **cron** and fixed-interval (`every`) jobs |
+| **Flows** | parent/child job trees: fan-out/fan-in, failure policies, flow-aware retry |
 | **Rate limiting** | queue-wide token bucket shared across all workers |
 | **Dedup** | custom (idempotent) job ids + a throttle window (`{id, ttl}`) |
 | **Auto-removal** | keep the last N and/or finished-within-age completed/failed |

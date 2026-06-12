@@ -37,15 +37,17 @@ type, `JobState`:
 | `wait` | Ready to run, waiting for a free worker. (Stored in the priority-ordered set, so "wait" and "prioritized" are the same place.) |
 | `delayed` | Scheduled for the future; not yet runnable. Promoted to `wait` when due. |
 | `active` | Claimed by a worker and currently running. |
+| `waiting-children` | A flow parent, parked until every child settles; released to `wait` by its last child. |
 | `completed` | Finished successfully; `returnvalue` holds the result. |
 | `failed` | Exhausted its retry attempts; `failed_reason` holds the error. |
 
 The normal path is `wait → active → completed`. A failure with retries left goes
 `active → wait` (or `active → delayed`, if a backoff delay applies) and tries
 again; only after the last attempt does it land in `failed`. A delayed or
-repeatable job starts in `delayed`. See [Job lifecycle](architecture.md) for the
-exact transitions and [Producing jobs](producing.md) for how delay and retries
-are configured.
+repeatable job starts in `delayed`; a flow parent starts in `waiting-children`
+(see [Flows](flows.md)). See [Job lifecycle](architecture.md) for the exact
+transitions and [Producing jobs](producing.md) for how delay and retries are
+configured.
 
 ## Workers vs. slots
 

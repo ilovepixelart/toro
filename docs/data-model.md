@@ -29,6 +29,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `delayed` | ZSET | Ids scored by their process-at timestamp (ms); promoted to `prioritized` when due. |
 | `completed` | ZSET | Successfully-finished ids, scored by finish time (for auto-removal + listing). |
 | `failed` | ZSET | Terminally-failed ids, scored by finish time. |
+| `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |
 | `meta-paused` | string (flag) | Exists only while the queue is paused; workers stop claiming new jobs. |
 | `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed`; drives `result()` and live dashboards. |
 | `limiter` | HASH | The queue-wide rate-limit token bucket (`{tokens, ts}`), shared by every worker. |
@@ -47,6 +48,9 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, ... |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |
+| `<jobId>:deps` | SET | A flow parent's still-pending child ids - the fan-in barrier; the parent releases when it empties. |
+| `<jobId>:results` | HASH | Child id → returnvalue JSON, written as each child completes. |
+| `<jobId>:cfail` | HASH | Child id → failure reason for children failed under `on_fail="continue"`. |
 
 Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a job
 `5` on `toro:emails:` is the hash `toro:emails:5`, with `toro:emails:5:lock` and

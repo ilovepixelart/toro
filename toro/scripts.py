@@ -126,7 +126,8 @@ local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
 end
 local function delJobs(ids, base)
   for _, id in ipairs(ids) do
-    redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs")
+    redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
+               base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail")
   end
 end
 -- Per-minute metrics bucket: one small hash per (queue, minute) holding
@@ -136,9 +137,9 @@ end
 -- disagree with the transition it counts. When a job name is given, the
 -- same counts also land in per-name fields ("completed:<name>", ...) so
 -- a dashboard can answer "which job is responsible".
-local function recordMetrics(base, field, now, durMs, retentionMs, name)
+local function recordMetrics(base, field, now, durMs, retentionMs, name, count)
   local bucket = base .. "metrics:" .. tostring(math.floor(now / 60000) * 60000)
-  redis.call("HINCRBY", bucket, field, 1)
+  redis.call("HINCRBY", bucket, field, count or 1)
   if durMs > 0 then redis.call("HINCRBY", bucket, "ms", durMs) end
   if name then
     redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
@@ -161,7 +162,7 @@ end
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
                               state, keepCount, keepAge)
   if keepCount == 0 and keepAge < 0 then
-    redis.call("DEL", jobKey, jobKey .. ":logs")
+    delJobs({jobId}, base)
     return
   end
   redis.call("ZADD", setKey, now, jobId)
@@ -181,6 +182,76 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
   if keepCount > 0 then
     delJobs(redis.call("ZREVRANGE", setKey, keepCount, -1), base)
     redis.call("ZREMRANGEBYRANK", setKey, 0, -(keepCount + 1))
+  end
+end
+-- Flow plumbing. A parent is parked in the `waiting-children` ZSET with a
+-- `<id>:deps` SET of pending child ids. Children settle into their parent
+-- inside the SAME script that commits their own transition (finish, stalled
+-- escalation, removal), so the fan-in barrier resolves on the crash path too.
+-- Queue-level keys derive from `base` (single-node assumption, see header).
+local function releaseParent(base, parentId)
+  -- no-op unless the parent is still parked (it may have failed eagerly)
+  if redis.call("ZREM", base .. "waiting-children", parentId) == 0 then return end
+  local priority = tonumber(redis.call("HGET", base .. parentId, "priority")) or 0
+  redis.call("HSET", base .. parentId, "state", "wait")
+  enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc")
+end
+local function settleChildCompleted(base, jobId, parentId, returnvalue)
+  -- a fully-removed parent (retention trim) must not get orphan keys recreated
+  if redis.call("EXISTS", base .. parentId) == 0 then return end
+  redis.call("HSET", base .. parentId .. ":results", jobId, returnvalue)
+  redis.call("SREM", base .. parentId .. ":deps", jobId)
+  if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
+    releaseParent(base, parentId)
+  end
+end
+-- The Lua twin of JobOptions.keep_args for the `removeOnFail` option - eager
+-- parent failure has no Python caller to compute retention, so it reads the
+-- parent's stored opts. Mirrors keep_args exactly (see job.py).
+local function keepArgsFromOpts(optsJson)
+  local ok, opts = pcall(cjson.decode, optsJson or "{}")
+  if not ok or type(opts) ~= "table" then return -1, -1 end
+  local v = opts.removeOnFail
+  if v == nil or v == cjson.null or v == false then return -1, -1 end
+  if v == true then return 0, -1 end
+  if type(v) == "number" then return v, -1 end
+  if type(v) == "table" then return tonumber(v.count) or -1, tonumber(v.age) or -1 end
+  return -1, -1
+end
+-- A terminally-failed child settles its parent per its `onFail` policy:
+-- "continue" records the failure and releases the parent once nothing is
+-- pending; anything else fails the parent NOW - eagerly, no worker needed -
+-- walking up through ancestors that are themselves fail_parent children.
+-- There is no "park forever" outcome by design. Eager failure goes through
+-- recordFinished so remove_on_fail retention applies like any other failure.
+local function settleChildFailed(base, jobId, parentId, onFail, reason, now, retentionMs)
+  local cid = jobId
+  local pid = parentId
+  while pid do
+    if onFail == "continue" then
+      if redis.call("EXISTS", base .. pid) == 1 then
+        redis.call("HSET", base .. pid .. ":cfail", cid, reason)
+        redis.call("SREM", base .. pid .. ":deps", cid)
+        if redis.call("SCARD", base .. pid .. ":deps") == 0 then
+          releaseParent(base, pid)
+        end
+      end
+      return
+    end
+    -- already settled (a sibling failed it first, or it was removed): stop
+    if redis.call("ZREM", base .. "waiting-children", pid) == 0 then return end
+    reason = "child " .. cid .. " failed: " .. reason
+    -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+    local pmeta = redis.call("HMGET", base .. pid, "parentId", "onFail", "name", "opts")
+    local keepCount, keepAge = keepArgsFromOpts(pmeta[4])
+    recordFinished(base .. "failed", base .. pid, base, pid, now,
+      "failedReason", reason, "failed", keepCount, keepAge)
+    recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
+    redis.call("PUBLISH", base .. "events",
+      cjson.encode({jobId = tostring(pid), event = "failed", reason = reason}))
+    cid = pid
+    pid = pmeta[1]
+    onFail = pmeta[2]
   end
 end
 """
@@ -247,6 +318,62 @@ return jobId
 """
 )
 
+# Add a whole flow tree atomically: every node's hash is created, leaves are
+# enqueued (or delayed), interior nodes are parked in `waiting-children` with
+# their `:deps` barrier populated. Either the entire flow exists or none of it.
+# Node `data`/`opts` arrive pre-encoded as JSON strings (stored verbatim).
+# KEYS[1] id counter  KEYS[2] key base
+# ARGV[1] now(ms)  ARGV[2] flow tree (json)  ARGV[3] metricsRetention(ms)
+# Returns the parent (root) job id.
+ADD_FLOW = (
+    _LIB
+    + """
+local base = KEYS[2]
+local now = tonumber(ARGV[1])
+local retention = tonumber(ARGV[3])
+local total = 0
+local function createNode(node, parentId)
+  local jobId = tostring(redis.call("INCR", KEYS[1]))
+  local jobKey = base .. jobId
+  total = total + 1
+  redis.call("HSET", jobKey,
+    "id", jobId, "name", node.name, "data", node.data, "opts", node.opts,
+    "timestamp", now, "attemptsMade", 0, "priority", node.priority)
+  if parentId then
+    redis.call("HSET", jobKey, "parentId", parentId, "onFail", node.onFail)
+  end
+  if node.children and #node.children > 0 then
+    local cids = {}
+    for i, child in ipairs(node.children) do
+      cids[i] = createNode(child, jobId)
+    end
+    redis.call("SADD", jobKey .. ":deps", unpack(cids))
+    redis.call("HSET", jobKey, "children", cjson.encode(cids),
+               "state", "waiting-children")
+    redis.call("ZADD", base .. "waiting-children", now, jobId)
+  else
+    local delay = tonumber(node.delay)
+    if delay > 0 then
+      redis.call("HSET", jobKey, "delay", delay, "state", "delayed")
+      redis.call("ZADD", base .. "delayed", now + delay, jobId)
+    else
+      redis.call("HSET", jobKey, "state", "wait")
+      enqueue(base .. "prioritized", base .. "marker", jobId,
+              tonumber(node.priority), base .. "pc")
+    end
+  end
+  return jobId
+end
+local rootId = createNode(cjson.decode(ARGV[2]), false)
+-- one metrics increment and one announce for the whole tree: per-node events
+-- have no result() waiter, and every pub/sub subscriber would pay for them
+recordMetrics(base, "added", now, 0, retention, nil, total)
+redis.call("PUBLISH", base .. "events",
+  cjson.encode({jobId = rootId, event = "added"}))
+return rootId
+"""
+)
+
 # Claim the next job: pop highest-priority from `prioritized` into `active`, lock
 # it, and return its hash. The blocking BZPOPMIN on the marker only wakes the
 # worker; THIS is the atomic move. Returns {jobHash, jobId} or nil if none.
@@ -294,11 +421,13 @@ redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[3])
 -- read BEFORE recordFinished (remove-on-complete may DEL the hash)
-local meta = redis.call("HMGET", KEYS[3], "processedOn", "name")
+local meta = redis.call("HMGET", KEYS[3], "processedOn", "name", "parentId")
 local startedOn = tonumber(meta[1]) or now
 recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now,
   "returnvalue", ARGV[2], "completed", tonumber(ARGV[7]), tonumber(ARGV[8]))
 recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]), meta[2])
+-- a flow child settles into its parent here, atomically with its own commit
+if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2]) end
 -- the result is decoded and re-encoded as part of ONE cjson document: a
 -- return value full of JSON metacharacters can never corrupt the message
 local okr, resultDoc = pcall(cjson.decode, ARGV[2])
@@ -355,13 +484,17 @@ if attemptsMade < maxAttempts then
 else
   local now = tonumber(ARGV[3])
   -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
-  local meta = redis.call("HMGET", KEYS[5], "processedOn", "name")
+  local meta = redis.call("HMGET", KEYS[5], "processedOn", "name", "parentId", "onFail")
   local startedOn = tonumber(meta[1]) or now
   recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now,
     "failedReason", ARGV[2], "failed", tonumber(ARGV[10]), tonumber(ARGV[11]))
   recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]), meta[2])
   redis.call("PUBLISH", KEYS[11],
     cjson.encode({jobId = ARGV[1], event = "failed", reason = ARGV[2]}))
+  -- a flow child settles into its parent per its on_fail policy, atomically
+  if meta[3] then
+    settleChildFailed(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[14]))
+  end
   outcome = 1
 end
 if ARGV[8] == "1" then
@@ -413,13 +546,32 @@ return 1
 )
 
 # Re-queue a failed job for another attempt (admin/dashboard action).
-# KEYS[1] failed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] job hash  KEYS[5] pc
-# ARGV[1] jobId
+# Flow-aware: a failed flow PARENT whose children haven't all settled re-parks
+# in `waiting-children` (the barrier re-arms) instead of running at once with
+# partial results; a failed flow CHILD re-joins its parked parent's barrier and
+# clears its stale failure record, so the parent's post-retry view is honest.
+# Retrying parent and children in any order (e.g. retry-all) recovers the flow.
+# KEYS[1] failed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] job hash
+# KEYS[5] pc  KEYS[6] key base
+# ARGV[1] jobId  ARGV[2] now(ms)
 RETRY_JOB = (
     _LIB
     + """
 if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
 redis.call("HDEL", KEYS[4], "failedReason", "finishedOn")
+local base = KEYS[6]
+local parentId = redis.call("HGET", KEYS[4], "parentId")
+if parentId then
+  redis.call("HDEL", base .. parentId .. ":cfail", ARGV[1])
+  if redis.call("ZSCORE", base .. "waiting-children", parentId) then
+    redis.call("SADD", base .. parentId .. ":deps", ARGV[1])
+  end
+end
+if redis.call("SCARD", base .. ARGV[1] .. ":deps") > 0 then
+  redis.call("HSET", KEYS[4], "state", "waiting-children")
+  redis.call("ZADD", base .. "waiting-children", tonumber(ARGV[2]), ARGV[1])
+  return 1
+end
 local priority = tonumber(redis.call("HGET", KEYS[4], "priority")) or 0
 redis.call("HSET", KEYS[4], "state", "wait")
 enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
@@ -427,18 +579,58 @@ return 1
 """
 )
 
-# Remove a job from wherever it lives and delete its hash (admin/dashboard action).
+# Remove a job from wherever it lives and delete its hash (admin/dashboard
+# action). A flow parent takes its whole subtree with it; a flow child unlinks
+# from its parent's barrier, releasing the parent when it was the last
+# dependency (nothing left to wait for).
 # KEYS[1] prioritized  KEYS[2] active  KEYS[3] delayed  KEYS[4] completed
-# KEYS[5] failed  KEYS[6] job hash   ARGV[1] jobId
-REMOVE_JOB = """
-redis.call("ZREM", KEYS[1], ARGV[1])
-redis.call("LREM", KEYS[2], 0, ARGV[1])
-redis.call("ZREM", KEYS[3], ARGV[1])
-redis.call("ZREM", KEYS[4], ARGV[1])
-redis.call("ZREM", KEYS[5], ARGV[1])
-redis.call("DEL", KEYS[6] .. ":lock", KEYS[6] .. ":logs")
-return redis.call("DEL", KEYS[6])
+# KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base   ARGV[1] jobId
+REMOVE_JOB = (
+    _LIB
+    + """
+local base = KEYS[7]
+-- The job's `state` field says which single collection holds it (every
+-- transition writes it atomically); only an unreadable state pays the blanket
+-- sweep - notably the O(active) LREM.
+local function removeFromState(jobId, state)
+  if state == "wait" then redis.call("ZREM", KEYS[1], jobId)
+  elseif state == "active" then redis.call("LREM", KEYS[2], 0, jobId)
+  elseif state == "delayed" then redis.call("ZREM", KEYS[3], jobId)
+  elseif state == "completed" then redis.call("ZREM", KEYS[4], jobId)
+  elseif state == "failed" then redis.call("ZREM", KEYS[5], jobId)
+  elseif state == "waiting-children" then redis.call("ZREM", KEYS[6], jobId)
+  else
+    redis.call("ZREM", KEYS[1], jobId)
+    redis.call("LREM", KEYS[2], 0, jobId)
+    redis.call("ZREM", KEYS[3], jobId)
+    redis.call("ZREM", KEYS[4], jobId)
+    redis.call("ZREM", KEYS[5], jobId)
+    redis.call("ZREM", KEYS[6], jobId)
+  end
+end
+local function removeTree(jobId)
+  local meta = redis.call("HMGET", base .. jobId, "children", "state")
+  removeFromState(jobId, meta[2])
+  delJobs({jobId}, base)
+  if meta[1] then
+    for _, cid in ipairs(cjson.decode(meta[1])) do removeTree(cid) end
+  end
+end
+local existed = redis.call("EXISTS", base .. ARGV[1])
+local parentId = redis.call("HGET", base .. ARGV[1], "parentId")
+removeTree(ARGV[1])
+if parentId then
+  -- unlink from the barrier only: a completed child's result and a failed
+  -- child's post-mortem record belong to the parent, and routine history
+  -- cleanup (clean('completed')) must never mutate a pending parent's data
+  redis.call("SREM", base .. parentId .. ":deps", ARGV[1])
+  if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
+    releaseParent(base, parentId)
+  end
+end
+return existed
 """
+)
 
 # Mark-and-sweep recovery of jobs whose worker died. Recovered jobs are
 # re-enqueued at their stored priority; jobs past maxStalledCount go to `failed`.
@@ -474,6 +666,17 @@ if #stalling > 0 then
             "finishedOn", ARGV[2])
           recordMetrics(KEYS[6], "failed", tonumber(ARGV[2]), 0, tonumber(ARGV[4]),
                         redis.call("HGET", jobKey, "name"))
+          -- announce the terminal failure so result() waiters resolve instead
+          -- of timing out (the sweeping worker's local events don't reach them)
+          redis.call("PUBLISH", KEYS[6] .. "events", cjson.encode({jobId = jobId,
+            event = "failed", reason = "job stalled more than allowable limit"}))
+          -- the crash path settles flow parents too - a dead worker must not
+          -- leave a parent parked forever
+          local pmeta = redis.call("HMGET", jobKey, "parentId", "onFail")
+          if pmeta[1] then
+            settleChildFailed(KEYS[6], jobId, pmeta[1], pmeta[2],
+              "job stalled more than allowable limit", tonumber(ARGV[2]), tonumber(ARGV[4]))
+          end
           table.insert(failed, jobId)
         else
           local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0

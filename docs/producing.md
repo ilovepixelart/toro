@@ -55,6 +55,9 @@ Two distinct tools, usable independently:
 `job_id` answers "this exact piece of work must exist at most once";
 `deduplication` answers "don't enqueue this more often than every X".
 
+To enqueue a parent job together with children that must run first
+(fan-out/fan-in, chains), use `add_flow()` - see [Flows](flows.md).
+
 ## Waiting for a result
 
 ```python

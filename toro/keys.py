@@ -51,6 +51,11 @@ class Keys:
         return f"{self.base}failed"
 
     @property
+    def waiting_children(self) -> str:
+        # ZSET of flow parents parked until their children settle.
+        return f"{self.base}waiting-children"
+
+    @property
     def meta_paused(self) -> str:
         # Existence flag: when set, workers stop claiming new jobs.
         return f"{self.base}meta-paused"
@@ -112,3 +117,15 @@ class Keys:
 
     def logs(self, job_id: str | int) -> str:
         return f"{self.base}{job_id}:logs"
+
+    def deps(self, job_id: str | int) -> str:
+        # SET of a flow parent's still-pending child ids (the fan-in barrier).
+        return f"{self.base}{job_id}:deps"
+
+    def results(self, job_id: str | int) -> str:
+        # HASH child id -> returnvalue JSON, written as each child completes.
+        return f"{self.base}{job_id}:results"
+
+    def cfail(self, job_id: str | int) -> str:
+        # HASH child id -> failed reason, for children failed under on_fail="continue".
+        return f"{self.base}{job_id}:cfail"

@@ -346,6 +346,8 @@ class Worker:
             events_key=self.keys.events,
             logs_key=self.keys.logs(job_id),
             job_id=job_id,
+            results_key=self.keys.results(job_id),
+            cfail_key=self.keys.cfail(job_id),
         )
         # A scheduler job mints its successor on first pickup, so the schedule
         # stays on time regardless of how long (or whether) this run succeeds.
