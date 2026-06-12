@@ -482,3 +482,24 @@ async def test_zombie_worker_recovered_and_completed_once(q):
     await healthy.stop()
     zt.cancel()
     ht.cancel()
+
+
+async def test_dedup_id_rejects_key_unsafe_characters(q):
+    # the dedup id becomes a Redis key segment ("de:<id>"); a ':' or control
+    # char lets two logically different ids collide and silently drop jobs
+    for bad in ("user:123", "a\x00b", "x\x1fy"):
+        with pytest.raises(ValueError, match="deduplication id"):
+            await q.add("m", {}, deduplication={"id": bad, "ttl": 60_000})
+
+
+async def test_result_event_roundtrips_hostile_payloads(q, run_worker):
+    # completed events are published as JSON built in Lua; a return value full
+    # of JSON metacharacters must come back byte-identical through result()
+    nasty = {"s": 'he said "}{," \\ and \n newline', "n": [1, {"deep": '"]}'}]}
+
+    async def proc(job):
+        return nasty
+
+    async with run_worker(q, proc):
+        j = await q.add("m", {})
+        assert await q.result(j.id, timeout=10) == nasty

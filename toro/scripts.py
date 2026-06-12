@@ -201,8 +201,9 @@ ADD_JOB = (
     _LIB
     + """
 local function announce(jobId)
+  -- whole-message cjson.encode: no hand-built JSON anywhere on the event bus
   redis.call("PUBLISH", KEYS[7],
-    '{"jobId":' .. cjson.encode(tostring(jobId)) .. ',"event":"added"}')
+    cjson.encode({jobId = tostring(jobId), event = "added"}))
 end
 local base = KEYS[5]
 -- Throttle dedup: within the TTL window, a repeat dedup id is ignored and the
@@ -298,8 +299,12 @@ local startedOn = tonumber(meta[1]) or now
 recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now,
   "returnvalue", ARGV[2], "completed", tonumber(ARGV[7]), tonumber(ARGV[8]))
 recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]), meta[2])
-redis.call("PUBLISH", KEYS[10],
-  '{"jobId":' .. cjson.encode(ARGV[1]) .. ',"event":"completed","result":' .. ARGV[2] .. '}')
+-- the result is decoded and re-encoded as part of ONE cjson document: a
+-- return value full of JSON metacharacters can never corrupt the message
+local okr, resultDoc = pcall(cjson.decode, ARGV[2])
+local completedMsg = {jobId = ARGV[1], event = "completed"}
+if okr then completedMsg.result = resultDoc end
+redis.call("PUBLISH", KEYS[10], cjson.encode(completedMsg))
 if ARGV[5] == "1" then
   local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                           ARGV[4], tonumber(ARGV[6]), ARGV[3],
@@ -355,8 +360,8 @@ else
   recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now,
     "failedReason", ARGV[2], "failed", tonumber(ARGV[10]), tonumber(ARGV[11]))
   recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]), meta[2])
-  redis.call("PUBLISH", KEYS[11], '{"jobId":' .. cjson.encode(ARGV[1])
-    .. ',"event":"failed","reason":' .. cjson.encode(ARGV[2]) .. '}')
+  redis.call("PUBLISH", KEYS[11],
+    cjson.encode({jobId = ARGV[1], event = "failed", reason = ARGV[2]}))
   outcome = 1
 end
 if ARGV[8] == "1" then

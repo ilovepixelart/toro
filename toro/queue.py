@@ -169,6 +169,14 @@ class Queue:
             dedup_ttl = int(deduplication.get("ttl") or 0)
             if not dedup_id or dedup_ttl <= 0:
                 raise ValueError("deduplication needs {'id': str, 'ttl': positive ms}")
+            # same rule as scheduler ids: the id becomes a Redis key segment,
+            # so ':' or control characters would let distinct ids collide
+            # (and silently drop jobs that share the accidental key)
+            if ":" in dedup_id or any(ord(c) < 0x20 for c in dedup_id):
+                raise ValueError(
+                    "deduplication id must not contain ':' or control characters "
+                    "(it is used as a Redis key segment)"
+                )
         now = _now_ms()
         new_id = str(
             await self._add_job(

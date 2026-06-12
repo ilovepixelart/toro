@@ -18,3 +18,5 @@ Reference docs for how toro works. The [README](../README.md) is the quick start
   occurrence schedules the next.
 - **[Architecture](architecture.md)** — the atomic-Lua core and the design
   decisions behind the queue.
+- **[Security](security.md)** — what toro guarantees (JSON-only, no dynamic
+  dispatch, no string-built commands) and what you own (Redis access, secrets).
