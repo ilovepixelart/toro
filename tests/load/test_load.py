@@ -1,4 +1,4 @@
-"""@load smoke test — a short OPEN-LOOP run that proves toro keeps up under steady
+"""@load smoke test - a short OPEN-LOOP run that proves toro keeps up under steady
 arrival without dropping jobs and without latency running away.
 
 Automated guardrail (opt-in: `pytest -m load`); the full sweep lives in harness.py.
@@ -7,7 +7,7 @@ We assert behaviour, not a vanity number:
   * zero errors,
   * p99 end-to-end latency stays bounded (a queue that fell behind would balloon it).
 
-Latency is recorded straight from the in-process processor (a closure) — reliable
+Latency is recorded straight from the in-process processor (a closure) - reliable
 and zero-overhead, no pub/sub timing games.
 """
 
@@ -17,7 +17,7 @@ import time
 
 async def test_open_loop_keeps_up_without_drops_or_runaway_latency(q, run_worker, run_until):
     N = 400
-    rate = 200.0  # jobs/s — modest, well under saturation
+    rate = 200.0  # jobs/s - modest, well under saturation
     interval = 1.0 / rate
     e2e_ms: list[float] = []
 
@@ -33,12 +33,12 @@ async def test_open_loop_keeps_up_without_drops_or_runaway_latency(q, run_worker
             await asyncio.sleep(max(0.0, nxt - time.time()))
         completed = await run_until(lambda: len(e2e_ms) >= N, timeout=10.0)
 
-    # (a) no drops — every enqueued job ran exactly once; (b) none failed.
-    assert completed, f"only {len(e2e_ms)}/{N} completed — dropped jobs?"
+    # (a) no drops - every enqueued job ran exactly once; (b) none failed.
+    assert completed, f"only {len(e2e_ms)}/{N} completed - dropped jobs?"
     assert len(e2e_ms) == N
     assert (await q.counts())["failed"] == 0
 
-    # (c) latency stayed bounded — runaway queueing would push p99 into seconds.
+    # (c) latency stayed bounded - runaway queueing would push p99 into seconds.
     e2e_ms.sort()
     p99 = e2e_ms[min(len(e2e_ms) - 1, int(len(e2e_ms) * 0.99))]
-    assert p99 < 1000, f"p99 end-to-end {p99:.0f}ms — the queue fell behind"
+    assert p99 < 1000, f"p99 end-to-end {p99:.0f}ms - the queue fell behind"

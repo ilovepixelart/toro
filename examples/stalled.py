@@ -1,4 +1,4 @@
-"""Demo: a worker dies mid-job and another recovers it — exactly one completion.
+"""Demo: a worker dies mid-job and another recovers it - exactly one completion.
 
 Run a Redis on localhost:6379, then:  python examples/stalled.py
 """
@@ -36,7 +36,7 @@ async def main():
     healthy.on("completed", lambda j, r: print(f"  ✓ #{j.id} completed by {r['by']}"))
     zombie.on(
         "lock-lost",
-        lambda jid: print(f"  [zombie] woke up, but #{jid} was taken — finish rejected"),
+        lambda jid: print(f"  [zombie] woke up, but #{jid} was taken - finish rejected"),
     )
 
     zt = asyncio.create_task(zombie.run())

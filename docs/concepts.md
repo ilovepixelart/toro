@@ -20,7 +20,7 @@ toro has a clean producer/consumer split, and both talk to the same Redis.
   bookkeeping the system fills in: `state`, `attempts_made`, timestamps
   (`timestamp`, `processed_on`, `finished_on`), `progress`, `stacktrace`, and
   either a `returnvalue` or a `failed_reason`. (A job's log lines and its lock
-  live in separate Redis keys, not as fields on the `Job` — see the
+  live in separate Redis keys, not as fields on the `Job` - see the
   [data model](data-model.md).)
 
 Producers and consumers never call each other. They coordinate only through
@@ -91,7 +91,7 @@ not on a retry. Two things consume the channel:
 
 `Worker.on(event, fn)` lets a worker react to its own lifecycle with in-process
 callbacks (`completed`, `failed`, `retrying`, `stalled`, `lock-lost`,
-`rate-limited`) — separate from the pub/sub channel above. See
+`rate-limited`) - separate from the pub/sub channel above. See
 [Processing jobs](processing.md).
 
 ## Reliability in one sentence

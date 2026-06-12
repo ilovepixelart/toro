@@ -31,7 +31,7 @@ class Keys:
 
     @property
     def pc(self) -> str:
-        # Priority sequence counter — breaks priority ties in FIFO order.
+        # Priority sequence counter - breaks priority ties in FIFO order.
         return f"{self.base}pc"
 
     @property
@@ -57,12 +57,12 @@ class Keys:
 
     @property
     def events(self) -> str:
-        # Pub/sub channel for job outcomes (completed/failed) — drives result() and live UI.
+        # Pub/sub channel for job outcomes (completed/failed) - drives result() and live UI.
         return f"{self.base}events"
 
     @property
     def limiter(self) -> str:
-        # Token-bucket hash {tokens, ts} — the queue-wide rate limit, shared by all workers.
+        # Token-bucket hash {tokens, ts} - the queue-wide rate limit, shared by all workers.
         return f"{self.base}limiter"
 
     @property

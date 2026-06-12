@@ -1,10 +1,10 @@
-"""@load — PROMOTE_DELAYED must promote due jobs in bounded chunks (LIMIT), so
+"""@load - PROMOTE_DELAYED must promote due jobs in bounded chunks (LIMIT), so
 a big backlog coming due at once (e.g. a backoff storm after an outage) never
 blocks Redis for the whole sweep.
 
 Seeds M delayed jobs all due now, drains them with repeated promote calls, and
-samples PING latency from a second connection throughout: no single call — and
-no observed stall — may approach the duration of the whole drain. Baseline
+samples PING latency from a second connection throughout: no single call - and
+no observed stall - may approach the duration of the whole drain. Baseline
 recorded on local Redis 7.4 before chunking: one call swept all M jobs and an
 independent client's PING stalled for the full sweep (M=50k: 131ms, ~2.6µs/job).
 """
@@ -62,7 +62,7 @@ async def _ping_sampler(url: str, stop: asyncio.Event) -> list[float]:
             t0 = time.perf_counter()
             await r.ping()
             stalls.append((time.perf_counter() - t0) * 1000)
-            await asyncio.sleep(0)  # stay hot — we WANT to observe any block
+            await asyncio.sleep(0)  # stay hot - we WANT to observe any block
     finally:
         await r.aclose()
     return stalls

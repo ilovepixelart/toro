@@ -21,7 +21,7 @@ def connect(url: str, *, max_connections: int = 50) -> aioredis.Redis:
     * a ``Retry`` policy so a transient reconnect is invisible to the worker loops,
       rather than surfacing as an exception they'd swallow into a skipped iteration.
     * a ``BlockingConnectionPool``, so a burst of concurrent commands past the pool
-      size awaits a free connection (an async wait — the event loop keeps running)
+      size awaits a free connection (an async wait - the event loop keeps running)
       instead of raising MaxConnectionsError, which the default pool does.
 
     ``max_connections`` must exceed the count of connections held LONG-term: a

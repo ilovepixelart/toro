@@ -19,7 +19,7 @@ is exactly what turns a dead worker's jobs back into runnable ones.
 
 While the job runs, a per-job **renewer** task extends the lock every
 `lock_renew_time` (default `lock_duration / 2`) and clears the job from the
-`stalled` candidate set. Renewal is token-guarded — a worker can never renew a
+`stalled` candidate set. Renewal is token-guarded - a worker can never renew a
 lock another worker has since taken over. If a renewal finds the token gone, the
 worker emits `lock-lost` and stops touching the job.
 
@@ -39,7 +39,7 @@ per interval, not once per worker:
    becoming a candidate for the *next* sweep.
 
 A healthy job is marked, then unmarked by its renewer before the next sweep ever
-sees it. Only a job whose worker stopped renewing — i.e. died — stays marked
+sees it. Only a job whose worker stopped renewing - i.e. died - stays marked
 with an expired lock long enough to be recovered. The whole pass is one Lua
 script, so recovery can't race a finish.
 
@@ -48,9 +48,9 @@ script, so recovery can't race a finish.
 The handler may run more than once; the *result* is committed exactly once. The
 finish scripts (`MOVE_TO_COMPLETED` / `MOVE_TO_FAILED`) begin with two guards:
 
-- the lock must still hold **this worker's token** — otherwise the script
+- the lock must still hold **this worker's token** - otherwise the script
   returns `LOCK_LOST` (-2) and commits nothing;
-- the job must still be in `active` — otherwise `NOT_ACTIVE` (-3), same result.
+- the job must still be in `active` - otherwise `NOT_ACTIVE` (-3), same result.
 
 So when a slow worker comes back from the dead after its job was recovered and
 re-run elsewhere, its late finish is dropped on the floor, with a `lock-lost`
@@ -75,10 +75,10 @@ are bounded by `max_stalled_count`.
 
 Two different counters bound two different failure modes:
 
-- `attempts_made` vs `attempts` — *your code failed*: the processor raised.
+- `attempts_made` vs `attempts` - *your code failed*: the processor raised.
   Decided at finish time; retries re-enqueue (with [backoff](producing.md) if
   configured) until attempts run out, then the job fails with your exception.
-- `stalledCounter` vs `max_stalled_count` — *the worker failed*: nobody renewed
+- `stalledCounter` vs `max_stalled_count` - *the worker failed*: nobody renewed
   the lock. Decided by the sweep; bounds how many times an apparently
   worker-killing job is allowed to take a worker down with it.
 
@@ -86,7 +86,7 @@ Two different counters bound two different failure modes:
 
 | Worker option | Default | Meaning |
 |---|---|---|
-| `lock_duration` | 30000 ms | Lock lease length. Must comfortably exceed your event-loop stalls, not your job length — the renewer handles long jobs. |
+| `lock_duration` | 30000 ms | Lock lease length. Must comfortably exceed your event-loop stalls, not your job length - the renewer handles long jobs. |
 | `lock_renew_time` | `lock_duration / 2` | Renewal cadence. |
 | `renew_locks` | `True` | Disable only to *test* stalled recovery. |
 | `stalled_interval` | 30000 ms | Sweep cadence; `0` disables the sweep entirely. |

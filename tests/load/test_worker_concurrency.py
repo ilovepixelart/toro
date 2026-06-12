@@ -1,12 +1,12 @@
-"""@load — a worker's effective concurrency must not be silently capped by the
+"""@load - a worker's effective concurrency must not be silently capped by the
 connection pool.
 
 The concern: each parked process loop holds a pool connection inside BZPOPMIN,
-and the BlockingConnectionPool defaults to 50 connections — so concurrency=100
+and the BlockingConnectionPool defaults to 50 connections - so concurrency=100
 might quietly run at 50. The counter-hypothesis: a loop only holds a connection
 while PARKED or issuing a command, not while its job runs, so under real load
 the pool rotates and full concurrency is reached. This measures which is true:
-deep backlog, slow jobs, concurrency 2x the pool size — peak simultaneous
+deep backlog, slow jobs, concurrency 2x the pool size - peak simultaneous
 in-flight jobs must approach the configured concurrency.
 """
 

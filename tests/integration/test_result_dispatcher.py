@@ -1,5 +1,5 @@
 """The shared result() dispatcher: one events subscription per Queue, routing
-terminal events to waiting futures — and its edge paths: already-finished
+terminal events to waiting futures - and its edge paths: already-finished
 short-circuits, timeouts, garbage on the channel, a crashed subscription
 (waiters fail fast, the next call restarts it), and close() with waiters.
 """
@@ -46,7 +46,7 @@ async def test_result_times_out_with_a_clear_message(q):
 
 
 def _waiting(q, *job_ids):
-    """True once every job id has a registered result() future — the
+    """True once every job id has a registered result() future - the
     deterministic 'waiter is ready' signal (no sleep guessing)."""
     return all(j in q._result_waiters for j in job_ids)
 
@@ -97,7 +97,7 @@ async def test_dispatcher_crash_fails_waiters_fast_then_restarts(q, run_until):
     assert time.monotonic() - t0 < 2, "waiter should fail fast, not sit out its timeout"
 
     # The next result() call sweeps the dead listener's leftovers and starts a
-    # fresh one — the dispatcher heals without restarting the Queue.
+    # fresh one - the dispatcher heals without restarting the Queue.
     waiter2 = asyncio.create_task(q.result("phoenix", timeout=5))
     assert await run_until(lambda: _waiting(q, "phoenix"))
     await _publish(q, "phoenix", result="alive")

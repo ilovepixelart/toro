@@ -1,4 +1,4 @@
-"""Unit: JobOptions — defaults, (de)serialization, and the auto-removal mapping."""
+"""Unit: JobOptions - defaults, (de)serialization, and the auto-removal mapping."""
 
 import pytest
 
@@ -48,6 +48,6 @@ def test_keep_args_maps_every_removal_form(opt, expected):
 
 
 def test_keep_args_distinguishes_true_from_one():
-    # bool is an int subclass — guard that True/1 don't collapse together.
+    # bool is an int subclass - guard that True/1 don't collapse together.
     assert JobOptions.keep_args(True) == (0, -1)
     assert JobOptions.keep_args(1) == (1, -1)

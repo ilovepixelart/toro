@@ -109,14 +109,14 @@ async def _running_worker(queue: Queue, processor, **kw):
 
 @pytest.fixture
 def run_worker():
-    """`async with run_worker(q, processor, concurrency=2) as w: ...` — starts a
+    """`async with run_worker(q, processor, concurrency=2) as w: ...` - starts a
     worker and guarantees a clean shutdown on exit."""
     return _running_worker
 
 
 @pytest.fixture
 def run_until():
-    """`await run_until(lambda: cond, timeout=2)` — poll until true or time out.
+    """`await run_until(lambda: cond, timeout=2)` - poll until true or time out.
     Returns True if the condition held, False on timeout (assert on the result)."""
 
     async def _run_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:

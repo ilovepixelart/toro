@@ -37,7 +37,7 @@ RemoveOption: TypeAlias = "bool | int | dict[str, int] | None"
 class SupportsResult(Protocol):
     """The slice of Queue that `Job.result()` needs. Typing `_queue` against this
     (not the concrete Queue) keeps the domain object from importing the queue/redis
-    layer — dependency inversion, and no circular import to dodge.
+    layer - dependency inversion, and no circular import to dodge.
     """
 
     async def result(self, job_id: str, *, timeout: float = ...) -> Any: ...

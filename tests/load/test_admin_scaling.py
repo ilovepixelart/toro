@@ -1,8 +1,8 @@
-"""@load — retry_all_failed must batch its per-job RETRY_JOB scripts through
+"""@load - retry_all_failed must batch its per-job RETRY_JOB scripts through
 one pipeline (the clean() pattern), not pay one round trip per job.
 
 Compares retry_all_failed() against the same retries issued serially via
-retry_job() — the batched bulk API has to beat the per-job loop by a wide
+retry_job() - the batched bulk API has to beat the per-job loop by a wide
 margin, at every size. Baseline recorded on local Redis 7.4: serial ~6.5k
 jobs/s (one ~0.16ms round trip each), pipelined ~110k jobs/s (~17x).
 """
@@ -20,7 +20,7 @@ async def _wipe(q: Queue) -> None:
 
 async def _seed_failed(q: Queue, n: int) -> None:
     """Plant n terminally-failed jobs directly (hash + `failed` ZSET entry),
-    mirroring what MOVE_TO_FAILED writes — milliseconds instead of running
+    mirroring what MOVE_TO_FAILED writes - milliseconds instead of running
     n real jobs through a worker.
     """
     now = int(time.time() * 1000)
@@ -78,6 +78,6 @@ async def test_retry_all_failed_beats_a_serial_per_job_loop(q, load_scale):
             f"bulk {bulk * 1000:>7.1f}ms ({n / bulk:>8,.0f} jobs/s)   speedup x{ratios[n]:.1f}"
         )
 
-    # The bulk API must remove the per-job round trip — far faster than the
+    # The bulk API must remove the per-job round trip - far faster than the
     # serial loop, and increasingly so as n grows.
     assert ratios[sizes[-1]] > 2.0, f"retry_all_failed is not batching: {ratios}"

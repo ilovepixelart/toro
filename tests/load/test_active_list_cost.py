@@ -1,18 +1,18 @@
-"""@load — the cost of removing a finished job from the `active` list
+"""@load - the cost of removing a finished job from the `active` list
 (`LREM count=0`, an O(len) full-list scan on every completion).
 
 Measured verdict (recorded 2026-06, local Redis 7.4): the asymptotic claim is
-true but the constant is small — the scan costs ~4-5µs per 1k active entries,
+true but the constant is small - the scan costs ~4-5µs per 1k active entries,
 invisible under the ~0.2ms round trip until `active` reaches tens of thousands
 of in-flight jobs. The tests below amplify to 100k entries so the scan
 dominates the RTT and the slope is measurable.
 
-(a) MOVE_TO_COMPLETED latency vs active list size — characterizes the slope.
+(a) MOVE_TO_COMPLETED latency vs active list size - characterizes the slope.
 (b) LREM count 0 / 1 / -1 for a tail-positioned element (jobs are LPUSHed at
-    the head, so the oldest — most likely to finish — sit near the tail).
+    the head, so the oldest - most likely to finish - sit near the tail).
     Decision on the data: toro KEEPS count=0. The direction trick saves only
     microseconds under the ~0.2ms round trip at realistic active sizes, while
-    count=0 removes every occurrence — self-healing if a bug ever double-inserts.
+    count=0 removes every occurrence - self-healing if a bug ever double-inserts.
 """
 
 import statistics

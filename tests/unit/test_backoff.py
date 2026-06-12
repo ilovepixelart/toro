@@ -1,4 +1,4 @@
-"""Unit: compute_backoff — the retry-delay policy, in isolation from the Worker."""
+"""Unit: compute_backoff - the retry-delay policy, in isolation from the Worker."""
 
 import pytest
 
