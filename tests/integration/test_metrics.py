@@ -244,3 +244,10 @@ async def test_stall_failure_records_the_job_name(q):
 async def _bucket_total(q: Queue, field: str, want: int) -> bool:
     points = await q.metrics(minutes=2)
     return sum(p[field] for p in points) >= want
+
+
+async def test_latency_zero_when_head_job_hash_is_gone(q):
+    # a job id can linger in `prioritized` while its hash was just removed —
+    # the race guard must answer 0, not raise
+    await q.redis.zadd(q.keys.prioritized, {"ghost": 1})
+    assert await q.latency() == 0
