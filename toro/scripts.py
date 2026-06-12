@@ -39,6 +39,10 @@ SEQ_MOD = 4294967296  # 2^32  — sequence wrap window
 # batch signals the backlog is drained.
 PROMOTE_BATCH = 1000
 
+# How long per-minute metrics buckets live: enough history for dashboard
+# charts, bounded key count (at most 480 small hashes per queue).
+METRICS_RETENTION_MS = 8 * 60 * 60 * 1000
+
 # Lua → Python return protocol: sentinels the scripts emit, decoded in worker.py.
 RL_SENTINEL = "__rl__"  # ACQUIRE hit the rate limiter; res[1] = ms until a token frees
 LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already reclaimed)
@@ -117,6 +121,23 @@ local function delJobs(ids, base)
     redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs")
   end
 end
+-- Per-minute metrics bucket: one small hash per (queue, minute) holding
+-- `added` / `completed` / `failed` counts and `ms` (summed processing
+-- duration), each bucket self-expiring after retentionMs. Written here,
+-- inside the same scripts as the transitions, so a counter can never
+-- disagree with the transition it counts. When a job name is given, the
+-- same counts also land in per-name fields ("completed:<name>", ...) so
+-- a dashboard can answer "which job is responsible".
+local function recordMetrics(base, field, now, durMs, retentionMs, name)
+  local bucket = base .. "metrics:" .. tostring(math.floor(now / 60000) * 60000)
+  redis.call("HINCRBY", bucket, field, 1)
+  if durMs > 0 then redis.call("HINCRBY", bucket, "ms", durMs) end
+  if name then
+    redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
+    if durMs > 0 then redis.call("HINCRBY", bucket, "ms:" .. name, durMs) end
+  end
+  redis.call("PEXPIRE", bucket, retentionMs)
+end
 -- Record a terminal job in a finished set, applying auto-removal:
 --   keepCount: -1 keep all, 0 remove immediately (don't record), N keep newest N
 --   keepAge:   -1 no age limit, S keep only those finished within S seconds
@@ -158,6 +179,7 @@ end
 # ARGV[1] name  ARGV[2] data(json)  ARGV[3] opts(json)
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
+# ARGV[10] metricsRetention(ms)
 ADD_JOB = (
     _LIB
     + """
@@ -200,6 +222,8 @@ else
   redis.call("HSET", jobKey, "state", "wait")
   enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
 end
+-- only real inserts count (dedup hits and id replays returned above)
+recordMetrics(base, "added", tonumber(ARGV[4]), 0, tonumber(ARGV[10]))
 announce(jobId)
 return jobId
 """
@@ -242,7 +266,7 @@ return 0
 # KEYS[10] events channel  KEYS[11] meta-paused  KEYS[12] limiter
 # ARGV[1] jobId  ARGV[2] returnvalue(json)  ARGV[3] now(ms)  ARGV[4] token
 # ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)  ARGV[7] keepCount  ARGV[8] keepAge(s)
-# ARGV[9] rlMax  ARGV[10] rlDuration(ms)
+# ARGV[9] rlMax  ARGV[10] rlDuration(ms)  ARGV[11] metricsRetention(ms)
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}.
 MOVE_TO_COMPLETED = (
     _LIB
@@ -250,8 +274,13 @@ MOVE_TO_COMPLETED = (
 if redis.call("GET", KEYS[4]) ~= ARGV[4] then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
-recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], tonumber(ARGV[3]),
+local now = tonumber(ARGV[3])
+-- read BEFORE recordFinished (remove-on-complete may DEL the hash)
+local meta = redis.call("HMGET", KEYS[3], "processedOn", "name")
+local startedOn = tonumber(meta[1]) or now
+recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now,
   "returnvalue", ARGV[2], "completed", tonumber(ARGV[7]), tonumber(ARGV[8]))
+recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]), meta[2])
 redis.call("PUBLISH", KEYS[10],
   '{"jobId":' .. cjson.encode(ARGV[1]) .. ',"event":"completed","result":' .. ARGV[2] .. '}')
 if ARGV[5] == "1" then
@@ -278,7 +307,7 @@ return {1}
 # ARGV[1] jobId  ARGV[2] failedReason  ARGV[3] now(ms)  ARGV[4] attemptsMade
 # ARGV[5] maxAttempts  ARGV[6] backoff(ms)  ARGV[7] token  ARGV[8] fetch(1/0)
 # ARGV[9] lockDuration(ms)  ARGV[10] keepCount  ARGV[11] keepAge(s)
-# ARGV[12] rlMax  ARGV[13] rlDuration(ms)
+# ARGV[12] rlMax  ARGV[13] rlDuration(ms)  ARGV[14] metricsRetention(ms)
 # Returns -2/-3, else {outcome} or {outcome, nextHash, nextId}; outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
@@ -302,8 +331,13 @@ if attemptsMade < maxAttempts then
   end
   outcome = 0
 else
-  recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], tonumber(ARGV[3]),
+  local now = tonumber(ARGV[3])
+  -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+  local meta = redis.call("HMGET", KEYS[5], "processedOn", "name")
+  local startedOn = tonumber(meta[1]) or now
+  recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now,
     "failedReason", ARGV[2], "failed", tonumber(ARGV[10]), tonumber(ARGV[11]))
+  recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]), meta[2])
   redis.call("PUBLISH", KEYS[11], '{"jobId":' .. cjson.encode(ARGV[1])
     .. ',"event":"failed","reason":' .. cjson.encode(ARGV[2]) .. '}')
   outcome = 1
@@ -389,6 +423,7 @@ return redis.call("DEL", KEYS[6])
 # KEYS[1] stalled  KEYS[2] active  KEYS[3] prioritized  KEYS[4] failed
 # KEYS[5] stalled-check  KEYS[6] key base  KEYS[7] marker  KEYS[8] pc
 # ARGV[1] maxStalledCount  ARGV[2] now(ms)  ARGV[3] throttle(ms), 0 disables
+# ARGV[4] metricsRetention(ms)
 # Returns {failedIds, recoveredIds}.
 MOVE_STALLED = (
     _LIB
@@ -415,6 +450,8 @@ if #stalling > 0 then
           redis.call("HSET", jobKey, "state", "failed",
             "failedReason", "job stalled more than allowable limit",
             "finishedOn", ARGV[2])
+          recordMetrics(KEYS[6], "failed", tonumber(ARGV[2]), 0, tonumber(ARGV[4]),
+                        redis.call("HGET", jobKey, "name"))
           table.insert(failed, jobId)
         else
           local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0

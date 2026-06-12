@@ -47,7 +47,9 @@ async def test_add_costs_a_single_round_trip(q, load_scale):
     now = int(time.time() * 1000)
     t0 = time.perf_counter()
     for i in range(n):
-        await add_job(keys=keys, args=["bench", json.dumps({"i": i}), opts, now, 0, 0, "", "", 0])
+        await add_job(
+            keys=keys, args=["bench", json.dumps({"i": i}), opts, now, 0, 0, "", "", 0, 60_000]
+        )
     bare = time.perf_counter() - t0
     assert (await q.counts())["wait"] == n
 

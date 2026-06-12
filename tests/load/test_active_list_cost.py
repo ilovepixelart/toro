@@ -79,7 +79,19 @@ async def test_finish_cost_grows_with_active_list_size(q, load_scale):
                     q.keys.meta_paused,
                     q.keys.limiter,
                 ],
-                args=[job.id, "null", int(time.time() * 1000), token, "0", 30_000, -1, -1, 0, 0],
+                args=[
+                    job.id,
+                    "null",
+                    int(time.time() * 1000),
+                    token,
+                    "0",
+                    30_000,
+                    -1,
+                    -1,
+                    0,
+                    0,
+                    60_000,
+                ],
             )
             samples.append((time.perf_counter() - t0) * 1000)
             assert out == [1]  # committed, not lock-lost

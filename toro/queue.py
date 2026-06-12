@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import time
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
@@ -35,6 +35,30 @@ def _str_list(reply: Any) -> list[str]:
 def _str_dict(reply: Any) -> dict[str, str]:
     """Type a Redis hash reply (decode_responses is on) as dict[str, str]."""
     return cast("dict[str, str]", reply)
+
+
+def _hash_replies(reply: Any) -> list[dict[str, str]]:
+    """Type a pipeline's list of hash replies as list[dict[str, str]]."""
+    return cast("list[dict[str, str]]", reply)
+
+
+class MetricsPoint(TypedDict):
+    """One minute of queue activity: counts + summed processing duration."""
+
+    timestamp: int  # minute bucket start (ms since epoch)
+    added: int  # jobs enqueued this minute (the leading signal; dedup hits don't count)
+    completed: int
+    failed: int  # terminal failures only (retries don't count, stall-failures do)
+    ms: int  # summed processing duration of jobs finished this minute
+
+
+class NameMetrics(TypedDict):
+    """One job name's totals over a metrics window."""
+
+    name: str
+    completed: int
+    failed: int
+    ms: int  # summed processing duration
 
 
 class Queue:
@@ -131,6 +155,7 @@ class Queue:
                     job_id or "",
                     dedup_id,
                     dedup_ttl,
+                    scripts.METRICS_RETENTION_MS,
                 ],
             )
         )
@@ -339,7 +364,7 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for sid, _ in entries:
             pipe.hgetall(self.keys.scheduler(sid))
-        templates = cast("list[dict[str, str]]", await pipe.execute())
+        templates = _hash_replies(await pipe.execute())
         out = []
         for (sid, when), t in zip(entries, templates, strict=False):
             out.append(
@@ -381,6 +406,69 @@ class Queue:
             "failed": failed,
         }
 
+    async def metrics(self, *, minutes: int = 60) -> list[MetricsPoint]:
+        """Per-minute completed/failed counts and summed processing duration,
+        oldest first, ending at the current minute. Gaps are zero-filled so the
+        series is chart-ready. Counters are written atomically inside the finish
+        scripts; buckets expire after `scripts.METRICS_RETENTION_MS` (8h), so
+        asking for more history than that just returns zeros.
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        stamps = [now_minute - 60_000 * i for i in range(minutes - 1, -1, -1)]
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for ts in stamps:
+            pipe.hgetall(self.keys.metrics_bucket(ts))
+        hashes = _hash_replies(await pipe.execute())
+        return [
+            MetricsPoint(
+                timestamp=ts,
+                added=int(h.get("added", 0)),
+                completed=int(h.get("completed", 0)),
+                failed=int(h.get("failed", 0)),
+                ms=int(h.get("ms", 0)),
+            )
+            for ts, h in zip(stamps, hashes, strict=True)
+        ]
+
+    async def metrics_by_name(self, *, minutes: int = 60) -> list[NameMetrics]:
+        """Per-job-name totals over the window, failures first — the triage
+        order ("which job is responsible"), not the volume order. Names come
+        from the per-name fields the finish scripts write into the same
+        minute buckets ("completed:<name>", "failed:<name>", "ms:<name>").
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for i in range(minutes):
+            pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
+        totals: dict[str, dict[str, int]] = {}
+        for h in _hash_replies(await pipe.execute()):
+            for field, value in h.items():
+                kind, sep, name = field.partition(":")
+                if not sep or kind not in ("completed", "failed", "ms"):
+                    continue  # queue-level field, not a per-name one
+                totals.setdefault(name, {"completed": 0, "failed": 0, "ms": 0})[kind] += int(value)
+        out = [
+            NameMetrics(name=n, completed=t["completed"], failed=t["failed"], ms=t["ms"])
+            for n, t in totals.items()
+        ]
+        return sorted(out, key=lambda t: (-t["failed"], -t["completed"], t["name"]))
+
+    async def latency(self) -> int:
+        """Age (ms) of the next-to-run waiting job — 0 when nothing is waiting.
+
+        The queue-health headline number: depth says how much is queued,
+        latency says how far behind the workers actually are.
+        """
+        head = _str_list(await self.redis.zrange(self.keys.prioritized, 0, 0))
+        if not head:
+            return 0
+        ts = await self.redis.hget(self.keys.job(head[0]), "timestamp")
+        if not ts:  # the head job was removed between the two reads
+            return 0
+        return max(0, _now_ms() - int(ts))
+
     async def workers(self, *, stale_after: int = 30_000) -> list[dict[str, Any]]:
         """Live workers, from the presence records their heartbeats write. An entry
         with no heartbeat for `stale_after` ms is treated as dead and pruned here,
@@ -393,7 +481,7 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for wid in ids:
             pipe.hgetall(self.keys.worker(wid))
-        hashes = cast("list[dict[str, str]]", await pipe.execute())
+        hashes = _hash_replies(await pipe.execute())
         live: list[dict[str, Any]] = []
         dead: list[tuple[str, dict[str, Any]]] = []
         for wid, h in zip(ids, hashes, strict=True):

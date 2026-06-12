@@ -141,7 +141,7 @@ async def test_fetch_next_in_finish(q):
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[cur.id, "{}", _now_ms(), w.token, "1", 30000, -1, -1, 0, 0],
+        args=[cur.id, "{}", _now_ms(), w.token, "1", 30000, -1, -1, 0, 0, 60_000],
     )
     assert isinstance(res, list) and res[0] == 1
     assert len(res) == 3 and res[2] == nxt.id  # next handed back

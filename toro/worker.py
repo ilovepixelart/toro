@@ -394,6 +394,7 @@ class Worker:
                 *JobOptions.keep_args(job.opts.remove_on_complete),
                 self.rl_max,
                 self.rl_duration,
+                scripts.METRICS_RETENTION_MS,
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
@@ -433,6 +434,7 @@ class Worker:
                 *JobOptions.keep_args(job.opts.remove_on_fail),
                 self.rl_max,
                 self.rl_duration,
+                scripts.METRICS_RETENTION_MS,
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
@@ -552,7 +554,7 @@ class Worker:
                 self.keys.marker,
                 self.keys.pc,
             ],
-            args=[self.max_stalled_count, _now_ms(), throttle],
+            args=[self.max_stalled_count, _now_ms(), throttle, scripts.METRICS_RETENTION_MS],
         )
         failed = list(res[0]) if res else []
         recovered = list(res[1]) if res and len(res) > 1 else []
