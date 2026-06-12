@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import time
 from typing import Any, TypedDict, cast
 
@@ -59,6 +60,30 @@ class NameMetrics(TypedDict):
     completed: int
     failed: int
     ms: int  # summed processing duration
+    p50: int  # duration percentiles (ms, bucket upper bounds) — successful
+    p95: int  # jobs only, 0 when nothing completed in the window
+    p99: int
+
+
+def bucket_upper_ms(idx: int) -> int:
+    """Upper bound (ms) of histogram bucket `idx` — see scripts.HIST_*."""
+    return int(scripts.HIST_BASE_MS * scripts.HIST_GROWTH**idx)
+
+
+def _percentile(buckets: list[int], q: float) -> int:
+    """Read the q-quantile duration from histogram bucket counts, reported as
+    the matching bucket's upper bound (conservative: never under-reports).
+    """
+    total = sum(buckets)
+    if total == 0:
+        return 0
+    target = max(1, math.ceil(total * q))
+    cum = 0
+    for idx, count in enumerate(buckets):
+        cum += count
+        if cum >= target:
+            return bucket_upper_ms(idx)
+    return bucket_upper_ms(len(buckets) - 1)  # pragma: no cover — cum reaches total above
 
 
 class Queue:
@@ -443,16 +468,33 @@ class Queue:
         for i in range(minutes):
             pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
         totals: dict[str, dict[str, int]] = {}
+        hists: dict[str, list[int]] = {}
         for h in _hash_replies(await pipe.execute()):
             for field, value in h.items():
-                kind, sep, name = field.partition(":")
-                if not sep or kind not in ("completed", "failed", "ms"):
+                kind, sep, rest = field.partition(":")
+                if not sep:
                     continue  # queue-level field, not a per-name one
-                totals.setdefault(name, {"completed": 0, "failed": 0, "ms": 0})[kind] += int(value)
-        out = [
-            NameMetrics(name=n, completed=t["completed"], failed=t["failed"], ms=t["ms"])
-            for n, t in totals.items()
-        ]
+                if kind in ("completed", "failed", "ms"):
+                    totals.setdefault(rest, {"completed": 0, "failed": 0, "ms": 0})
+                    totals[rest][kind] += int(value)
+                elif kind == "h":
+                    # "h:<name>:<idx>" — names may contain colons, idx never does
+                    name, _, idx = rest.rpartition(":")
+                    hists.setdefault(name, [0] * scripts.HIST_BUCKETS)[int(idx)] += int(value)
+        out = []
+        for n, t in totals.items():
+            buckets = hists.get(n, [])
+            out.append(
+                NameMetrics(
+                    name=n,
+                    completed=t["completed"],
+                    failed=t["failed"],
+                    ms=t["ms"],
+                    p50=_percentile(buckets, 0.50),
+                    p95=_percentile(buckets, 0.95),
+                    p99=_percentile(buckets, 0.99),
+                )
+            )
         return sorted(out, key=lambda t: (-t["failed"], -t["completed"], t["name"]))
 
     async def latency(self) -> int:

@@ -43,6 +43,14 @@ PROMOTE_BATCH = 1000
 # charts, bounded key count (at most 480 small hashes per queue).
 METRICS_RETENTION_MS = 8 * 60 * 60 * 1000
 
+# Duration histogram shape: log-scaled buckets so one set covers 20ms jobs and
+# 5-minute jobs alike. Bucket 0 is [0, 20ms); each next bucket grows 1.5x;
+# the last bucket absorbs everything past ~5.6 minutes. Successful jobs only —
+# failures have unpredictable timing and would read as fake regressions.
+HIST_BASE_MS = 20
+HIST_GROWTH = 1.5
+HIST_BUCKETS = 26
+
 # Lua → Python return protocol: sentinels the scripts emit, decoded in worker.py.
 RL_SENTINEL = "__rl__"  # ACQUIRE hit the rate limiter; res[1] = ms until a token frees
 LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already reclaimed)
@@ -135,6 +143,15 @@ local function recordMetrics(base, field, now, durMs, retentionMs, name)
   if name then
     redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
     if durMs > 0 then redis.call("HINCRBY", bucket, "ms:" .. name, durMs) end
+    -- duration histogram ("h:<name>:<bucketIdx>"), successful jobs only:
+    -- log-scaled buckets, [0,20ms) then 1.5x each, overflow clamps to the last
+    if field == "completed" then
+      local idx = 0
+      if durMs >= 20 then
+        idx = math.min(25, math.floor(math.log(durMs / 20) / math.log(1.5)) + 1)
+      end
+      redis.call("HINCRBY", bucket, "h:" .. name .. ":" .. idx, 1)
+    end
   end
   redis.call("PEXPIRE", bucket, retentionMs)
 end

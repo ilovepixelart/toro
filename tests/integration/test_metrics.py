@@ -251,3 +251,50 @@ async def test_latency_zero_when_head_job_hash_is_gone(q):
     # the race guard must answer 0, not raise
     await q.redis.zadd(q.keys.prioritized, {"ghost": 1})
     assert await q.latency() == 0
+
+
+async def test_histogram_written_for_completions_only(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc):
+        await q.add("good", {})
+        await q.add("good", {})
+        await q.add("bad", {}, attempts=1)
+        assert await run_until(lambda: _count(q, "completed", 2))
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    minute = _minute(time.time() * 1000)
+    h = await q.redis.hgetall(q.keys.metrics_bucket(minute))
+    good = sum(int(v) for f, v in h.items() if f.startswith("h:good:"))
+    bad = sum(int(v) for f, v in h.items() if f.startswith("h:bad:"))
+    assert good == 2  # every completion lands in exactly one bucket
+    assert bad == 0  # failures are not timed
+
+
+async def test_percentiles_come_back_ordered_and_sane(q, run_worker, run_until):
+    async def quick(job):
+        await asyncio.sleep(0.02)
+
+    async with run_worker(q, quick):
+        for _ in range(5):
+            await q.add("m", {})
+        assert await run_until(lambda: _count(q, "completed", 5))
+
+    (m,) = await q.metrics_by_name(minutes=2)
+    assert 0 < m["p50"] <= m["p95"] <= m["p99"]
+    assert m["p99"] < 5_000  # ~20ms jobs can't report seconds
+
+
+async def test_percentiles_zero_when_nothing_completed(q, run_worker, run_until):
+    async def boom(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, boom):
+        await q.add("bad", {}, attempts=1)
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    (m,) = await q.metrics_by_name(minutes=2)
+    assert m["p50"] == 0 and m["p95"] == 0 and m["p99"] == 0
