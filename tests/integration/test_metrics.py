@@ -312,8 +312,10 @@ async def test_queue_percentiles_merge_all_names(q, run_worker, run_until):
 
     p = await q.percentiles(minutes=2)
     assert 0 < p["p50"] <= p["p95"] <= p["p99"]
-    assert p["p50"] < 200  # the fast majority sets the median
-    assert p["p99"] >= 200  # the slow straggler owns the tail
+    assert p["p50"] < 100  # the fast majority sets the median
+    # the ~200ms straggler owns the tail; its bucket's geometric-mean
+    # estimate can sit up to ~22% under the true duration
+    assert p["p99"] >= 150
 
 
 async def test_queue_percentiles_zero_on_idle_queue(q):

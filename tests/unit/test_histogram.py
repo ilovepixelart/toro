@@ -3,7 +3,7 @@
 import itertools
 
 from toro import scripts
-from toro.queue import _percentile, bucket_upper_ms
+from toro.queue import _percentile, bucket_estimate_ms, bucket_upper_ms
 
 
 def test_bucket_bounds_grow_log_scale():
@@ -25,22 +25,40 @@ def test_percentile_single_bucket():
     buckets = [0] * scripts.HIST_BUCKETS
     buckets[3] = 10  # everything in one bucket
     for q in (0.5, 0.95, 0.99):
-        assert _percentile(buckets, q) == bucket_upper_ms(3)
+        assert _percentile(buckets, q) == bucket_estimate_ms(3)
+
+
+def test_estimate_is_the_geometric_mean_not_the_upper_bound():
+    # the representative value sits inside the bucket (DDSketch-style), so the
+    # worst-case error is two-sided ~22% instead of one-sided +50%
+    for idx in (1, 5, 20):
+        upper = bucket_upper_ms(idx)
+        lower = bucket_upper_ms(idx - 1)
+        est = bucket_estimate_ms(idx)
+        assert lower < est < upper
+
+
+def test_rank_arithmetic_survives_float_artifacts():
+    # 20 * 0.95 == 19.000000000000004; ceil of that must be 19, not 20
+    buckets = [0] * scripts.HIST_BUCKETS
+    buckets[0] = 19
+    buckets[10] = 1  # one straggler at rank 20
+    assert _percentile(buckets, 0.95) == bucket_estimate_ms(0)
 
 
 def test_percentiles_expose_the_tail_a_mean_would_hide():
     buckets = [0] * scripts.HIST_BUCKETS
     buckets[0] = 99  # 99 jobs under 20ms
     buckets[20] = 1  # one ~1.5min straggler
-    assert _percentile(buckets, 0.50) == bucket_upper_ms(0)
-    assert _percentile(buckets, 0.95) == bucket_upper_ms(0)
-    assert _percentile(buckets, 0.99) == bucket_upper_ms(0)
-    assert _percentile(buckets, 1.0) == bucket_upper_ms(20)  # the straggler
+    assert _percentile(buckets, 0.50) == bucket_estimate_ms(0)
+    assert _percentile(buckets, 0.95) == bucket_estimate_ms(0)
+    assert _percentile(buckets, 0.99) == bucket_estimate_ms(0)
+    assert _percentile(buckets, 1.0) == bucket_estimate_ms(20)  # the straggler
 
 
-def test_percentile_is_conservative_upper_bound():
+def test_percentile_picks_the_crossing_bucket():
     buckets = [0] * scripts.HIST_BUCKETS
     buckets[5] = 2
     buckets[6] = 2
-    assert _percentile(buckets, 0.5) == bucket_upper_ms(5)
-    assert _percentile(buckets, 0.99) == bucket_upper_ms(6)
+    assert _percentile(buckets, 0.5) == bucket_estimate_ms(5)
+    assert _percentile(buckets, 0.99) == bucket_estimate_ms(6)

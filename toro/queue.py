@@ -70,20 +70,31 @@ def bucket_upper_ms(idx: int) -> int:
     return int(scripts.HIST_BASE_MS * scripts.HIST_GROWTH**idx)
 
 
+def bucket_estimate_ms(idx: int) -> int:
+    """Estimate the representative duration for bucket `idx`: the geometric
+    mean of its bounds. Reporting this instead of the upper bound halves the
+    worst-case error (±22% instead of +50%) and removes the systematic upward
+    bias — the same choice DDSketch makes. True values can sit anywhere in
+    the bucket, so any single number is an estimate either way.
+    """
+    return round(bucket_upper_ms(idx) / math.sqrt(scripts.HIST_GROWTH))
+
+
 def _percentile(buckets: list[int], q: float) -> int:
-    """Read the q-quantile duration from histogram bucket counts, reported as
-    the matching bucket's upper bound (conservative: never under-reports).
+    """Read the q-quantile duration from histogram bucket counts (nearest-rank
+    on the cumulative counts, reported as the bucket's geometric mean).
     """
     total = sum(buckets)
     if total == 0:
         return 0
-    target = max(1, math.ceil(total * q))
+    # the epsilon guards float artifacts: 20 * 0.95 == 19.000000000000004
+    target = max(1, math.ceil(total * q - 1e-9))
     cum = 0
     for idx, count in enumerate(buckets):
         cum += count
         if cum >= target:
-            return bucket_upper_ms(idx)
-    return bucket_upper_ms(len(buckets) - 1)  # pragma: no cover — cum reaches total above
+            return bucket_estimate_ms(idx)
+    return bucket_estimate_ms(len(buckets) - 1)  # pragma: no cover — cum reaches total above
 
 
 class Queue:
