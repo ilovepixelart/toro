@@ -422,3 +422,174 @@ async def test_default_job_options_apply_to_children(q, run_worker, run_until):
         assert flow["children"][0]["job"].attempts_made == 2  # the default reached the child
     finally:
         await q2.close()
+
+
+# ---- pins from the deep-dive: documented behavior, now tested ---------------------
+
+
+async def test_parent_result_raises_on_flow_failure(q, run_worker):
+    from toro import JobFailedError
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return "never"
+
+    async with run_worker(q, proc):
+        parent = await q.add_flow("report", {}, children=[c("bad", {})])
+        with pytest.raises(JobFailedError, match=r"child \d+ failed"):
+            await parent.result(timeout=10)
+
+
+async def test_eager_failure_reason_compounds_per_ancestor(q, run_worker, run_until):
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, proc):
+        root = await q.add_flow("root", {}, children=[c("mid", {}, children=[c("bad", {})])])
+        assert await run_until(_count_is(q, "failed", 3))
+
+    reason = (await q.get_job(root.id)).failed_reason
+    # the chain narrates the path down to the real failure
+    assert reason.count("child") == 2
+    assert reason.endswith("boom")
+
+
+async def test_late_sibling_results_collect_into_failed_parent(q, run_worker, run_until):
+    """Documented: siblings aren't cancelled and their results still collect -
+    that's what makes a later parent retry see them."""
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        await asyncio.sleep(0.3)
+        return "slow-ok"
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("bad", {}), c("slow", {})])
+        assert await run_until(_count_is(q, "failed", 2))
+        assert await run_until(_count_is(q, "completed", 1))
+
+    assert (await q.get_job(parent.id)).state == "failed"
+    assert "slow-ok" in (await q.children_results(parent.id)).values()
+
+
+async def test_get_flow_truncates_at_default_depth(q):
+    node = c("leaf", {})
+    for lvl in range(12):
+        node = c(f"mid-{lvl}", {}, children=[node])
+    root = await q.add_flow("root", {}, children=[node])
+
+    def depth_of(n):
+        return 1 + max((depth_of(ch) for ch in n["children"]), default=0)
+
+    assert depth_of(await q.get_flow(root.id)) == 11  # default depth=10 -> 11 levels
+    assert depth_of(await q.get_flow(root.id, depth=20)) == 14  # the whole tree
+
+
+async def test_failed_metric_counts_child_and_each_ancestor(q, run_worker, run_until):
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, proc):
+        await q.add_flow("root", {}, children=[c("mid", {}, children=[c("bad", {})])])
+        assert await run_until(_count_is(q, "failed", 3))
+
+    point = (await q.metrics(minutes=1))[-1]
+    assert point["failed"] == 3  # the leaf + both eagerly-failed ancestors
+
+
+async def test_add_flow_publishes_one_added_event(q):
+    pubsub = q.redis.pubsub()
+    await pubsub.subscribe(q.keys.events)
+    try:
+        parent = await q.add_flow("report", {}, children=[c("a", {}), c("b", {})])
+        added = []
+        for _ in range(20):
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.05)
+            if msg is None:
+                continue
+            import json as _json
+
+            data = _json.loads(msg["data"])
+            if data.get("event") == "added":
+                added.append(data["jobId"])
+        assert added == [parent.id]  # one announce for the whole tree, the root's id
+    finally:
+        await pubsub.aclose()
+
+
+async def test_on_fail_is_mutable_after_enqueue(q, run_worker, run_until):
+    """The design claim: the policy is a plain hash field, so tooling can
+    change its mind after the flow exists."""
+    seen = {}
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        seen["failures"] = await job.failed_children()
+        return "done"
+
+    parent = await q.add_flow("report", {}, children=[c("bad", {})])  # fail_parent default
+    cid = (await q.get_flow(parent.id))["children"][0]["job"].id
+    await q.redis.hset(q.keys.job(cid), "onFail", "continue")  # change of heart
+
+    async with run_worker(q, proc):
+        assert await run_until(_count_is(q, "completed", 1))  # the parent RAN
+
+    assert (await q.get_job(parent.id)).state == "completed"
+    assert list(seen["failures"].values()) == ["boom"]
+
+
+async def test_count_retention_keeps_eagerly_failed_parent(q, run_worker, run_until):
+    """remove_on_fail=N (the count form) through the eager-fail Lua path."""
+
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, proc):
+        parent = await q.add_flow("report", {}, children=[c("bad", {})], remove_on_fail=5)
+        assert await run_until(_count_is(q, "failed", 2))
+
+    kept = await q.get_job(parent.id)
+    assert kept is not None and kept.state == "failed"  # well under keep-5, retained
+
+
+async def test_add_flow_on_paused_queue_waits_for_resume(q, run_worker, run_until):
+    async def proc(job):
+        return "ok" if job.name == "fetch" else "done"
+
+    await q.pause()
+    async with run_worker(q, proc):
+        parent = await q.add_flow("report", {}, children=[c("fetch", {})])
+        await asyncio.sleep(0.3)  # a paused queue must not start the children
+        counts = await q.counts()
+        assert counts["wait"] == 1 and counts["completed"] == 0
+
+        await q.resume()
+        assert await run_until(_count_is(q, "completed", 2))
+    assert (await q.get_job(parent.id)).state == "completed"
+
+
+async def test_children_run_in_priority_order(q, run_worker, run_until):
+    order = []
+
+    async def proc(job):
+        order.append(job.data.get("tag"))
+        if job.name == "report":
+            return "done"
+        return "ok"
+
+    parent = await q.add_flow(
+        "report",
+        {},
+        children=[
+            c("fetch", {"tag": "low"}),  # declared first, priority 0
+            c("fetch", {"tag": "high"}, priority=5),
+        ],
+    )
+    async with run_worker(q, proc):  # concurrency 1: strict claim order
+        assert await run_until(_count_is(q, "completed", 3))
+
+    assert order == ["high", "low", None]  # priority beats declaration order
+    assert (await q.get_job(parent.id)).state == "completed"
