@@ -298,3 +298,24 @@ async def test_percentiles_zero_when_nothing_completed(q, run_worker, run_until)
 
     (m,) = await q.metrics_by_name(minutes=2)
     assert m["p50"] == 0 and m["p95"] == 0 and m["p99"] == 0
+
+
+async def test_queue_percentiles_merge_all_names(q, run_worker, run_until):
+    async def proc(job):
+        await asyncio.sleep(0.03 if job.name == "fast" else 0.2)
+
+    async with run_worker(q, proc, concurrency=2):
+        for _ in range(4):
+            await q.add("fast", {})
+        await q.add("slow", {})
+        assert await run_until(lambda: _count(q, "completed", 5))
+
+    p = await q.percentiles(minutes=2)
+    assert 0 < p["p50"] <= p["p95"] <= p["p99"]
+    assert p["p50"] < 200  # the fast majority sets the median
+    assert p["p99"] >= 200  # the slow straggler owns the tail
+
+
+async def test_queue_percentiles_zero_on_idle_queue(q):
+    p = await q.percentiles(minutes=2)
+    assert p == {"p50": 0, "p95": 0, "p99": 0}

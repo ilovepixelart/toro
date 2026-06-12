@@ -497,6 +497,26 @@ class Queue:
             )
         return sorted(out, key=lambda t: (-t["failed"], -t["completed"], t["name"]))
 
+    async def percentiles(self, *, minutes: int = 60) -> dict[str, int]:
+        """Queue-level p50/p95/p99 (ms) over the window — every job name's
+        histogram merged into one. Successful jobs only; 0s when idle.
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for i in range(minutes):
+            pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
+        merged = [0] * scripts.HIST_BUCKETS
+        for h in _hash_replies(await pipe.execute()):
+            for field, value in h.items():
+                if field.startswith("h:"):
+                    merged[int(field.rpartition(":")[2])] += int(value)
+        return {
+            "p50": _percentile(merged, 0.50),
+            "p95": _percentile(merged, 0.95),
+            "p99": _percentile(merged, 0.99),
+        }
+
     async def latency(self) -> int:
         """Age (ms) of the next-to-run waiting job — 0 when nothing is waiting.
 
