@@ -4,7 +4,7 @@ Reference docs for how toro works. The [README](../README.md) is the quick start
 
 ## Pages
 
-- **[Concepts](concepts.md)** - the mental model: queues, workers, jobs, the five
+- **[Concepts](concepts.md)** - the mental model: queues, workers, jobs, the six
   job states, and the difference between *workers* and *slots*.
 - **[Data model](data-model.md)** - the exact Redis keys a queue uses and what
   each one stores.

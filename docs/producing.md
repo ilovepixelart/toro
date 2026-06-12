@@ -76,7 +76,7 @@ waiting; only the terminal outcome resolves the call.
 
 | Call | Returns |
 |---|---|
-| `await queue.counts()` | `{"wait": n, "active": n, "delayed": n, "completed": n, "failed": n}` |
+| `await queue.counts()` | `{"wait": n, "active": n, "delayed": n, "waiting-children": n, "completed": n, "failed": n}` |
 | `await queue.get_job(job_id)` | A `Job` snapshot, or `None`. |
 | `await queue.get_jobs(state, start, end)` | A page of jobs; `wait` comes back in global priority order, finished states newest-first. |
 | `await queue.get_logs(job_id)` | Log lines appended by the processor. |
@@ -91,10 +91,10 @@ waiting; only the terminal outcome resolves the call.
 
 | Call | Does |
 |---|---|
-| `await queue.retry_job(job_id)` | Move one failed job back to the queue. |
+| `await queue.retry_job(job_id)` | Move one failed job back to the queue. Flow-aware: a failed flow parent re-parks until its children settle; a retried child re-joins its parked parent's barrier ([Flows](flows.md)). |
 | `await queue.retry_all_failed(limit=1000)` | Re-queue every failed job (pipelined, one round trip per batch); returns how many were retried. |
 | `await queue.promote_job(job_id)` | Run a delayed job now. |
-| `await queue.remove_job(job_id)` | Delete a job from every state, with its lock and logs. |
+| `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. Removing a flow parent removes its whole subtree - children included, even running ones. |
 | `await queue.clean(state, limit=1000)` | Remove every job in a state (pipelined). |
 | `await queue.pause()` / `resume()` / `is_paused()` | Stop workers claiming new jobs (in-flight jobs finish); resume wakes idle workers. |
 

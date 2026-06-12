@@ -139,7 +139,8 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
   depth-first; leaves enqueue into `prioritized` (or `delayed`), interior
   nodes land in `waiting-children` with their `:deps` set populated. Capped
   (~1000 nodes per flow) to bound script time, like `PROMOTE_BATCH`. One
-  metrics increment and one announce for the whole tree.
+  `added` increment of the node count and one announce (the root id) for
+  the whole tree.
 - **Release** lives inside the existing finish scripts, the extension point
   `_LIB` reserved ("to add markers-with-delay or grouping later, we change
   only these functions"):
@@ -151,9 +152,12 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
     `recordFinished` (so `remove_on_fail` retention applies), publish the
     event, and **loop upward** while the ancestor itself has a parent with
     `fail_parent`.
-  - **The stalled path gets identical bookkeeping**: `MOVE_STALLED`'s
-    fail-branch runs the same parent logic (lesson 1: the crash path is where
-    barriers historically break).
+  - **The stalled path gets identical parent bookkeeping**: `MOVE_STALLED`'s
+    fail-branch runs the same settle logic (lesson 1: the crash path is where
+    barriers historically break). One pre-existing nuance: the stall-escalated
+    child itself is recorded into `failed` without `recordFinished`, so its
+    own `remove_on_fail` retention does not apply on the stall path - true
+    for all stalled jobs, not just flow children.
 - **Cleanup is structural** (lesson 5): `delJobs` and `REMOVE_JOB` know the
   three aux keys, so every existing removal path (auto-removal
   keepCount/keepAge, manual remove, `clean()`) deletes them for free.

@@ -87,6 +87,11 @@ await queue.add("charge", data, job_id="order-1234")
 # A repeatable schedule (cron or every-N-ms); "run now" with trigger_scheduler
 await queue.add_scheduler("nightly-rollup", cron="0 0 * * *")
 
+# A flow: children run first (fan-out), the parent runs on their results (fan-in)
+from toro import FlowChild as c
+report = await queue.add_flow("report", {"q": 3},
+                              children=[c("fetch", {"shard": i}) for i in range(3)])
+
 # Queue-wide rate limit: at most 100 jobs / second across every worker
 worker = Worker("emails", process, rate_limit={"max": 100, "duration": 1000})
 

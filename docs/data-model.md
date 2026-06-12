@@ -38,6 +38,8 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `repeat` | ZSET | Scheduler id -> next-run timestamp. |
 | `workers` | ZSET | Live worker id -> last-heartbeat ms; stale entries pruned lazily on read. |
 | `departed` | LIST (capped) | Recent worker departures: graceful `stopped` or `lost` (crashed). |
+| `metrics:<minute>` | HASH | Per-minute counters (`added`/`completed`/`failed`/`ms`, per-name fields, histograms); self-expiring. |
+| `de:<dedupId>` | string (PX) | A live deduplication throttle window; holds the already-queued job's id. |
 
 ## Per-scheduler, per-worker, per-job keys
 
@@ -45,7 +47,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 |---|---|---|
 | `repeat:<schedulerId>` | HASH | A scheduler's template: `name`, `every`/`cron`, `data`, `opts`. |
 | `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, current jobs, processed/failed counts, state. |
-| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, ... |
+| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail` (children), `children` (parents). |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |
 | `<jobId>:deps` | SET | A flow parent's still-pending child ids - the fan-in barrier; the parent releases when it empties. |
@@ -58,9 +60,11 @@ Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a
 
 ## How the pieces connect
 
-- A job moves between `prioritized` / `active` / `delayed` / `completed` / `failed`
-  as its state changes; the move and the hash update happen in one Lua script. See
-  [Architecture](architecture.md).
+- A job moves between `prioritized` / `active` / `delayed` / `waiting-children` /
+  `completed` / `failed` as its state changes; the move and the hash update happen
+  in one Lua script. See [Architecture](architecture.md).
+- `:deps` + `:results` + `:cfail` are the flow fan-in machinery - children settle
+  into them as they finish. See [Flows](flows.md).
 - The `lock` + `stalled` keys are the at-least-once machinery. See
   [Reliability](reliability.md).
 - `repeat` + `repeat:<id>` drive [scheduling](scheduling.md); `workers` +
