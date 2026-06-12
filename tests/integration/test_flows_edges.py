@@ -701,3 +701,113 @@ async def test_flow_progress_counts_settled_children(q, run_worker, run_until):
 async def _flow_settled(q, pid, done, failed):
     p = await q.flow_progress([pid])
     return p[pid] == (done, failed)
+
+
+# ---- bug-hunting probes: retry_flow / flow_progress corners ----------------------
+
+
+async def test_retry_flow_with_a_pending_sibling_recovers_via_promote(q, run_worker, run_until):
+    """retry_flow must re-park the parent and re-join only the failed branch,
+    leaving a still-pending (delayed) sibling alone - the flow completes once
+    that sibling runs. Probes re-park with a genuinely-unsettled dep."""
+    fail = True
+
+    async def proc(job):
+        if job.name == "bad" and fail:
+            raise RuntimeError("boom")
+        return job.name
+
+    async with run_worker(q, proc):
+        parent = await q.add_flow(
+            "report", {}, children=[c("bad", {}), c("later", {}, delay=600_000)]
+        )
+        assert await run_until(_count_is(q, "failed", 2))  # bad + parent eager
+
+        fail = False
+        assert await q.retry_flow(parent.id) == 2  # parent + bad (not the delayed sibling)
+        # the parent is parked again, waiting on the still-delayed sibling
+        assert await run_until(_count_is(q, "completed", 1))  # bad re-ran ...
+        assert await _count(q, "waiting-children") == 1  # ... but parent stays parked
+
+        later_id = (await q.get_flow(parent.id))["children"][1]["job"].id
+        await q.promote_job(later_id)
+        assert await run_until(_count_is(q, "completed", 3))
+
+    assert (await q.get_job(parent.id)).state == "completed"
+
+
+async def test_retry_flow_recovers_a_deep_chain(q, run_worker, run_until):
+    """Four levels deep: every ancestor must re-park before its failed child
+    re-joins. Probes the root-first pipeline ordering beyond depth 2."""
+    fail = True
+
+    async def proc(job):
+        if job.name == "leaf" and fail:
+            raise RuntimeError("boom")
+        results = await job.children_results()
+        return (next(iter(results.values())) + 1) if results else 1
+
+    async with run_worker(q, proc):
+        tree = c("leaf", {})
+        for lvl in range(3):
+            tree = c(f"mid{lvl}", {}, children=[tree])
+        root = await q.add_flow("root", {}, children=[tree])
+        assert await run_until(_count_is(q, "failed", 5))  # leaf + 3 mids + root
+
+        fail = False
+        assert await q.retry_flow(root.id) == 5
+        assert await run_until(_count_is(q, "completed", 5))
+
+    assert (await q.get_job(root.id)).state == "completed"
+
+
+async def test_retry_flow_on_a_healthy_completed_flow_is_a_noop(q, run_worker, run_until):
+    async def proc(job):
+        return "ok" if job.name == "leaf" else (await job.children_results())
+
+    async with run_worker(q, proc):
+        parent = await q.add_flow("report", {}, children=[c("leaf", {})])
+        assert await run_until(_count_is(q, "completed", 2))
+
+        before = (await q.get_job(parent.id)).returnvalue
+        assert await q.retry_flow(parent.id) == 0  # nothing failed -> nothing retried
+        await asyncio.sleep(0.1)
+
+    after = await q.get_job(parent.id)
+    assert after.state == "completed" and after.returnvalue == before  # untouched
+
+
+async def test_retry_flow_count_is_exactly_the_failed_nodes(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        if job.name in ("ok1", "ok2"):
+            return 1
+        return await job.children_results()
+
+    async with run_worker(q, proc, concurrency=4):
+        parent = await q.add_flow("report", {}, children=[c("ok1", {}), c("ok2", {}), c("bad", {})])
+        assert await run_until(_count_is(q, "failed", 2))  # bad + parent eager
+
+    # two completed children, one failed child, one failed parent -> 2 failed nodes
+    assert await q.retry_flow(parent.id) == 2
+
+
+async def test_flow_progress_on_a_fresh_flow_is_zero(q):
+    parent = await q.add_flow("report", {}, children=[c("a", {}), c("b", {})])
+    assert (await q.flow_progress([parent.id]))[parent.id] == (0, 0)
+
+
+async def test_flow_progress_counts_direct_children_only(q, run_worker, run_until):
+    """For a nested flow, flow_progress(root) reflects the root's DIRECT child,
+    not deep descendants - the row's done/total is over direct children."""
+
+    async def proc(job):
+        return 1 if job.name == "leaf" else sum((await job.children_results()).values())
+
+    async with run_worker(q, proc):
+        root = await q.add_flow("root", {}, children=[c("mid", {}, children=[c("leaf", {})])])
+        assert await run_until(_count_is(q, "completed", 3))
+
+    # root has ONE direct child (mid), which completed -> (1, 0), not 2
+    assert (await q.flow_progress([root.id]))[root.id] == (1, 0)
