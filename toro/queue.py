@@ -873,6 +873,58 @@ class Queue:
         res = await pipe.execute()
         return sum(1 for r in res if r)
 
+    async def _subtree_ids(self, root_id: str) -> list[str]:
+        """Every job id in a flow's subtree, root first (breadth-first, unbounded
+        unlike get_flow's display depth). One pipelined round trip per level;
+        bounded by the flow's node cap. The `children` hash field is the static
+        full child list, so a fully-failed flow is still walkable.
+        """
+        ids: list[str] = []
+        level = [root_id]
+        while level:
+            ids.extend(level)
+            pipe = self.redis.pipeline(transaction=False)  # read fan-out per level
+            for jid in level:
+                pipe.hget(self.keys.job(jid), "children")
+            level = [
+                cid for raw in await pipe.execute() for cid in (json.loads(raw) if raw else [])
+            ]
+        return ids
+
+    async def retry_flow(self, parent_id: str) -> int:
+        """Re-drive a whole failed flow: retry every failed job in the parent's
+        subtree (the parent and all its descendants) in one call. Returns how
+        many jobs were actually retried.
+
+        Order is handled for you: the parent is retried first, so a parent that
+        failed eagerly re-parks its barrier before its failed children re-join
+        it - the flow converges back to running. Completed children are left
+        untouched (their collected results survive); non-failed nodes are a
+        no-op, so this also retries just the failed children of an in-flight
+        flow. See `retry_job` for the single-job semantics this builds on.
+        """
+        ids = await self._subtree_ids(parent_id)
+        if not ids:
+            return 0
+        sha = await self.redis.script_load(scripts.RETRY_JOB)  # ensure loaded for EVALSHA
+        now = _now_ms()
+        pipe = self.redis.pipeline(transaction=False)
+        for job_id in ids:  # root-first: a re-parked parent is ready when its children retry
+            pipe.evalsha(
+                sha,
+                6,
+                self.keys.failed,
+                self.keys.prioritized,
+                self.keys.marker,
+                self.keys.job(job_id),
+                self.keys.pc,
+                self.keys.base,
+                job_id,
+                now,
+            )
+        res = await pipe.execute()
+        return sum(1 for r in res if r)
+
     async def clean(self, state: JobState, limit: int = 1000) -> int:
         """Remove every job in a state (up to `limit`, oldest first - when the
         limit truncates, old history goes before recent results). Returns how

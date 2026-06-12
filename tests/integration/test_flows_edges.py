@@ -593,3 +593,78 @@ async def test_children_run_in_priority_order(q, run_worker, run_until):
 
     assert order == ["high", "low", None]  # priority beats declaration order
     assert (await q.get_job(parent.id)).state == "completed"
+
+
+# ---- retry_flow: one-call whole-flow recovery ------------------------------------
+
+
+async def test_retry_flow_recovers_a_whole_failed_flow(q, run_worker, run_until):
+    fail = True
+
+    async def proc(job):
+        if job.name == "bad":
+            if fail:
+                raise RuntimeError("boom")
+            return "fixed"
+        return sorted((await job.children_results()).values())
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("bad", {}), c("bad", {})])
+        assert await run_until(_count_is(q, "failed", 3))  # both children + the parent
+
+        fail = False
+        n = await q.retry_flow(parent.id)
+        assert n == 3  # parent + both failed children, all re-driven in one call
+        assert await run_until(_count_is(q, "completed", 3))
+
+    assert (await q.get_job(parent.id)).returnvalue == ["fixed", "fixed"]
+
+
+async def test_retry_flow_leaves_completed_children_untouched(q, run_worker, run_until):
+    fail_bad = True
+
+    async def proc(job):
+        if job.name == "good":
+            return "g"
+        if job.name == "bad":
+            if fail_bad:
+                raise RuntimeError("boom")
+            return "b"
+        return await job.children_results()
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("good", {}), c("bad", {})])
+        assert await run_until(_count_is(q, "failed", 2))  # bad child + the parent
+
+        fail_bad = False
+        n = await q.retry_flow(parent.id)
+        assert n == 2  # only the parent and the failed child - good was never failed
+        assert await run_until(_count_is(q, "completed", 3))
+
+    # the parent ran with BOTH results: good's survived from the first run
+    assert sorted((await q.get_job(parent.id)).returnvalue.values()) == ["b", "g"]
+
+
+async def test_retry_flow_recovers_a_nested_flow(q, run_worker, run_until):
+    fail = True
+
+    async def proc(job):
+        if job.name == "leaf":
+            if fail:
+                raise RuntimeError("boom")
+            return 1
+        return sum((await job.children_results()).values())
+
+    async with run_worker(q, proc):
+        root = await q.add_flow("root", {}, children=[c("mid", {}, children=[c("leaf", {})])])
+        assert await run_until(_count_is(q, "failed", 3))  # leaf, mid, root all eager-failed
+
+        fail = False
+        assert await q.retry_flow(root.id) == 3
+        assert await run_until(_count_is(q, "completed", 3))
+
+    assert (await q.get_job(root.id)).returnvalue == 1
+
+
+async def test_retry_flow_on_unknown_id_is_a_noop(q):
+    assert await q.retry_flow("nope") == 0
