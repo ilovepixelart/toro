@@ -8,12 +8,16 @@ full design (and the landscape research behind it) is docs/flows-design.md.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from . import scripts
 from .job import JobOptions
 
 OnFail = Literal["fail_parent", "continue"]
+
+# A flow node is terminal once it has settled; anything else is still moving.
+_TERMINAL = ("completed", "failed")
 
 # Whole-tree cap: ADD_FLOW inserts the tree in one atomic script, so its size
 # bounds how long that script can hold Redis (same idea as PROMOTE_BATCH).
@@ -116,3 +120,42 @@ def to_tree(node: FlowChild, defaults: dict[str, Any]) -> dict[str, Any]:
     if node.children:
         payload["children"] = [to_tree(child, defaults) for child in node.children]
     return payload
+
+
+@dataclass(frozen=True, slots=True)
+class FlowView:
+    """A whole flow projected for a dashboard in one read.
+
+    `tree` is the `{job, children}` shape `get_flow` returns; `results` and
+    `failures` are the parent's collected child return values and its tolerated
+    (`on_fail="continue"`) failures. The counts are derived over the root's
+    direct children - completions only, so a failed flow never reads as done -
+    and `live` is true while ANY node in the subtree is still non-terminal.
+    Built by `Queue.flow_view()`, which reads it all in O(depth) round trips.
+    """
+
+    tree: dict[str, Any]
+    results: dict[str, Any]
+    failures: dict[str, str]
+
+    @property
+    def total(self) -> int:
+        # the root's declared child list, robust to a child hash vanishing mid-walk
+        return len(self.tree["job"].children_ids or [])
+
+    @property
+    def done(self) -> int:
+        return sum(1 for n in self.tree["children"] if n["job"].state == "completed")
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for n in self.tree["children"] if n["job"].state == "failed")
+
+    @property
+    def live(self) -> bool:
+        def moving(node: dict[str, Any]) -> bool:
+            return node["job"].state not in _TERMINAL or any(
+                moving(child) for child in node["children"]
+            )
+
+        return moving(self.tree)

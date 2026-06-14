@@ -219,6 +219,51 @@ async def test_on_fail_continue_runs_parent_with_failure_report(q, run_worker, r
     assert await _count(q, "failed") == 1  # the child still counts as failed
 
 
+# ---- flow_view: one projected read for dashboards ---------------------------------
+
+
+async def test_flow_view_projects_tree_results_and_failures(q, run_worker, run_until):
+    # flow_view folds the tree, the collected results and the tolerated failures into
+    # one projection (the three reads a dashboard otherwise makes for a flow detail).
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        if job.name == "good":
+            return 42
+        return "done"
+
+    async with run_worker(q, proc):
+        parent = await q.add_flow(
+            "report", {}, children=[c("good", {}), c("bad", {}, on_fail="continue")]
+        )
+        assert await run_until(_count_is(q, "completed", 2))  # good child + parent
+
+    view = await q.flow_view(parent.id)
+    # the tree, same {job, children} shape as get_flow
+    assert view.tree["job"].id == parent.id
+    assert {n["job"].name for n in view.tree["children"]} == {"good", "bad"}
+    # results + tolerated failures, folded into the same projection
+    assert list(view.results.values()) == [42]
+    assert list(view.failures.values()) == ["boom"]
+    # fan-in counts derived over the root's direct children, from one snapshot
+    assert view.total == 2
+    assert view.done == 1  # good completed
+    assert view.failed == 1  # bad failed (on_fail=continue)
+    assert view.live is False  # every node terminal
+
+
+async def test_flow_view_is_live_until_every_node_settles(q):
+    # a delayed child keeps the flow moving even with no worker yet running
+    parent = await q.add_flow("report", {}, children=[c("a", {}), c("b", {}, delay=600_000)])
+    view = await q.flow_view(parent.id)
+    assert view.live is True
+    assert (view.total, view.done, view.failed) == (2, 0, 0)
+
+
+async def test_flow_view_none_for_a_missing_job(q):
+    assert await q.flow_view("nope") is None
+
+
 async def test_late_sibling_does_not_resurrect_failed_parent(q, run_worker, run_until):
     async def proc(job):
         if job.name == "bad":

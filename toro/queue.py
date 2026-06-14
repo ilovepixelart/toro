@@ -15,7 +15,7 @@ from redis.asyncio.client import PubSub
 from . import scripts
 from .connection import connect
 from .errors import JobFailedError
-from .flow import MAX_FLOW_NODES, FlowChild, count_nodes, node_options, to_tree
+from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
 from .job import Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
@@ -259,12 +259,11 @@ class Queue:
             _queue=self,
         )
 
-    async def get_flow(self, job_id: str, *, depth: int = 10) -> dict[str, Any] | None:
-        """Read a flow tree back: ``{"job": Job, "children": [<same shape>]}``.
-
-        Hydrates breadth-first, one pipelined round trip per level (the same
-        shape as get_jobs' page hydration) - O(depth) round trips, not
-        O(nodes). `depth` bounds the walk. None when the job doesn't exist.
+    async def _hydrate_flow(self, job_id: str, depth: int) -> dict[str, Any] | None:
+        """BFS-hydrate a flow tree into ``{"job": Job, "children": [<same>]}``,
+        root-down, one pipelined round trip per level - O(depth), not O(nodes).
+        Shared by get_flow() and flow_view(). None when the root is gone; child
+        hashes that vanished mid-walk are skipped. `depth` bounds the walk.
         """
         nodes: dict[str, dict[str, Any]] = {}
         parent_of: dict[str, str] = {}
@@ -273,9 +272,8 @@ class Queue:
             pipe = self.redis.pipeline(transaction=False)  # read fan-out per level
             for jid in level:
                 pipe.hgetall(self.keys.job(jid))
-            hashes = _hash_replies(await pipe.execute())
             next_level: list[str] = []
-            for jid, h in zip(level, hashes, strict=True):
+            for jid, h in zip(level, _hash_replies(await pipe.execute()), strict=True):
                 if not h:
                     continue  # removed mid-walk (or a stale children entry)
                 nodes[jid] = {"job": Job.from_hash(jid, h), "children": []}
@@ -288,6 +286,37 @@ class Queue:
             if not level:
                 break
         return nodes.get(job_id)
+
+    async def get_flow(self, job_id: str, *, depth: int = 10) -> dict[str, Any] | None:
+        """Read a flow tree back: ``{"job": Job, "children": [<same shape>]}``.
+
+        Hydrates breadth-first, one pipelined round trip per level (the same
+        shape as get_jobs' page hydration) - O(depth) round trips, not
+        O(nodes). `depth` bounds the walk. None when the job doesn't exist.
+        """
+        return await self._hydrate_flow(job_id, depth)
+
+    async def flow_view(self, job_id: str, *, depth: int = 10) -> FlowView | None:
+        """Project a whole flow for a dashboard: the `get_flow` tree plus the
+        parent's collected `results` and tolerated `failures`.
+
+        One call where a detail view otherwise makes three (get_flow +
+        children_results + failed_children): the tree in O(depth) round trips,
+        then a single pipelined read of the parent's `:results` / `:cfail`
+        hashes. None when the job doesn't exist.
+        """
+        tree = await self._hydrate_flow(job_id, depth)
+        if tree is None:
+            return None
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.hgetall(self.keys.results(job_id))
+        pipe.hgetall(self.keys.cfail(job_id))
+        raw_results, raw_cfail = await pipe.execute()
+        return FlowView(
+            tree=tree,
+            results=decode_results(_str_dict(raw_results)),
+            failures=_str_dict(raw_cfail),
+        )
 
     async def children_results(self, job_id: str) -> dict[str, Any]:
         """Read a flow parent's collected child results (child id -> value) -
