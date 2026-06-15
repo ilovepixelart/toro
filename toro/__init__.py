@@ -3,7 +3,7 @@
 from .errors import JobFailedError, ToroError
 from .flow import FlowChild, FlowView, OnFail
 from .job import Backoff, BackoffOpts, Deduplication, Job, JobOptions, JobState, RemoveOption
-from .queue import MetricsPoint, NameMetrics, Queue
+from .queue import FlowMetricsPoint, MetricsPoint, NameMetrics, Queue
 from .worker import RateLimit, Worker
 
 __all__ = [
@@ -11,6 +11,7 @@ __all__ = [
     "BackoffOpts",
     "Deduplication",
     "FlowChild",
+    "FlowMetricsPoint",
     "FlowView",
     "Job",
     "JobFailedError",

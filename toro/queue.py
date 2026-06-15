@@ -63,6 +63,17 @@ class NameMetrics(TypedDict):
     p99: int
 
 
+class FlowMetricsPoint(TypedDict):
+    """One minute of flow activity: whole flows that settled, counted once at
+    the root (nested sub-flows don't count). Duration is tracked separately in a
+    histogram (see flow_percentiles), not per minute.
+    """
+
+    timestamp: int  # minute bucket start (ms since epoch)
+    completed: int  # root flows that finished this minute
+    failed: int  # root flows that failed this minute
+
+
 def bucket_upper_ms(idx: int) -> int:
     """Upper bound (ms) of histogram bucket `idx` - see scripts.HIST_*."""
     return int(scripts.HIST_BASE_MS * scripts.HIST_GROWTH**idx)
@@ -660,6 +671,50 @@ class Queue:
         for h in _hash_replies(await pipe.execute()):
             for field, value in h.items():
                 if field.startswith("h:"):
+                    merged[int(field.rpartition(":")[2])] += int(value)
+        return {
+            "p50": _percentile(merged, 0.50),
+            "p95": _percentile(merged, 0.95),
+            "p99": _percentile(merged, 0.99),
+        }
+
+    async def flow_metrics(self, *, minutes: int = 60) -> list[FlowMetricsPoint]:
+        """Per-minute whole-flow completed/failed counts, oldest first and zero-
+        filled like metrics(). One unit per root flow - nested sub-flows don't
+        count. Buckets expire after `scripts.METRICS_RETENTION_MS` (8h).
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        stamps = [now_minute - 60_000 * i for i in range(minutes - 1, -1, -1)]
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for ts in stamps:
+            pipe.hgetall(self.keys.metrics_bucket(ts))
+        hashes = _hash_replies(await pipe.execute())
+        return [
+            FlowMetricsPoint(
+                timestamp=ts,
+                completed=int(h.get("flows:completed", 0)),
+                failed=int(h.get("flows:failed", 0)),
+            )
+            for ts, h in zip(stamps, hashes, strict=True)
+        ]
+
+    async def flow_percentiles(self, *, minutes: int = 60) -> dict[str, int]:
+        """End-to-end flow-duration p50/p95/p99 in ms over the window.
+
+        Enqueue to root completion, merged from the "fh:<idx>" histogram;
+        completed flows only, 0s when none finished. Distinct from percentiles(),
+        which is each job's own runtime - this is the whole flow's wall clock.
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for i in range(minutes):
+            pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
+        merged = [0] * scripts.HIST_BUCKETS
+        for h in _hash_replies(await pipe.execute()):
+            for field, value in h.items():
+                if field.startswith("fh:"):
                     merged[int(field.rpartition(":")[2])] += int(value)
         return {
             "p50": _percentile(merged, 0.50),

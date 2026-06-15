@@ -137,6 +137,12 @@ end
 -- disagree with the transition it counts. When a job name is given, the
 -- same counts also land in per-name fields ("completed:<name>", ...) so
 -- a dashboard can answer "which job is responsible".
+-- Log-scaled duration bucket index for the percentile histograms: [0,20ms) is
+-- bucket 0, then 1.5x growth per bucket, overflow clamped to the last (25).
+local function histIdx(durMs)
+  if durMs < 20 then return 0 end
+  return math.min(25, math.floor(math.log(durMs / 20) / math.log(1.5)) + 1)
+end
 local function recordMetrics(base, field, now, durMs, retentionMs, name, count)
   local bucket = base .. "metrics:" .. tostring(math.floor(now / 60000) * 60000)
   redis.call("HINCRBY", bucket, field, count or 1)
@@ -144,15 +150,25 @@ local function recordMetrics(base, field, now, durMs, retentionMs, name, count)
   if name then
     redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
     if durMs > 0 then redis.call("HINCRBY", bucket, "ms:" .. name, durMs) end
-    -- duration histogram ("h:<name>:<bucketIdx>"), successful jobs only:
-    -- log-scaled buckets, [0,20ms) then 1.5x each, overflow clamps to the last
+    -- duration histogram ("h:<name>:<bucketIdx>"), successful jobs only
     if field == "completed" then
-      local idx = 0
-      if durMs >= 20 then
-        idx = math.min(25, math.floor(math.log(durMs / 20) / math.log(1.5)) + 1)
-      end
-      redis.call("HINCRBY", bucket, "h:" .. name .. ":" .. idx, 1)
+      redis.call("HINCRBY", bucket, "h:" .. name .. ":" .. histIdx(durMs), 1)
     end
+  end
+  redis.call("PEXPIRE", bucket, retentionMs)
+end
+-- Flow-level metrics: a whole flow is ONE unit, recorded only for the ROOT (a
+-- parent with no parentId) when it settles, so nested sub-flows don't double
+-- count. `flows:completed` / `flows:failed` are per-minute counters in the same
+-- bucket; a completed flow also feeds a duration histogram ("fh:<idx>") over the
+-- END-TO-END wall clock (enqueue -> root finished), which no per-job metric sees.
+local function recordFlow(base, completed, now, durMs, retentionMs)
+  local bucket = base .. "metrics:" .. tostring(math.floor(now / 60000) * 60000)
+  if completed then
+    redis.call("HINCRBY", bucket, "flows:completed", 1)
+    redis.call("HINCRBY", bucket, "fh:" .. histIdx(durMs), 1)
+  else
+    redis.call("HINCRBY", bucket, "flows:failed", 1)
   end
   redis.call("PEXPIRE", bucket, retentionMs)
 end
@@ -247,6 +263,8 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
     recordFinished(base .. "failed", base .. pid, base, pid, now,
       "failedReason", reason, "failed", keepCount, keepAge)
     recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
+    -- reached the ROOT of the flow (no grandparent): count one flow failure
+    if not pmeta[1] then recordFlow(base, false, now, 0, retentionMs) end
     redis.call("PUBLISH", base .. "events",
       cjson.encode({jobId = tostring(pid), event = "failed", reason = reason}))
     cid = pid
@@ -421,11 +439,16 @@ redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[3])
 -- read BEFORE recordFinished (remove-on-complete may DEL the hash)
-local meta = redis.call("HMGET", KEYS[3], "processedOn", "name", "parentId")
+local meta = redis.call("HMGET", KEYS[3],
+  "processedOn", "name", "parentId", "children", "timestamp")
 local startedOn = tonumber(meta[1]) or now
 recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now,
   "returnvalue", ARGV[2], "completed", tonumber(ARGV[7]), tonumber(ARGV[8]))
 recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]), meta[2])
+-- a root flow completing: count the whole flow and its end-to-end wall clock
+if meta[4] and not meta[3] then
+  recordFlow(KEYS[8], true, now, now - (tonumber(meta[5]) or now), tonumber(ARGV[11]))
+end
 -- a flow child settles into its parent here, atomically with its own commit
 if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2]) end
 -- the result is decoded and re-encoded as part of ONE cjson document: a
@@ -484,13 +507,17 @@ if attemptsMade < maxAttempts then
 else
   local now = tonumber(ARGV[3])
   -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
-  local meta = redis.call("HMGET", KEYS[5], "processedOn", "name", "parentId", "onFail")
+  local meta = redis.call("HMGET", KEYS[5], "processedOn", "name", "parentId", "onFail", "children")
   local startedOn = tonumber(meta[1]) or now
   recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now,
     "failedReason", ARGV[2], "failed", tonumber(ARGV[10]), tonumber(ARGV[11]))
   recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]), meta[2])
   redis.call("PUBLISH", KEYS[11],
     cjson.encode({jobId = ARGV[1], event = "failed", reason = ARGV[2]}))
+  -- a root flow whose own processor failed (children all settled): count it.
+  -- A child failing (meta[3] set) instead propagates through settleChildFailed,
+  -- which counts the root it reaches - the two paths are disjoint, no double count
+  if meta[5] and not meta[3] then recordFlow(KEYS[9], false, now, 0, tonumber(ARGV[14])) end
   -- a flow child settles into its parent per its on_fail policy, atomically
   if meta[3] then
     settleChildFailed(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[14]))
@@ -672,10 +699,13 @@ if #stalling > 0 then
             event = "failed", reason = "job stalled more than allowable limit"}))
           -- the crash path settles flow parents too - a dead worker must not
           -- leave a parent parked forever
-          local pmeta = redis.call("HMGET", jobKey, "parentId", "onFail")
+          local pmeta = redis.call("HMGET", jobKey, "parentId", "onFail", "children")
           if pmeta[1] then
             settleChildFailed(KEYS[6], jobId, pmeta[1], pmeta[2],
               "job stalled more than allowable limit", tonumber(ARGV[2]), tonumber(ARGV[4]))
+          elseif pmeta[3] then
+            -- a released root flow parent that stalled out: count the flow failed
+            recordFlow(KEYS[6], false, tonumber(ARGV[2]), 0, tonumber(ARGV[4]))
           end
           table.insert(failed, jobId)
         else
