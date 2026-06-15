@@ -393,3 +393,24 @@ async def test_regular_jobs_record_no_flow_metrics(q, run_worker, run_until):
 
 async def test_flow_percentiles_zero_on_idle_queue(q):
     assert await q.flow_percentiles(minutes=2) == {"p50": 0, "p95": 0, "p99": 0}
+
+
+async def test_stalled_root_flow_parent_counts_one_flow_failed(q):
+    # A released root flow parent that stalls out: MOVE_STALLED must count the whole
+    # flow failed. It has no parentId, so it never reaches settleChildFailed - the
+    # stall path owns this case. (Staged like test_stall_failure: a worker grabbed
+    # the released parent on `active`, then died with no lock.)
+    parent = await q.add_flow("report", {}, children=[c("leaf", {})])
+    pid = parent.id
+    w = Worker(QUEUE, _noop, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+    await q.redis.zrem(q.keys.waiting_children, pid)
+    await q.redis.hset(q.keys.job(pid), "state", "active")
+    await q.redis.rpush(q.keys.active, pid)
+
+    await w.check_stalled(throttle_ms=0)  # mark
+    failed, _ = await w.check_stalled(throttle_ms=0)  # escalate past the limit
+    assert pid in failed
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["failed"] for p in points) == 1
+    assert sum(p["completed"] for p in points) == 0

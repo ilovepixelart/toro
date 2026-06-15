@@ -94,6 +94,12 @@ failed flow in one shot, in any order. One pinned v1 edge: if the parent has
 already failed and you retry *only* the child, the child's later success does
 not resurrect the parent; retry the parent too (or use retry-all).
 
+To recover *one* flow without touching the rest of the queue, use
+`retry_flow(parent_id)`: it retries every failed job in that subtree, root
+first, so a re-parked parent is ready before its children re-join the barrier -
+order-independent, like retry-all but scoped. It returns the number of jobs
+retried. The dashboard's *retry flow* button on a failed parent calls it.
+
 ## Removing flow jobs
 
 - Removing a **parent** removes its whole subtree - children included, even
@@ -119,19 +125,48 @@ failures = await queue.failed_children(parent_id)
 `get_flow` hydrates the tree breadth-first, one pipelined round trip per
 level, down to `depth` levels (default 10; `depth=0` returns just the root
 node) - pass a larger `depth` for deeper trees. `Job.parent_id` and
-`Job.children_ids` expose flow membership on any loaded job. [matador](https://github.com/ilovepixelart/matador) renders all of
-this as a **flows** tab (one row per parked parent) and a tree on the job
-detail with fan-in progress that counts completions only.
+`Job.children_ids` expose flow membership on any loaded job.
+
+For a dashboard detail view, `flow_view(parent_id)` folds those three reads
+into one `FlowView`:
+
+```python
+view = await queue.flow_view(parent_id)
+view.tree                       # same {"job": Job, "children": [...]} shape
+view.results, view.failures     # collected results + tolerated failures
+view.total, view.done, view.failed   # fan-in counts (completions only)
+view.live                       # True while any node is still non-terminal
+```
+
+It costs the tree's O(depth) round trips plus one pipelined read of the
+parent's result/failure hashes (not three separate calls), and `done`/`failed`
+count completions only - a failed flow never reads as done. Returns `None` if
+the job doesn't exist. [matador](https://github.com/ilovepixelart/matador)
+renders all of this as a **flows** tab (one row per parked parent) and a tree
+on the job detail with fan-in progress.
 
 ## Metrics and events
 
 Enqueueing a flow increments the queue's `added` counter by the node count
 and publishes a single `added` event carrying the root's id. On failures,
-every terminally-failed child increments `failed` (tolerated `continue`
-failures included), and each eagerly-failed ancestor increments it again -
-so one leaf failure in a deep `fail_parent` chain produces several `failed`
-increments and events. Alerts on the failed counter count failed *jobs*, not
-failed *flows*.
+every terminally-failed child increments the per-job `failed` counter
+(tolerated `continue` failures included), and each eagerly-failed ancestor
+increments it again - so one leaf failure in a deep `fail_parent` chain
+produces several `failed` increments and events. That counter is about *jobs*.
+
+Whole flows are counted in their own right, one unit per **root** flow as it
+settles (nested sub-flows don't double count):
+
+```python
+points = await queue.flow_metrics(minutes=60)   # per-minute completed/failed
+pcts = await queue.flow_percentiles(minutes=60)  # end-to-end p50/p95/p99 (ms)
+```
+
+`flow_percentiles` measures the whole flow's wall clock - enqueue to the root
+finishing - which the per-job duration never captures (a flow that fans out
+wide finishes long after any single job's runtime). The dashboard charts this
+as a throughput strip on the flows tab. Both reads zero-fill and share the
+8h metrics retention.
 
 ## Limits
 
