@@ -142,8 +142,9 @@ It costs the tree's O(depth) round trips plus one pipelined read of the
 parent's result/failure hashes (not three separate calls), and `done`/`failed`
 count completions only - a failed flow never reads as done. Returns `None` if
 the job doesn't exist. [matador](https://github.com/ilovepixelart/matador)
-renders all of this as a **flows** tab (one row per parked parent) and a tree
-on the job detail with fan-in progress.
+renders a flow as its root job moving through the normal state tabs (children
+hidden, shown only in the tree), with a recursive tree and fan-in progress on
+the job detail.
 
 ## Metrics and events
 
@@ -165,7 +166,7 @@ pcts = await queue.flow_percentiles(minutes=60)  # end-to-end p50/p95/p99 (ms)
 `flow_percentiles` measures the whole flow's wall clock - enqueue to the root
 finishing - which the per-job duration never captures (a flow that fans out
 wide finishes long after any single job's runtime). The dashboard charts this
-as a throughput strip on the flows tab. Both reads zero-fill and share the
+as a throughput strip on the active tab. Both reads zero-fill and share the
 8h metrics retention.
 
 ## Limits
