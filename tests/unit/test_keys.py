@@ -30,6 +30,13 @@ def test_flow_keys():
     assert k.cfail(5) == "toro:emails:5:cfail"
 
 
+def test_roots_index_keys():
+    # the children index + its diff scratch, behind the root-first listing
+    k = Keys("emails", "toro")
+    assert k.children == "toro:emails:children"
+    assert k.roots_scratch == "toro:emails:roots-scratch"
+
+
 def test_scheduler_key():
     assert Keys("emails", "toro").scheduler("nightly") == "toro:emails:repeat:nightly"
 

@@ -128,6 +128,7 @@ local function delJobs(ids, base)
   for _, id in ipairs(ids) do
     redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
                base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail")
+    redis.call("ZREM", base .. "children", id)  -- prune the flow-child index (hygiene)
   end
 end
 -- Per-minute metrics bucket: one small hash per (queue, minute) holding
@@ -359,6 +360,7 @@ local function createNode(node, parentId)
     "timestamp", now, "attemptsMade", 0, "priority", node.priority)
   if parentId then
     redis.call("HSET", jobKey, "parentId", parentId, "onFail", node.onFail)
+    redis.call("ZADD", base .. "children", now, jobId)  -- index as a flow child (ROOTS listing)
   end
   if node.children and #node.children > 0 then
     local cids = {}
@@ -749,3 +751,47 @@ end
 return #jobs
 """
 )
+
+# Roots-only page of one ZSET state: the jobs a root-first dashboard shows with
+# flow children hidden. Roots = state \ children (a child is any node with a
+# parentId; the `children` index holds them all). ZDIFFSTORE keeps the state
+# set's own scores, so the page order matches get_jobs() (priority / due-time /
+# insertion); the caller picks ZRANGE vs ZREVRANGE for newest-first states.
+# Exact and unbounded - no scan cap. The scratch zset lives only for this atomic
+# call, so a single fixed key is safe (scripts never interleave).
+# KEYS[1] state zset  KEYS[2] children zset  KEYS[3] scratch zset
+# ARGV[1] start  ARGV[2] stop (inclusive)  ARGV[3] rev (1 = ZREVRANGE)
+LIST_ROOTS = """
+local total = redis.call("ZDIFFSTORE", KEYS[3], 2, KEYS[1], KEYS[2])
+local ids = {}
+if total > 0 then
+  if ARGV[3] == "1" then
+    ids = redis.call("ZREVRANGE", KEYS[3], ARGV[1], ARGV[2])
+  else
+    ids = redis.call("ZRANGE", KEYS[3], ARGV[1], ARGV[2])
+  end
+  redis.call("DEL", KEYS[3])
+end
+return {total, ids}
+"""
+
+# Exact roots-only count per state - the root-first counterpart of counts().
+# Each ZSET state is diffed against the children index in turn through one shared
+# scratch key (DELeted between uses); `active` is a LIST, so its roots are
+# counted by membership in the children index. One atomic round trip for all six.
+# KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] completed  KEYS[4] failed
+# KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] children  KEYS[8] scratch
+ROOTS_COUNTS = """
+local ch = KEYS[7]
+local sc = KEYS[8]
+local function rc(k)
+  local n = redis.call("ZDIFFSTORE", sc, 2, k, ch)
+  redis.call("DEL", sc)
+  return n
+end
+local active = 0
+for _, jid in ipairs(redis.call("LRANGE", KEYS[6], 0, -1)) do
+  if redis.call("ZSCORE", ch, jid) == false then active = active + 1 end
+end
+return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), active}
+"""

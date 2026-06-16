@@ -56,6 +56,21 @@ class Keys:
         return f"{self.base}waiting-children"
 
     @property
+    def children(self) -> str:
+        # ZSET of every flow CHILD id (a node with a parentId - leaf or interior
+        # sub-flow parent), so a dashboard can list ROOTS only via ZDIFF(state,
+        # children). Added in ADD_FLOW, pruned in delJobs (a stale entry is
+        # harmless to the diff - it's not in any state set anyway).
+        return f"{self.base}children"
+
+    @property
+    def roots_scratch(self) -> str:
+        # Ephemeral ZSET the roots diff (state \ children) stores into. Written and
+        # DELeted inside one atomic Lua call, so a single fixed key is safe even
+        # under concurrent callers - Redis never interleaves scripts.
+        return f"{self.base}roots-scratch"
+
+    @property
     def meta_paused(self) -> str:
         # Existence flag: when set, workers stop claiming new jobs.
         return f"{self.base}meta-paused"

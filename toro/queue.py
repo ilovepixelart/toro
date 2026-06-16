@@ -132,6 +132,8 @@ class Queue:
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
+        self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
+        self._roots_counts_script = self.redis.register_script(scripts.ROOTS_COUNTS)
         # result() plumbing: ALL waiters share ONE events subscription; a
         # dispatcher task routes each terminal event to the futures registered
         # for that jobId. One pubsub per waiter would cost waiters x events
@@ -832,16 +834,87 @@ class Queue:
             ids = await self.redis.zrevrange(getattr(self.keys, state), start, end)
         else:
             raise ValueError(f"unknown state: {state}")
+        return await self._hydrate_ids(_str_list(ids))
+
+    async def _hydrate_ids(self, ids: list[str]) -> list[Job]:
+        """Load a list of job ids into Jobs in one pipelined round trip (one
+        HGETALL per id, not one call per id). Ids whose hash has vanished are
+        skipped. The shared tail of every id-list listing (get_jobs, roots).
+        """
         if not ids:
             return []
-        # Hydrate the whole page in one round trip instead of one HGETALL per job.
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for job_id in ids:
-            pipe.hgetall(self.keys.job(cast("str", job_id)))
+            pipe.hgetall(self.keys.job(job_id))
         hashes = await pipe.execute()
-        return [
-            Job.from_hash(cast("str", jid), h) for jid, h in zip(ids, hashes, strict=False) if h
-        ]
+        return [Job.from_hash(jid, h) for jid, h in zip(ids, hashes, strict=False) if h]
+
+    def _roots_zset(self, state: JobState) -> tuple[str, bool]:
+        """Map a ZSET-backed state to (key, newest_first) for the roots diff.
+        `active` is a LIST and is handled separately by the caller.
+        """
+        if state in ("wait", "prioritized"):
+            return self.keys.prioritized, False
+        if state == "delayed":
+            return self.keys.delayed, False
+        if state == "waiting-children":
+            return self.keys.waiting_children, False
+        if state in ("completed", "failed"):
+            return getattr(self.keys, state), True  # finished states read newest-first
+        raise ValueError(f"unknown state: {state}")
+
+    async def get_jobs_roots(
+        self, state: JobState, start: int = 0, end: int = 20
+    ) -> tuple[int, list[Job]]:
+        """Page through the ROOT jobs of a state - flow children (any job with a
+        parentId) are excluded, since a root-first dashboard shows them only in
+        the parent's tree - and return (exact total roots, hydrated page).
+
+        Roots-only and unbounded: paging deep needs no scan cap. `start`/`end`
+        are inclusive like get_jobs(); `end < 0` means "to the end". The ZSET
+        states diff against the children index in one atomic script (order
+        preserved); `active` is a small LIST, filtered in Python.
+        """
+        if state == "active":
+            ids = _str_list(await self.redis.lrange(self.keys.active, 0, -1))
+            roots = [j for j in await self._hydrate_ids(ids) if not j.parent_id]
+            stop = None if end < 0 else end + 1
+            return len(roots), roots[start:stop]
+        zset, newest = self._roots_zset(state)
+        total, ids = await self._list_roots(
+            keys=[zset, self.keys.children, self.keys.roots_scratch],
+            args=[start, end, 1 if newest else 0],
+        )
+        return int(total), await self._hydrate_ids(_str_list(ids))
+
+    async def roots_counts(self) -> dict[str, int]:
+        """Exact roots-only count per state - the root-first counterpart of
+        counts(). One atomic script diffs each state set against the children
+        index (`active`, a LIST, is counted by membership). `wait` is the
+        prioritized set; `waiting-children` is the parked flow parents (each a
+        root unless itself nested).
+        """
+        res = await self._roots_counts_script(
+            keys=[
+                self.keys.prioritized,
+                self.keys.delayed,
+                self.keys.completed,
+                self.keys.failed,
+                self.keys.waiting_children,
+                self.keys.active,
+                self.keys.children,
+                self.keys.roots_scratch,
+            ],
+        )
+        wait, delayed, completed, failed, waiting_children, active = (int(x) for x in res)
+        return {
+            "wait": wait,
+            "active": active,
+            "delayed": delayed,
+            "completed": completed,
+            "failed": failed,
+            "waiting-children": waiting_children,
+        }
 
     def _retry_job_keys(self, job_id: str) -> list[str]:
         """Build the six KEYS the RETRY_JOB script takes - one definition so
