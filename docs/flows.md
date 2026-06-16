@@ -141,10 +141,19 @@ view.live                       # True while any node is still non-terminal
 It costs the tree's O(depth) round trips plus one pipelined read of the
 parent's result/failure hashes (not three separate calls), and `done`/`failed`
 count completions only - a failed flow never reads as done. Returns `None` if
-the job doesn't exist. [matador](https://github.com/ilovepixelart/matador)
-renders a flow as its root job moving through the normal state tabs (children
-hidden, shown only in the tree), with a recursive tree and fan-in progress on
-the job detail.
+the job doesn't exist.
+
+To show fan-in progress for a whole *page* of parents without hydrating each
+tree, `flow_progress(parent_ids)` returns `{parent_id: (completed, failed)}` from
+cheap pipelined `HLEN` reads (just the counts):
+
+```python
+progress = await queue.flow_progress([p1, p2, p3])   # {p1: (2, 0), p2: (1, 1), ...}
+```
+
+[matador](https://github.com/ilovepixelart/matador) renders a flow as its root
+job moving through the normal state tabs (children hidden, shown only in the
+tree), with a recursive tree and fan-in progress on the job detail.
 
 ## Metrics and events
 
