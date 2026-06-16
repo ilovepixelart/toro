@@ -270,6 +270,29 @@ class Queue:
             _queue=self,
         )
 
+    @staticmethod
+    def _hydrate_level(
+        level: list[str],
+        replies: list[dict[str, str]],
+        nodes: dict[str, dict[str, Any]],
+        parent_of: dict[str, str],
+    ) -> list[str]:
+        """Build the node for each id in one BFS level, link it under its parent,
+        and return the next level's child ids. Hashes that vanished mid-walk are
+        skipped. Mutates `nodes`/`parent_of` (the walk's shared accumulators).
+        """
+        next_level: list[str] = []
+        for jid, h in zip(level, replies, strict=True):
+            if not h:
+                continue  # removed mid-walk (or a stale children entry)
+            nodes[jid] = {"job": Job.from_hash(jid, h), "children": []}
+            if (pid := parent_of.get(jid)) is not None:
+                nodes[pid]["children"].append(nodes[jid])
+            for cid in json.loads(h["children"]) if h.get("children") else []:
+                parent_of[cid] = jid
+                next_level.append(cid)
+        return next_level
+
     async def _hydrate_flow(self, job_id: str, depth: int) -> dict[str, Any] | None:
         """BFS-hydrate a flow tree into ``{"job": Job, "children": [<same>]}``,
         root-down, one pipelined round trip per level - O(depth), not O(nodes).
@@ -283,17 +306,9 @@ class Queue:
             pipe = self.redis.pipeline(transaction=False)  # read fan-out per level
             for jid in level:
                 pipe.hgetall(self.keys.job(jid))
-            next_level: list[str] = []
-            for jid, h in zip(level, _hash_replies(await pipe.execute()), strict=True):
-                if not h:
-                    continue  # removed mid-walk (or a stale children entry)
-                nodes[jid] = {"job": Job.from_hash(jid, h), "children": []}
-                if (pid := parent_of.get(jid)) is not None:
-                    nodes[pid]["children"].append(nodes[jid])
-                for cid in json.loads(h["children"]) if h.get("children") else []:
-                    parent_of[cid] = jid
-                    next_level.append(cid)
-            level = next_level
+            level = self._hydrate_level(
+                level, _hash_replies(await pipe.execute()), nodes, parent_of
+            )
             if not level:
                 break
         return nodes.get(job_id)
