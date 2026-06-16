@@ -100,6 +100,15 @@ job = await queue.add("resize", {"src": "a.png"})
 print(await job.result(timeout=30))
 ```
 
+## Flows
+
+A flow enqueues a parent and its children as one atomic tree. The children run
+first (fan-out, nested arbitrarily); the parent parks until every child has
+settled, then runs and reads their results (fan-in). One primitive covers
+fan-out/fan-in and chained steps, with per-child failure policies and
+flow-aware retry that recovers a whole failed flow in one shot. Full guide:
+[docs/flows.md](docs/flows.md).
+
 ## Develop
 
 Managed with [uv](https://astral.sh/uv); the Astral toolchain throughout.
