@@ -9,6 +9,7 @@ import asyncio
 import itertools
 import time
 
+from toro import FlowChild as c  # noqa: N813 - `c("fetch", ...)` keeps trees readable
 from toro import Queue, Worker
 from toro.scripts import METRICS_RETENTION_MS
 
@@ -321,3 +322,95 @@ async def test_queue_percentiles_merge_all_names(q, run_worker, run_until):
 async def test_queue_percentiles_zero_on_idle_queue(q):
     p = await q.percentiles(minutes=2)
     assert p == {"p50": 0, "p95": 0, "p99": 0}
+
+
+# ---- flow-level metrics: one unit per root flow, end-to-end duration ----------
+
+
+async def test_completed_flow_counts_once_with_duration(q, run_worker, run_until):
+    async with run_worker(q, _noop):
+        # 2 leaves + the parent = 3 completed JOBS, but exactly one ROOT FLOW
+        await q.add_flow("report", {}, children=[c("a", {}), c("b", {})])
+        assert await run_until(lambda: _count(q, "completed", 3))
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["completed"] for p in points) == 1  # the flow, not the 3 jobs
+    assert all(p["failed"] == 0 for p in points)
+    assert points[-1]["timestamp"] == _minute(time.time() * 1000)
+    # the end-to-end wall clock landed in the flow histogram
+    pcts = await q.flow_percentiles(minutes=2)
+    assert pcts["p50"] > 0
+
+
+async def test_nested_flow_counts_once_at_the_root(q, run_worker, run_until):
+    async with run_worker(q, _noop):
+        # root -> mid -> leaf: two interior parents, but still ONE flow
+        await q.add_flow("root", {}, children=[c("mid", {}, children=[c("leaf", {})])])
+        assert await run_until(lambda: _count(q, "completed", 3))
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["completed"] for p in points) == 1  # not 2 (root + mid)
+
+
+async def test_eager_child_failure_counts_one_flow_failed(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc):
+        await q.add_flow("report", {}, children=[c("ok", {}), c("bad", {})])
+        assert await run_until(lambda: _count(q, "failed", 2))  # bad child + parent
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["failed"] for p in points) == 1  # one root flow failed
+    assert sum(p["completed"] for p in points) == 0
+
+
+async def test_parent_processor_failure_counts_one_flow_failed(q, run_worker, run_until):
+    async def proc(job):
+        if job.name == "report":  # the parent runs after its children, then fails
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc):
+        await q.add_flow("report", {}, children=[c("a", {}), c("b", {})])
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["failed"] for p in points) == 1
+    assert sum(p["completed"] for p in points) == 0  # the flow did NOT complete
+
+
+async def test_regular_jobs_record_no_flow_metrics(q, run_worker, run_until):
+    async with run_worker(q, _noop):
+        await q.add("solo", {})
+        assert await run_until(lambda: _count(q, "completed", 1))
+
+    points = await q.flow_metrics(minutes=2)
+    assert all(p["completed"] == 0 and p["failed"] == 0 for p in points)
+
+
+async def test_flow_percentiles_zero_on_idle_queue(q):
+    assert await q.flow_percentiles(minutes=2) == {"p50": 0, "p95": 0, "p99": 0}
+
+
+async def test_stalled_root_flow_parent_counts_one_flow_failed(q):
+    # A released root flow parent that stalls out: MOVE_STALLED must count the whole
+    # flow failed. It has no parentId, so it never reaches settleChildFailed - the
+    # stall path owns this case. (Staged like test_stall_failure: a worker grabbed
+    # the released parent on `active`, then died with no lock.)
+    parent = await q.add_flow("report", {}, children=[c("leaf", {})])
+    pid = parent.id
+    w = Worker(QUEUE, _noop, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+    await q.redis.zrem(q.keys.waiting_children, pid)
+    await q.redis.hset(q.keys.job(pid), "state", "active")
+    await q.redis.rpush(q.keys.active, pid)
+
+    await w.check_stalled(throttle_ms=0)  # mark
+    failed, _ = await w.check_stalled(throttle_ms=0)  # escalate past the limit
+    assert pid in failed
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["failed"] for p in points) == 1
+    assert sum(p["completed"] for p in points) == 0

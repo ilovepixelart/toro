@@ -9,7 +9,8 @@ every job is durable in Redis.
 ## Atomic state transitions via Lua
 
 Every state move (`wait→active`, `active→completed/failed/delayed`,
-`delayed→wait`) is a single Redis Lua script, run atomically, so multi-key
+`delayed→wait`, and the flow transitions around `waiting-children` -
+see [Flows](flows.md)) is a single Redis Lua script, run atomically, so multi-key
 "check-then-act" sequences can't interleave. That removes whole classes of race:
 
 - **pop-then-lock gap** - two workers claiming the same job: the claim pops from
@@ -88,6 +89,10 @@ due jobs into the prioritized set.
   `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
 - **Auto-removal** - `remove_on_complete` / `remove_on_fail` (bool / count /
   `{count, age}`) enforced inside the finish script, not by a separate sweeper.
+- **Flows** - `add_flow()` creates a parent/child tree atomically; children
+  settle into the parent's `:deps` barrier inside the same finish scripts that
+  commit their own transitions, so the fan-in resolves on the crash path too.
+  See [Flows](flows.md).
 
 ## The Lua scripts
 
@@ -104,20 +109,23 @@ The scripts share a small library of routines:
 | `acquireNext` | Pops the top prioritized job into `active` and locks it, honoring the rate limit. |
 | `tryRateLimit` | Token bucket: ms until a token frees, or 0 to proceed. |
 | `recordFinished` | Records a terminal job in `completed`/`failed` and applies auto-removal. |
+| `settleChildCompleted` / `settleChildFailed` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent - or fails it eagerly, per `on_fail`. |
+| `keepArgsFromOpts` | The Lua twin of `JobOptions.keep_args`, for eager parent failures that have no Python caller. |
 
 And the scripts themselves:
 
 | Script | Caller | Does |
 |---|---|---|
 | `ADD_JOB` | producer | Mint/accept an id, write the hash, enqueue or delay, dedup, publish `added`. |
+| `ADD_FLOW` | producer | Create a whole flow tree atomically: leaves enqueued/delayed, parents parked with their `:deps` barrier. |
 | `MOVE_TO_ACTIVE` | worker wakeup | Claim the next job: `ZPOPMIN prioritized` → `active` → lock + load. |
-| `MOVE_TO_COMPLETED` | worker finish | Commit the result and fetch-next in one round trip. |
-| `MOVE_TO_FAILED` | worker finish | Retry (to `wait`/`delayed`) or terminally fail, and fetch-next. |
+| `MOVE_TO_COMPLETED` | worker finish | Commit the result (settling a flow child into its parent) and fetch-next in one round trip. |
+| `MOVE_TO_FAILED` | worker finish | Retry (to `wait`/`delayed`) or terminally fail (applying a flow child's `on_fail`), and fetch-next. |
 | `EXTEND_LOCK` | renewer | Token-guarded lock renewal; clears the job from `stalled`. |
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
 | `PROMOTE_DELAYED` | promote loop | Move up to `PROMOTE_BATCH` (1000) due delayed jobs to `prioritized`. |
 | `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |
-| `PROMOTE_JOB` / `RETRY_JOB` / `REMOVE_JOB` | dashboard | Run a delayed job now / re-enqueue a failed one / delete a job with its lock and logs. |
+| `PROMOTE_JOB` / `RETRY_JOB` / `REMOVE_JOB` | dashboard | Run a delayed job now / re-enqueue a failed one (flow-aware: a parent with unsettled children re-parks, a child re-joins the barrier) / delete a job with its lock, logs and flow aux keys (a flow parent takes its subtree). |
 
 ### Lua → Python return protocol
 
@@ -132,8 +140,9 @@ Scripts signal outcomes with sentinels the worker decodes:
   job terminally failed or will retry.
 
 Scores are packed under 2^53 (`PRIORITY_OFFSET = 2^20`, `SEQ_MOD = 2^32`) so ZSET
-double scores stay exact, and the scripts use only plain JSON and integer ARGV -
-no `cmsgpack` / `bit` / `cjson` - so they run on any Redis build.
+double scores stay exact, and the scripts use only plain JSON and integer ARGV with the built-in
+`cjson` for encode/decode - no `cmsgpack` / `bit` - so they run on any
+Redis build.
 
 ## Python-specific choices
 

@@ -15,17 +15,15 @@ from redis.asyncio.client import PubSub
 from . import scripts
 from .connection import connect
 from .errors import JobFailedError
-from .job import Deduplication, Job, JobOptions, JobState
+from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
+from .flow import clamp_priority as _clamp_priority
+from .job import Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
 from .scheduler import next_run, valid_cron
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _clamp_priority(p: int) -> int:
-    return max(0, min(int(p), scripts.PRIORITY_OFFSET))
 
 
 def _str_list(reply: Any) -> list[str]:
@@ -63,6 +61,17 @@ class NameMetrics(TypedDict):
     p50: int  # duration percentiles (ms, bucket upper bounds) - successful
     p95: int  # jobs only, 0 when nothing completed in the window
     p99: int
+
+
+class FlowMetricsPoint(TypedDict):
+    """One minute of flow activity: whole flows that settled, counted once at
+    the root (nested sub-flows don't count). Duration is tracked separately in a
+    histogram (see flow_percentiles), not per minute.
+    """
+
+    timestamp: int  # minute bucket start (ms since epoch)
+    completed: int  # root flows that finished this minute
+    failed: int  # root flows that failed this minute
 
 
 def bucket_upper_ms(idx: int) -> int:
@@ -118,10 +127,13 @@ class Queue:
         # redis-py's async client isn't generic over that, hence the casts below.
         self.redis = connection or connect(url)
         self._add_job = self.redis.register_script(scripts.ADD_JOB)
+        self._add_flow_script = self.redis.register_script(scripts.ADD_FLOW)
         self._retry_job = self.redis.register_script(scripts.RETRY_JOB)
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
+        self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
+        self._roots_counts_script = self.redis.register_script(scripts.ROOTS_COUNTS)
         # result() plumbing: ALL waiters share ONE events subscription; a
         # dispatcher task routes each terminal event to the futures registered
         # for that jobId. One pubsub per waiter would cost waiters x events
@@ -214,6 +226,151 @@ class Queue:
             state="delayed" if options.delay > 0 else "wait",
             _queue=self,
         )
+
+    async def add_flow(
+        self,
+        name: str,
+        data: Any = None,
+        *,
+        children: list[FlowChild],
+        **opts: Any,
+    ) -> Job:
+        """Atomically enqueue a parent job plus its `children` (a flow).
+
+        Children run first (in parallel; nest `FlowChild`s for deeper trees);
+        the parent is parked in `waiting-children` until every child settles,
+        then runs and can pull `job.children_results()` / `job.failed_children()`.
+        A child's terminal failure follows its `on_fail` policy (default: the
+        parent fails immediately). Returns the parent Job; `await job.result()`
+        resolves when the whole flow does. See docs/flows-design.md.
+        """
+        if not children:
+            raise ValueError("a flow needs at least one child - use add() for a single job")
+        # The root is a FlowChild too: same validation (incl. "no delay on a
+        # node with children" - the parent runs when its children settle).
+        root = FlowChild(name, data, children=list(children), **opts)
+        if (n := count_nodes(root)) > MAX_FLOW_NODES:
+            raise ValueError(f"flow has {n} nodes; the limit is {MAX_FLOW_NODES}")
+        # Built (and validated) BEFORE the script runs: an option error must
+        # never surface after the flow is already live in Redis.
+        options = node_options(root, self.default_job_options)
+        now = _now_ms()
+        tree = to_tree(root, self.default_job_options)
+        parent_id = str(
+            await self._add_flow_script(
+                keys=[self.keys.id, self.keys.base],
+                args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
+            )
+        )
+        return Job(
+            id=parent_id,
+            name=name,
+            data=data,
+            opts=options,
+            timestamp=now,
+            state="waiting-children",
+            _queue=self,
+        )
+
+    @staticmethod
+    def _hydrate_level(
+        level: list[str],
+        replies: list[dict[str, str]],
+        nodes: dict[str, dict[str, Any]],
+        parent_of: dict[str, str],
+    ) -> list[str]:
+        """Build the node for each id in one BFS level, link it under its parent,
+        and return the next level's child ids. Hashes that vanished mid-walk are
+        skipped. Mutates `nodes`/`parent_of` (the walk's shared accumulators).
+        """
+        next_level: list[str] = []
+        for jid, h in zip(level, replies, strict=True):
+            if not h:
+                continue  # removed mid-walk (or a stale children entry)
+            nodes[jid] = {"job": Job.from_hash(jid, h), "children": []}
+            if (pid := parent_of.get(jid)) is not None:
+                nodes[pid]["children"].append(nodes[jid])
+            for cid in json.loads(h["children"]) if h.get("children") else []:
+                parent_of[cid] = jid
+                next_level.append(cid)
+        return next_level
+
+    async def _hydrate_flow(self, job_id: str, depth: int) -> dict[str, Any] | None:
+        """BFS-hydrate a flow tree into ``{"job": Job, "children": [<same>]}``,
+        root-down, one pipelined round trip per level - O(depth), not O(nodes).
+        Shared by get_flow() and flow_view(). None when the root is gone; child
+        hashes that vanished mid-walk are skipped. `depth` bounds the walk.
+        """
+        nodes: dict[str, dict[str, Any]] = {}
+        parent_of: dict[str, str] = {}
+        level = [job_id]
+        for _ in range(depth + 1):
+            pipe = self.redis.pipeline(transaction=False)  # read fan-out per level
+            for jid in level:
+                pipe.hgetall(self.keys.job(jid))
+            level = self._hydrate_level(
+                level, _hash_replies(await pipe.execute()), nodes, parent_of
+            )
+            if not level:
+                break
+        return nodes.get(job_id)
+
+    async def get_flow(self, job_id: str, *, depth: int = 10) -> dict[str, Any] | None:
+        """Read a flow tree back: ``{"job": Job, "children": [<same shape>]}``.
+
+        Hydrates breadth-first, one pipelined round trip per level (the same
+        shape as get_jobs' page hydration) - O(depth) round trips, not
+        O(nodes). `depth` bounds the walk. None when the job doesn't exist.
+        """
+        return await self._hydrate_flow(job_id, depth)
+
+    async def flow_view(self, job_id: str, *, depth: int = 10) -> FlowView | None:
+        """Project a whole flow for a dashboard: the `get_flow` tree plus the
+        parent's collected `results` and tolerated `failures`.
+
+        One call where a detail view otherwise makes three (get_flow +
+        children_results + failed_children): the tree in O(depth) round trips,
+        then a single pipelined read of the parent's `:results` / `:cfail`
+        hashes. None when the job doesn't exist.
+        """
+        tree = await self._hydrate_flow(job_id, depth)
+        if tree is None:
+            return None
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.hgetall(self.keys.results(job_id))
+        pipe.hgetall(self.keys.cfail(job_id))
+        raw_results, raw_cfail = await pipe.execute()
+        return FlowView(
+            tree=tree,
+            results=decode_results(_str_dict(raw_results)),
+            failures=_str_dict(raw_cfail),
+        )
+
+    async def children_results(self, job_id: str) -> dict[str, Any]:
+        """Read a flow parent's collected child results (child id -> value) -
+        the queue-side read, for dashboards; processors use
+        `job.children_results()`.
+        """
+        return decode_results(_str_dict(await self.redis.hgetall(self.keys.results(job_id))))
+
+    async def failed_children(self, job_id: str) -> dict[str, str]:
+        """Read child id -> failure reason recorded under ``on_fail="continue"``."""
+        return _str_dict(await self.redis.hgetall(self.keys.cfail(job_id)))
+
+    async def flow_progress(self, parent_ids: list[str]) -> dict[str, tuple[int, int]]:
+        """For each flow parent id, ``(completed_children, failed_children)`` -
+        cheap pipelined HLEN reads of the ``:results`` / ``:cfail`` hashes (just
+        the counts, no values). Lets a dashboard show fan-in progress for a page
+        of parked parents without hydrating each tree.
+        """
+        if not parent_ids:
+            return {}
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for pid in parent_ids:
+            pipe.hlen(self.keys.results(pid))
+            pipe.hlen(self.keys.cfail(pid))
+        res = await pipe.execute()
+        return {pid: (int(res[2 * i]), int(res[2 * i + 1])) for i, pid in enumerate(parent_ids)}
 
     async def result(self, job_id: str, *, timeout: float = 30.0) -> Any:
         """Wait for a job to finish; return its return value, or raise JobFailedError.
@@ -441,14 +598,43 @@ class Queue:
         pipe.zcard(self.keys.delayed)
         pipe.zcard(self.keys.completed)
         pipe.zcard(self.keys.failed)
-        wait, active, delayed, completed, failed = await pipe.execute()
+        pipe.zcard(self.keys.waiting_children)
+        wait, active, delayed, completed, failed, waiting_children = await pipe.execute()
         return {
             "wait": wait,
             "active": active,
             "delayed": delayed,
             "completed": completed,
             "failed": failed,
+            "waiting-children": waiting_children,
         }
+
+    async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
+        """Fetch the last `minutes` per-minute metric buckets, oldest first, in
+        one pipelined round trip as (timestamp, hash) pairs. Missing buckets come
+        back as empty dicts (zero-fill). The shared read behind every metrics
+        method; buckets expire after `scripts.METRICS_RETENTION_MS` (8h).
+        """
+        minutes = max(1, minutes)
+        now_minute = _now_ms() // 60_000 * 60_000
+        stamps = [now_minute - 60_000 * i for i in range(minutes - 1, -1, -1)]
+        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
+        for ts in stamps:
+            pipe.hgetall(self.keys.metrics_bucket(ts))
+        return list(zip(stamps, _hash_replies(await pipe.execute()), strict=True))
+
+    @staticmethod
+    def _percentiles_from(buckets: list[tuple[int, dict[str, str]]], prefix: str) -> dict[str, int]:
+        """Merge the duration-histogram fields named ``<prefix><idx>`` across the
+        buckets into one histogram, then read p50/p95/p99 - the same maths for
+        per-job (`h:`) and whole-flow (`fh:`) durations.
+        """
+        merged = [0] * scripts.HIST_BUCKETS
+        for _ts, h in buckets:
+            for field, value in h.items():
+                if field.startswith(prefix):
+                    merged[int(field.rpartition(":")[2])] += int(value)
+        return {q: _percentile(merged, p) for q, p in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))}
 
     async def metrics(self, *, minutes: int = 60) -> list[MetricsPoint]:
         """Per-minute completed/failed counts and summed processing duration,
@@ -457,13 +643,6 @@ class Queue:
         scripts; buckets expire after `scripts.METRICS_RETENTION_MS` (8h), so
         asking for more history than that just returns zeros.
         """
-        minutes = max(1, minutes)
-        now_minute = _now_ms() // 60_000 * 60_000
-        stamps = [now_minute - 60_000 * i for i in range(minutes - 1, -1, -1)]
-        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
-        for ts in stamps:
-            pipe.hgetall(self.keys.metrics_bucket(ts))
-        hashes = _hash_replies(await pipe.execute())
         return [
             MetricsPoint(
                 timestamp=ts,
@@ -472,7 +651,7 @@ class Queue:
                 failed=int(h.get("failed", 0)),
                 ms=int(h.get("ms", 0)),
             )
-            for ts, h in zip(stamps, hashes, strict=True)
+            for ts, h in await self._metric_buckets(minutes)
         ]
 
     async def metrics_by_name(self, *, minutes: int = 60) -> list[NameMetrics]:
@@ -481,14 +660,9 @@ class Queue:
         from the per-name fields the finish scripts write into the same
         minute buckets ("completed:<name>", "failed:<name>", "ms:<name>").
         """
-        minutes = max(1, minutes)
-        now_minute = _now_ms() // 60_000 * 60_000
-        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
-        for i in range(minutes):
-            pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
         totals: dict[str, dict[str, int]] = {}
         hists: dict[str, list[int]] = {}
-        for h in _hash_replies(await pipe.execute()):
+        for _ts, h in await self._metric_buckets(minutes):
             for field, value in h.items():
                 kind, sep, rest = field.partition(":")
                 if not sep:
@@ -520,21 +694,30 @@ class Queue:
         """Queue-level p50/p95/p99 (ms) over the window - every job name's
         histogram merged into one. Successful jobs only; 0s when idle.
         """
-        minutes = max(1, minutes)
-        now_minute = _now_ms() // 60_000 * 60_000
-        pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
-        for i in range(minutes):
-            pipe.hgetall(self.keys.metrics_bucket(now_minute - 60_000 * i))
-        merged = [0] * scripts.HIST_BUCKETS
-        for h in _hash_replies(await pipe.execute()):
-            for field, value in h.items():
-                if field.startswith("h:"):
-                    merged[int(field.rpartition(":")[2])] += int(value)
-        return {
-            "p50": _percentile(merged, 0.50),
-            "p95": _percentile(merged, 0.95),
-            "p99": _percentile(merged, 0.99),
-        }
+        return self._percentiles_from(await self._metric_buckets(minutes), "h:")
+
+    async def flow_metrics(self, *, minutes: int = 60) -> list[FlowMetricsPoint]:
+        """Per-minute whole-flow completed/failed counts, oldest first and zero-
+        filled like metrics(). One unit per root flow - nested sub-flows don't
+        count. Buckets expire after `scripts.METRICS_RETENTION_MS` (8h).
+        """
+        return [
+            FlowMetricsPoint(
+                timestamp=ts,
+                completed=int(h.get("flows:completed", 0)),
+                failed=int(h.get("flows:failed", 0)),
+            )
+            for ts, h in await self._metric_buckets(minutes)
+        ]
+
+    async def flow_percentiles(self, *, minutes: int = 60) -> dict[str, int]:
+        """End-to-end flow-duration p50/p95/p99 in ms over the window.
+
+        Enqueue to root completion, merged from the "fh:<idx>" histogram;
+        completed flows only, 0s when none finished. Distinct from percentiles(),
+        which is each job's own runtime - this is the whole flow's wall clock.
+        """
+        return self._percentiles_from(await self._metric_buckets(minutes), "fh:")
 
     async def latency(self) -> int:
         """Age (ms) of the next-to-run waiting job - 0 when nothing is waiting.
@@ -645,48 +828,141 @@ class Queue:
             ids = await self.redis.lrange(self.keys.active, start, end)
         elif state == "delayed":
             ids = await self.redis.zrange(self.keys.delayed, start, end)
+        elif state == "waiting-children":
+            ids = await self.redis.zrange(self.keys.waiting_children, start, end)
         elif state in ("completed", "failed"):
             ids = await self.redis.zrevrange(getattr(self.keys, state), start, end)
         else:
             raise ValueError(f"unknown state: {state}")
+        return await self._hydrate_ids(_str_list(ids))
+
+    async def _hydrate_ids(self, ids: list[str]) -> list[Job]:
+        """Load a list of job ids into Jobs in one pipelined round trip (one
+        HGETALL per id, not one call per id). Ids whose hash has vanished are
+        skipped. The shared tail of every id-list listing (get_jobs, roots).
+        """
         if not ids:
             return []
-        # Hydrate the whole page in one round trip instead of one HGETALL per job.
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
         for job_id in ids:
-            pipe.hgetall(self.keys.job(cast("str", job_id)))
+            pipe.hgetall(self.keys.job(job_id))
         hashes = await pipe.execute()
-        return [
-            Job.from_hash(cast("str", jid), h) for jid, h in zip(ids, hashes, strict=False) if h
-        ]
+        return [Job.from_hash(jid, h) for jid, h in zip(ids, hashes, strict=False) if h]
 
-    async def retry_job(self, job_id: str) -> bool:
-        """Move a failed job back to the queue for another attempt."""
-        res = await self._retry_job(
-            keys=[
-                self.keys.failed,
-                self.keys.prioritized,
-                self.keys.marker,
-                self.keys.job(job_id),
-                self.keys.pc,
-            ],
-            args=[job_id],
+    def _roots_zset(self, state: JobState) -> tuple[str, bool]:
+        """Map a ZSET-backed state to (key, newest_first) for the roots diff.
+        `active` is a LIST and is handled separately by the caller.
+        """
+        if state in ("wait", "prioritized"):
+            return self.keys.prioritized, False
+        if state == "delayed":
+            return self.keys.delayed, False
+        if state == "waiting-children":
+            return self.keys.waiting_children, False
+        if state in ("completed", "failed"):
+            return getattr(self.keys, state), True  # finished states read newest-first
+        raise ValueError(f"unknown state: {state}")
+
+    async def get_jobs_roots(
+        self, state: JobState, start: int = 0, end: int = 20
+    ) -> tuple[int, list[Job]]:
+        """Page through the ROOT jobs of a state - flow children (any job with a
+        parentId) are excluded, since a root-first dashboard shows them only in
+        the parent's tree - and return (exact total roots, hydrated page).
+
+        Roots-only and unbounded: paging deep needs no scan cap. `start`/`end`
+        are inclusive like get_jobs(); `end < 0` means "to the end". The ZSET
+        states diff against the children index in one atomic script (order
+        preserved); `active` is a small LIST, filtered in Python.
+        """
+        if state == "active":
+            ids = _str_list(await self.redis.lrange(self.keys.active, 0, -1))
+            roots = [j for j in await self._hydrate_ids(ids) if not j.parent_id]
+            stop = None if end < 0 else end + 1
+            return len(roots), roots[start:stop]
+        zset, newest = self._roots_zset(state)
+        total, ids = await self._list_roots(
+            keys=[zset, self.keys.children, self.keys.roots_scratch],
+            args=[start, end, 1 if newest else 0],
         )
-        return bool(res)
+        return int(total), await self._hydrate_ids(_str_list(ids))
 
-    async def remove_job(self, job_id: str) -> bool:
-        """Delete a job from every state and drop its hash."""
-        res = await self._remove_job(
+    async def roots_counts(self) -> dict[str, int]:
+        """Exact roots-only count per state - the root-first counterpart of
+        counts(). One atomic script diffs each state set against the children
+        index (`active`, a LIST, is counted by membership). `wait` is the
+        prioritized set; `waiting-children` is the parked flow parents (each a
+        root unless itself nested).
+        """
+        res = await self._roots_counts_script(
             keys=[
                 self.keys.prioritized,
-                self.keys.active,
                 self.keys.delayed,
                 self.keys.completed,
                 self.keys.failed,
-                self.keys.job(job_id),
+                self.keys.waiting_children,
+                self.keys.active,
+                self.keys.children,
+                self.keys.roots_scratch,
             ],
-            args=[job_id],
         )
+        wait, delayed, completed, failed, waiting_children, active = (int(x) for x in res)
+        return {
+            "wait": wait,
+            "active": active,
+            "delayed": delayed,
+            "completed": completed,
+            "failed": failed,
+            "waiting-children": waiting_children,
+        }
+
+    def _retry_job_keys(self, job_id: str) -> list[str]:
+        """Build the six KEYS the RETRY_JOB script takes - one definition so
+        retry_job, retry_all_failed and retry_flow can never drift apart.
+        """
+        return [
+            self.keys.failed,
+            self.keys.prioritized,
+            self.keys.marker,
+            self.keys.job(job_id),
+            self.keys.pc,
+            self.keys.base,
+        ]
+
+    async def retry_job(self, job_id: str) -> bool:
+        """Move a failed job back to the queue for another attempt.
+
+        Flow-aware: a failed flow parent whose children haven't all settled
+        re-parks in `waiting-children` instead of running with partial results;
+        a retried child re-joins its parked parent's barrier. Retrying parent
+        and children in any order (retry_all_failed does) recovers the flow.
+        """
+        res = await self._retry_job(keys=self._retry_job_keys(job_id), args=[job_id, _now_ms()])
+        return bool(res)
+
+    def _remove_job_keys(self) -> list[str]:
+        """Build the seven KEYS the REMOVE_JOB script takes (every state set plus
+        the base; the job id rides in as an ARGV) - one definition so remove_job
+        and clean can't drift apart.
+        """
+        return [
+            self.keys.prioritized,
+            self.keys.active,
+            self.keys.delayed,
+            self.keys.completed,
+            self.keys.failed,
+            self.keys.waiting_children,
+            self.keys.base,
+        ]
+
+    async def remove_job(self, job_id: str) -> bool:
+        """Delete a job from every state and drop its hash.
+
+        A flow parent takes its whole subtree with it (children included,
+        even mid-flight); removing a pending child releases its parent when
+        nothing else is left to wait for.
+        """
+        res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id])
         return bool(res)
 
     async def promote_job(self, job_id: str) -> bool:
@@ -712,6 +988,8 @@ class Queue:
             return _str_list(await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
+        if state == "waiting-children":
+            return _str_list(await self.redis.zrange(self.keys.waiting_children, 0, limit - 1))
         if state in ("delayed", "completed", "failed"):
             zset = getattr(self.keys, state)
             if newest and state in ("completed", "failed"):
@@ -751,18 +1029,51 @@ class Queue:
         if not ids:
             return 0
         sha = await self.redis.script_load(scripts.RETRY_JOB)  # ensure loaded for EVALSHA
+        now = _now_ms()
         pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:
-            pipe.evalsha(
-                sha,
-                5,
-                self.keys.failed,
-                self.keys.prioritized,
-                self.keys.marker,
-                self.keys.job(job_id),
-                self.keys.pc,
-                job_id,
-            )
+            pipe.evalsha(sha, 6, *self._retry_job_keys(job_id), job_id, now)
+        res = await pipe.execute()
+        return sum(1 for r in res if r)
+
+    async def _subtree_ids(self, root_id: str) -> list[str]:
+        """Every job id in a flow's subtree, root first (breadth-first, unbounded
+        unlike get_flow's display depth). One pipelined round trip per level;
+        bounded by the flow's node cap. The `children` hash field is the static
+        full child list, so a fully-failed flow is still walkable.
+        """
+        ids: list[str] = []
+        level = [root_id]
+        while level:
+            ids.extend(level)
+            pipe = self.redis.pipeline(transaction=False)  # read fan-out per level
+            for jid in level:
+                pipe.hget(self.keys.job(jid), "children")
+            level = [
+                cid for raw in await pipe.execute() for cid in (json.loads(raw) if raw else [])
+            ]
+        return ids
+
+    async def retry_flow(self, parent_id: str) -> int:
+        """Re-drive a whole failed flow: retry every failed job in the parent's
+        subtree (the parent and all its descendants) in one call. Returns how
+        many jobs were actually retried.
+
+        Order is handled for you: the parent is retried first, so a parent that
+        failed eagerly re-parks its barrier before its failed children re-join
+        it - the flow converges back to running. Completed children are left
+        untouched (their collected results survive); non-failed nodes are a
+        no-op, so this also retries just the failed children of an in-flight
+        flow. See `retry_job` for the single-job semantics this builds on.
+        """
+        ids = await self._subtree_ids(parent_id)
+        if not ids:
+            return 0
+        sha = await self.redis.script_load(scripts.RETRY_JOB)  # ensure loaded for EVALSHA
+        now = _now_ms()
+        pipe = self.redis.pipeline(transaction=False)
+        for job_id in ids:  # root-first: a re-parked parent is ready when its children retry
+            pipe.evalsha(sha, 6, *self._retry_job_keys(job_id), job_id, now)
         res = await pipe.execute()
         return sum(1 for r in res if r)
 
@@ -770,6 +1081,10 @@ class Queue:
         """Remove every job in a state (up to `limit`, oldest first - when the
         limit truncates, old history goes before recent results). Returns how
         many were removed.
+
+        Removing a flow parent removes its whole subtree, so
+        clean("waiting-children") cancels every parked flow outright - children
+        included, even ones currently running.
 
         Pipelines the per-job removals - one round trip per batch, not one per job -
         so clearing a large state stays fast (thousands of jobs in well under a second).
@@ -780,17 +1095,7 @@ class Queue:
         sha = await self.redis.script_load(scripts.REMOVE_JOB)  # ensure loaded for EVALSHA
         pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:
-            pipe.evalsha(
-                sha,
-                6,
-                self.keys.prioritized,
-                self.keys.active,
-                self.keys.delayed,
-                self.keys.completed,
-                self.keys.failed,
-                self.keys.job(job_id),
-                job_id,
-            )
+            pipe.evalsha(sha, 7, *self._remove_job_keys(), job_id)
         await pipe.execute()
         return len(ids)
 

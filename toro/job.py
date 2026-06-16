@@ -9,7 +9,9 @@ from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast
 from redis.asyncio import Redis
 
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
-JobState = Literal["wait", "active", "delayed", "completed", "failed"]
+# `waiting-children` is the flow-parent park: enqueued, but runnable only once
+# every child has settled.
+JobState = Literal["wait", "active", "delayed", "completed", "failed", "waiting-children"]
 
 
 class BackoffOpts(TypedDict, total=False):
@@ -93,6 +95,15 @@ class JobOptions:
         return (-1, -1)
 
 
+def decode_results(h: dict[str, str]) -> dict[str, Any]:
+    """Decode a flow parent's :results hash (child id -> returnvalue JSON).
+
+    The one decode used by both the processor-side (Job) and queue-side
+    (Queue) readers, so the two can never drift.
+    """
+    return {cid: json.loads(v) for cid, v in h.items()}
+
+
 @dataclass(frozen=True, slots=True)
 class JobContext:
     """Worker-side handles attached to a Job while its processor runs, so the handler
@@ -104,6 +115,8 @@ class JobContext:
     events_key: str
     logs_key: str
     job_id: str
+    results_key: str  # the flow aux keys, derived via Keys by the worker so
+    cfail_key: str  # the layout stays defined in exactly one place (keys.py)
 
 
 @dataclass
@@ -123,6 +136,8 @@ class Job:
     finished_on: int | None = None
     progress: Any = None
     stacktrace: str | None = None
+    parent_id: str | None = None  # set on flow children: the parent this job settles into
+    children_ids: list[str] | None = None  # set on flow parents: the full child id list
     # Back-reference to the owning Queue, set on jobs returned by Queue.add() so
     # producers can `await job.result()`. Not part of the job's data/identity.
     _queue: SupportsResult | None = field(default=None, repr=False, compare=False)
@@ -154,6 +169,26 @@ class Job:
             raise RuntimeError("log() is only available inside a worker processor")
         await self._ctx.redis.rpush(self._ctx.logs_key, message)
 
+    async def children_results(self) -> dict[str, Any]:
+        """Pull this flow parent's collected child results, keyed by child id.
+
+        The explicit pull (no implicit argument injection) - call it from the
+        parent's processor. Empty for jobs that aren't flow parents.
+        """
+        if self._ctx is None:
+            raise RuntimeError("children_results() is only available inside a worker processor")
+        return decode_results(
+            cast("dict[str, str]", await self._ctx.redis.hgetall(self._ctx.results_key))
+        )
+
+    async def failed_children(self) -> dict[str, str]:
+        """Pull child id -> failure reason for children failed under
+        ``on_fail="continue"``. Empty when every child succeeded.
+        """
+        if self._ctx is None:
+            raise RuntimeError("failed_children() is only available inside a worker processor")
+        return cast("dict[str, str]", await self._ctx.redis.hgetall(self._ctx.cfail_key))
+
     @classmethod
     def from_hash(cls, job_id: str, h: dict[str, str]) -> Job:
         """Build a Job from a decoded Redis hash (str keys/values)."""
@@ -171,4 +206,6 @@ class Job:
             finished_on=int(h["finishedOn"]) if h.get("finishedOn") else None,
             progress=json.loads(h["progress"]) if h.get("progress") else None,
             stacktrace=h.get("stacktrace"),
+            parent_id=h.get("parentId"),
+            children_ids=json.loads(h["children"]) if h.get("children") else None,
         )

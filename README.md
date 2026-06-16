@@ -44,6 +44,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Enqueue** | delayed jobs, global **priorities** (FIFO within a band) |
 | **Retries** | fixed or exponential **backoff**, capped attempts |
 | **Schedules** | repeatable **cron** and fixed-interval (`every`) jobs |
+| **Flows** | parent/child job trees: fan-out/fan-in, failure policies, flow-aware retry |
 | **Rate limiting** | queue-wide token bucket shared across all workers |
 | **Dedup** | custom (idempotent) job ids + a throttle window (`{id, ttl}`) |
 | **Auto-removal** | keep the last N and/or finished-within-age completed/failed |
@@ -86,6 +87,11 @@ await queue.add("charge", data, job_id="order-1234")
 # A repeatable schedule (cron or every-N-ms); "run now" with trigger_scheduler
 await queue.add_scheduler("nightly-rollup", cron="0 0 * * *")
 
+# A flow: children run first (fan-out), the parent runs on their results (fan-in)
+from toro import FlowChild as c
+report = await queue.add_flow("report", {"q": 3},
+                              children=[c("fetch", {"shard": i}) for i in range(3)])
+
 # Queue-wide rate limit: at most 100 jobs / second across every worker
 worker = Worker("emails", process, rate_limit={"max": 100, "duration": 1000})
 
@@ -93,6 +99,15 @@ worker = Worker("emails", process, rate_limit={"max": 100, "duration": 1000})
 job = await queue.add("resize", {"src": "a.png"})
 print(await job.result(timeout=30))
 ```
+
+## Flows
+
+A flow enqueues a parent and its children as one atomic tree. The children run
+first (fan-out, nested arbitrarily); the parent parks until every child has
+settled, then runs and reads their results (fan-in). One primitive covers
+fan-out/fan-in and chained steps, with per-child failure policies and
+flow-aware retry that recovers a whole failed flow in one shot. Full guide:
+[docs/flows.md](docs/flows.md).
 
 ## Develop
 

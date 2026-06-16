@@ -4,7 +4,7 @@ Reference docs for how toro works. The [README](../README.md) is the quick start
 
 ## Pages
 
-- **[Concepts](concepts.md)** - the mental model: queues, workers, jobs, the five
+- **[Concepts](concepts.md)** - the mental model: queues, workers, jobs, the six
   job states, and the difference between *workers* and *slots*.
 - **[Data model](data-model.md)** - the exact Redis keys a queue uses and what
   each one stores.
@@ -16,7 +16,14 @@ Reference docs for how toro works. The [README](../README.md) is the quick start
   rate limiting, and graceful shutdown.
 - **[Scheduling](scheduling.md)** - repeatable and cron jobs, and how each
   occurrence schedules the next.
+- **[Flows](flows.md)** - parent/child job trees: fan-out/fan-in, failure
+  policies, flow-aware retry and removal.
 - **[Architecture](architecture.md)** - the atomic-Lua core and the design
   decisions behind the queue.
 - **[Security](security.md)** - what toro guarantees (JSON-only, no dynamic
   dispatch, no string-built commands) and what you own (Redis access, secrets).
+
+## Design notes
+
+- **[Flows (design)](flows-design.md)** - the decisions and landscape lessons
+  behind the flows feature.

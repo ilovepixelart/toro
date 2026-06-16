@@ -32,7 +32,9 @@ per interval, not once per worker:
 
 1. **Sweep**: for every id in the `stalled` set whose lock has *expired*, remove
    it from `active` and decide its fate: if its `stalledCounter` exceeds
-   `max_stalled_count` (default 1) it terminally fails with
+   `max_stalled_count` (default 1) it terminally fails (and, if it was a flow
+   child, the same sweep settles its parent per its `on_fail` policy - a dead
+   worker can't park a flow forever; see [Flows](flows.md)) with
    `"job stalled more than allowable limit"`; otherwise it goes back into the
    prioritized set at its stored priority and will run again.
 2. **Mark**: every id currently in `active` is written to the `stalled` set,

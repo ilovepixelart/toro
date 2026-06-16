@@ -94,6 +94,25 @@ async def q():
     await queue.close()
 
 
+@pytest.fixture(autouse=True)
+def _fast_idle_polling(monkeypatch):
+    """Idle workers block on BZPOPMIN for `block_timeout` (default 5s) before
+    re-polling, so a test that starts a worker pays several of those 5s waits
+    plus the shutdown drain - ~20s per worker test, ~6min for the suite. The
+    timeout is only the idle poll cadence (the marker still wakes a worker the
+    instant work arrives, and the atomic claim is unchanged), so shrinking it in
+    tests is purely a speed knob, not a behaviour change. A test that needs a
+    specific cadence still passes its own block_timeout (setdefault won't clobber).
+    """
+    orig = Worker.__init__
+
+    def faster(self, *args, **kw):
+        kw.setdefault("block_timeout", 0.05)
+        orig(self, *args, **kw)
+
+    monkeypatch.setattr(Worker, "__init__", faster)
+
+
 @asynccontextmanager
 async def _running_worker(queue: Queue, processor, **kw):
     worker = Worker(queue.name, processor, prefix=PREFIX, **kw)

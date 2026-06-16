@@ -34,6 +34,17 @@ async def handle(job):
 
 `update_progress` takes a number or any JSON value; dashboards render it live.
 
+A flow parent's processor pulls what its children produced (both helpers are
+processor-only and raise `RuntimeError` elsewhere - use the `Queue`-side
+equivalents outside a worker):
+
+```python
+results = await job.children_results()   # {child_id: returnvalue}
+failures = await job.failed_children()   # {child_id: reason} (on_fail="continue")
+```
+
+See [Flows](flows.md) for the full model.
+
 ## Concurrency
 
 `concurrency=N` runs N processing loops ("slots") as `asyncio` tasks on one
