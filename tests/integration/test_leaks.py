@@ -5,6 +5,7 @@ background tasks. The fuzzer checks orphans mid-run; this pins the end state.
 """
 
 import asyncio
+import contextlib
 
 from toro import FlowChild as c  # noqa: N813
 from toro import Queue, Worker
@@ -142,7 +143,7 @@ async def test_stopped_worker_leaks_no_tasks(q, run_until):
     assert await run_until(lambda: len(done) >= 1, timeout=10)
     await worker.stop()
     task.cancel()
-    with __import__("contextlib").suppress(asyncio.CancelledError):
+    with contextlib.suppress(asyncio.CancelledError):
         await task
 
     # every background loop (stalled / heartbeat / promote) is done, none lingering
