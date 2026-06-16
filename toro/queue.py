@@ -828,6 +828,19 @@ class Queue:
             Job.from_hash(cast("str", jid), h) for jid, h in zip(ids, hashes, strict=False) if h
         ]
 
+    def _retry_job_keys(self, job_id: str) -> list[str]:
+        """Build the six KEYS the RETRY_JOB script takes - one definition so
+        retry_job, retry_all_failed and retry_flow can never drift apart.
+        """
+        return [
+            self.keys.failed,
+            self.keys.prioritized,
+            self.keys.marker,
+            self.keys.job(job_id),
+            self.keys.pc,
+            self.keys.base,
+        ]
+
     async def retry_job(self, job_id: str) -> bool:
         """Move a failed job back to the queue for another attempt.
 
@@ -836,18 +849,23 @@ class Queue:
         a retried child re-joins its parked parent's barrier. Retrying parent
         and children in any order (retry_all_failed does) recovers the flow.
         """
-        res = await self._retry_job(
-            keys=[
-                self.keys.failed,
-                self.keys.prioritized,
-                self.keys.marker,
-                self.keys.job(job_id),
-                self.keys.pc,
-                self.keys.base,
-            ],
-            args=[job_id, _now_ms()],
-        )
+        res = await self._retry_job(keys=self._retry_job_keys(job_id), args=[job_id, _now_ms()])
         return bool(res)
+
+    def _remove_job_keys(self) -> list[str]:
+        """Build the seven KEYS the REMOVE_JOB script takes (every state set plus
+        the base; the job id rides in as an ARGV) - one definition so remove_job
+        and clean can't drift apart.
+        """
+        return [
+            self.keys.prioritized,
+            self.keys.active,
+            self.keys.delayed,
+            self.keys.completed,
+            self.keys.failed,
+            self.keys.waiting_children,
+            self.keys.base,
+        ]
 
     async def remove_job(self, job_id: str) -> bool:
         """Delete a job from every state and drop its hash.
@@ -856,18 +874,7 @@ class Queue:
         even mid-flight); removing a pending child releases its parent when
         nothing else is left to wait for.
         """
-        res = await self._remove_job(
-            keys=[
-                self.keys.prioritized,
-                self.keys.active,
-                self.keys.delayed,
-                self.keys.completed,
-                self.keys.failed,
-                self.keys.waiting_children,
-                self.keys.base,
-            ],
-            args=[job_id],
-        )
+        res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id])
         return bool(res)
 
     async def promote_job(self, job_id: str) -> bool:
@@ -937,18 +944,7 @@ class Queue:
         now = _now_ms()
         pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:
-            pipe.evalsha(
-                sha,
-                6,
-                self.keys.failed,
-                self.keys.prioritized,
-                self.keys.marker,
-                self.keys.job(job_id),
-                self.keys.pc,
-                self.keys.base,
-                job_id,
-                now,
-            )
+            pipe.evalsha(sha, 6, *self._retry_job_keys(job_id), job_id, now)
         res = await pipe.execute()
         return sum(1 for r in res if r)
 
@@ -989,18 +985,7 @@ class Queue:
         now = _now_ms()
         pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:  # root-first: a re-parked parent is ready when its children retry
-            pipe.evalsha(
-                sha,
-                6,
-                self.keys.failed,
-                self.keys.prioritized,
-                self.keys.marker,
-                self.keys.job(job_id),
-                self.keys.pc,
-                self.keys.base,
-                job_id,
-                now,
-            )
+            pipe.evalsha(sha, 6, *self._retry_job_keys(job_id), job_id, now)
         res = await pipe.execute()
         return sum(1 for r in res if r)
 
@@ -1022,18 +1007,7 @@ class Queue:
         sha = await self.redis.script_load(scripts.REMOVE_JOB)  # ensure loaded for EVALSHA
         pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:
-            pipe.evalsha(
-                sha,
-                7,
-                self.keys.prioritized,
-                self.keys.active,
-                self.keys.delayed,
-                self.keys.completed,
-                self.keys.failed,
-                self.keys.waiting_children,
-                self.keys.base,
-                job_id,
-            )
+            pipe.evalsha(sha, 7, *self._remove_job_keys(), job_id)
         await pipe.execute()
         return len(ids)
 
