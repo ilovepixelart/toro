@@ -25,6 +25,9 @@ from toro.job import Job
 PREFIX = "torotest"
 
 _STATE_SETS = ("prioritized", "active", "delayed", "completed", "failed", "waiting_children")
+# counts() key -> the keys.py property backing it. They line up one-to-one except
+# `wait`: the waiting set is the priority-ordered zset, so its key is `prioritized`
+# (the state is named for what it means; the key for what it is).
 _COUNT_TO_SET = {
     "wait": "prioritized",
     "active": "active",
