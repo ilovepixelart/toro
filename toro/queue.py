@@ -932,11 +932,18 @@ class Queue:
     async def retry_job(self, job_id: str) -> bool:
         """Move a failed job back to the queue for another attempt.
 
-        Flow-aware: a failed flow parent whose children haven't all settled
-        re-parks in `waiting-children` instead of running with partial results;
-        a retried child re-joins its parked parent's barrier. Retrying parent
-        and children in any order (retry_all_failed does) recovers the flow.
+        Flow-aware: retrying a flow PARENT re-drives its whole failed subtree, not
+        the parent alone. The parent re-parks on every non-completed child
+        (completed children keep their collected results; failed and still-pending
+        ones stay in the barrier) and each failed descendant is re-queued root-first
+        - so a parent that failed because a child failed recovers in one call
+        instead of stranding on that still-failed child. A retried child re-joins
+        its parked parent's barrier. (retry_all_failed and retry_flow drive the
+        per-job script directly, so this convenience does not change them.)
         """
+        job = await self.get_job(job_id)
+        if job is not None and job.children_ids:  # a flow parent: recover the subtree
+            return await self.retry_flow(job_id) > 0
         res = await self._retry_job(keys=self._retry_job_keys(job_id), args=[job_id, _now_ms()])
         return bool(res)
 

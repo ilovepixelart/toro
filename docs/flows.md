@@ -83,16 +83,17 @@ the parent - removal cascades the subtree.
 
 Retry is flow-aware:
 
-- Retrying a failed **parent** re-arms its barrier: it goes back to
-  `waiting-children` until its unsettled children resolve (it will not run on
-  partial results).
+- Retrying a failed **parent** re-drives its whole failed subtree: it re-parks
+  on every non-completed child (completed children keep their collected results)
+  and re-queues the failed ones root-first, so the flow recovers in a single
+  call. It re-arms the barrier rather than running on partial results.
 - Retrying a failed **child** re-joins its parked parent's barrier and clears
   the stale entry from the parent's failure report.
 
 So `retry_all_failed()` - or the dashboard's *retry all* - recovers an entire
-failed flow in one shot, in any order. One pinned v1 edge: if the parent has
-already failed and you retry *only* the child, the child's later success does
-not resurrect the parent; retry the parent too (or use retry-all).
+failed flow in one shot, in any order. Retrying just a **child** of an
+already-failed parent still won't resurrect the parent on its own; retry the
+parent (which now pulls its failed children along) or use retry-all.
 
 To recover *one* flow without touching the rest of the queue, use
 `retry_flow(parent_id)`: it retries every failed job in that subtree, root
