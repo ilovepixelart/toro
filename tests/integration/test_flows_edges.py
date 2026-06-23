@@ -172,30 +172,28 @@ async def test_retry_failed_child_after_parent_failed(q, run_worker, run_until):
     assert (await q.get_job(parent.id)).state == "failed"
 
 
-async def test_retry_reparks_failed_parent_until_children_settle(q, run_worker, run_until):
-    fail = True
+async def test_retry_parent_reparks_and_redrives_its_failed_child(q, run_worker, run_until):
+    # retrying a parent re-arms the barrier AND re-drives its failed child, but the
+    # parent must still wait for that child - never run on partial results.
+    async def boom(job):
+        raise RuntimeError("boom")
 
-    async def proc(job):
-        if job.name == "bad" and fail:
-            raise RuntimeError("boom")
+    parent = await q.add_flow("report", {}, children=[c("bad", {})])
+    async with run_worker(q, boom):  # fail the flow, then the worker exits
+        assert await run_until(_count_is(q, "failed", 2))  # child + parent
+
+    # retry the PARENT only; with no worker running we can inspect the re-armed state
+    assert await q.retry_job(parent.id)
+    cid = (await q.get_flow(parent.id))["children"][0]["job"].id
+    assert (await q.get_job(parent.id)).state == "waiting-children"  # re-parked, not run
+    assert (await q.get_job(cid)).state == "wait"  # the failed child was re-driven too
+    assert await _count(q, "completed") == 0  # no partial run
+
+    async def fixed(job):
         return "fixed" if job.name == "bad" else "report-ran"
 
-    async with run_worker(q, proc):
-        parent = await q.add_flow("report", {}, children=[c("bad", {})])
-        assert await run_until(_count_is(q, "failed", 2))
-
-        # retrying the parent re-arms the barrier - it must NOT run with
-        # partial results while its failed child is unsettled
-        assert await q.retry_job(parent.id)
-        assert (await q.get_job(parent.id)).state == "waiting-children"
-        assert await _count(q, "completed") == 0
-
-        # retrying the child completes it, which releases the re-parked parent
-        fail = False
-        cid = (await q.get_flow(parent.id))["children"][0]["job"].id
-        assert await q.retry_job(cid)
+    async with run_worker(q, fixed):  # the re-driven child completes, releasing the parent
         assert await run_until(_count_is(q, "completed", 2))
-
     assert (await q.get_job(parent.id)).returnvalue == "report-ran"
 
 
@@ -618,6 +616,31 @@ async def test_retry_flow_recovers_a_whole_failed_flow(q, run_worker, run_until)
         assert await run_until(_count_is(q, "completed", 3))
 
     assert (await q.get_job(parent.id)).returnvalue == ["fixed", "fixed"]
+
+
+async def test_retry_parent_recovers_the_whole_flow(q, run_worker, run_until):
+    # retrying a PARENT directly re-drives its failed children too, so a flow that
+    # failed on a child recovers in one call instead of stranding on it.
+    fail = True
+
+    async def proc(job):
+        if job.name == "bad":
+            if fail:
+                raise RuntimeError("boom")
+            return "fixed"
+        if job.name == "ok":
+            return "ok-ran"
+        return "report-ran"  # the parent
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("ok", {}), c("bad", {})])
+        assert await run_until(_count_is(q, "failed", 2))  # the bad child + the parent
+
+        fail = False
+        assert await q.retry_job(parent.id)  # parent only - the child rides along
+        assert await run_until(_count_is(q, "completed", 3))  # both children + parent
+
+    assert (await q.get_job(parent.id)).state == "completed"
 
 
 async def test_retry_flow_leaves_completed_children_untouched(q, run_worker, run_until):

@@ -108,7 +108,8 @@ There is deliberately **no "wait indefinitely" option** (lesson 3). Retries
 still happen first: "terminally fails" means after the child's own `attempts`
 are exhausted (or it stalls past `max_stalled_count`). A child retried to
 success *after* its parent already failed does not resurrect the parent
-(documented, v1); retrying the parent re-arms its barrier instead.
+(documented, v1); retrying the parent re-arms its barrier and pulls its
+failed children along instead.
 
 ### Data model
 
@@ -165,16 +166,19 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
   parent's deps (and releases the parent if it was the last). Settle writes
   are guarded by a parent-exists check so a retention-trimmed parent can't
   get orphan keys recreated by late siblings.
-- **Retry is flow-aware**: a failed parent with unsettled deps re-parks in
-  `waiting-children`; a retried child re-joins a parked parent's barrier and
-  clears its stale `:cfail` entry. `retry_all_failed()` therefore recovers a
-  whole flow in any order.
+- **Retry is flow-aware**: at the script level a failed parent with unsettled
+  deps re-parks in `waiting-children`, and a retried child re-joins a parked
+  parent's barrier (clearing its stale `:cfail` entry). On top of that,
+  `retry_job(parent)` re-drives the whole failed subtree (delegating to
+  `retry_flow`), so `retry_all_failed()` and a single parent retry both recover
+  a whole flow in any order.
 
 ### Edge cases pinned down (each has a test)
 
 - **Parent retries**: a released parent is a normal job; its own
-  `attempts`/`backoff` apply. Children are not re-run on parent retry -
-  results are already in `:results`.
+  `attempts`/`backoff` apply. `retry_job(parent)` re-drives the subtree's
+  *failed* children too (root-first); completed children are not re-run -
+  their results are already in `:results`.
 - **`remove_on_complete` on children**: allowed - the result is copied into
   the parent's `:results` at completion, so the child hash is free to go.
   Routine `clean("completed")` likewise never touches a pending parent's
