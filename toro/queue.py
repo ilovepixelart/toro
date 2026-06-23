@@ -940,6 +940,12 @@ class Queue:
         instead of stranding on that still-failed child. A retried child re-joins
         its parked parent's barrier. (retry_all_failed and retry_flow drive the
         per-job script directly, so this convenience does not change them.)
+
+        The parent path keys off being a flow parent, not off being failed: called
+        on a parent that is not itself failed (e.g. still in-flight in
+        `waiting-children` with a `continue`-failed child), it re-drives the
+        subtree's failed nodes instead of being a no-op as it is for a non-failed
+        plain job. Pass a leaf child id to retry just that one job.
         """
         job = await self.get_job(job_id)
         if job is not None and job.children_ids:  # a flow parent: recover the subtree

@@ -91,7 +91,7 @@ waiting; only the terminal outcome resolves the call.
 
 | Call | Does |
 |---|---|
-| `await queue.retry_job(job_id)` | Move one failed job back to the queue. Flow-aware: a failed flow parent re-parks until its children settle; a retried child re-joins its parked parent's barrier ([Flows](flows.md)). |
+| `await queue.retry_job(job_id)` | Move one failed job back to the queue. Flow-aware: retrying a flow parent re-drives its whole failed subtree (failed children pulled along, completed ones kept); a retried child re-joins its parked parent's barrier ([Flows](flows.md)). |
 | `await queue.retry_all_failed(limit=1000)` | Re-queue every failed job (pipelined, one round trip per batch); returns how many were retried. |
 | `await queue.promote_job(job_id)` | Run a delayed job now. |
 | `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. Removing a flow parent removes its whole subtree - children included, even running ones. |
