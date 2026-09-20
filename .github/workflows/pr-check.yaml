@@ -41,13 +41,13 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0          # full history improves Sonar new-code/blame relevancy
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.2.0
+        uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -72,7 +72,7 @@ jobs:
       # Config is passed inline; there is no sonar-project.properties.
       - name: SonarCloud scan
         if: matrix.python-version == '3.13' && env.SONAR_TOKEN
-        uses: SonarSource/sonarqube-scan-action@v8.2.0
+        uses: SonarSource/sonarqube-scan-action@v8.2.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
