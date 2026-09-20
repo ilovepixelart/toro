@@ -106,7 +106,6 @@ end
 -- the pop, so a capped claim touches nothing: no put-back, no rate-limit token
 -- spent. Only MOVE_TO_ACTIVE can actually be refused here: a finish script LREMs
 -- its own job before it fetches, so its claim is a swap that cannot raise occupancy.
--- A missing cap is an error, not "no cap": a limit must never fail open.
 local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
                            base, pcKey, metaKey, token, lockMs, now,
                            rlKey, rlMax, rlDuration, cap)
@@ -133,6 +132,14 @@ local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
     redis.call("ZADD", markerKey, 0, "0")
   end
   return lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
+end
+-- A missing cap is an error, not "no cap": a limit must never fail open. Callers
+-- read it BEFORE their first write: Redis does not roll a script back, so an error
+-- raised after a finish has committed would leave that commit standing.
+local function requireCap(raw)
+  local cap = tonumber(raw)
+  if cap == nil then error("missing global concurrency cap argument") end
+  return cap
 end
 -- A slot in `active` was freed WITHOUT a claim (a draining worker's finish, a
 -- stalled job failed for good). Under a global concurrency cap a worker may be
@@ -427,7 +434,7 @@ MOVE_TO_ACTIVE = (
     + """
 return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7],
                    ARGV[1], tonumber(ARGV[2]), ARGV[3],
-                   KEYS[8], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]))
+                   KEYS[8], tonumber(ARGV[4]), tonumber(ARGV[5]), requireCap(ARGV[6]))
 """
 )
 
@@ -457,6 +464,8 @@ return 0
 MOVE_TO_COMPLETED = (
     _LIB
     + """
+local cap = 0
+if ARGV[5] == "1" then cap = requireCap(ARGV[12]) end
 if redis.call("GET", KEYS[4]) ~= ARGV[4] then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
@@ -483,8 +492,7 @@ redis.call("PUBLISH", KEYS[10], cjson.encode(completedMsg))
 if ARGV[5] == "1" then
   local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                           ARGV[4], tonumber(ARGV[6]), ARGV[3],
-                          KEYS[12], tonumber(ARGV[9]), tonumber(ARGV[10]),
-                          tonumber(ARGV[12]))
+                          KEYS[12], tonumber(ARGV[9]), tonumber(ARGV[10]), cap)
   if nxt then
     if nxt[1] == "__rl__" then
       redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
@@ -513,6 +521,8 @@ return {1}
 MOVE_TO_FAILED = (
     _LIB
     + """
+local cap = 0
+if ARGV[8] == "1" then cap = requireCap(ARGV[15]) end
 if redis.call("GET", KEYS[6]) ~= ARGV[7] then return -2 end
 redis.call("DEL", KEYS[6])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
@@ -554,8 +564,7 @@ end
 if ARGV[8] == "1" then
   local nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
                           ARGV[7], tonumber(ARGV[9]), ARGV[3],
-                          KEYS[13], tonumber(ARGV[12]), tonumber(ARGV[13]),
-                          tonumber(ARGV[15]))
+                          KEYS[13], tonumber(ARGV[12]), tonumber(ARGV[13]), cap)
   if nxt then
     if nxt[1] == "__rl__" then
       redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check

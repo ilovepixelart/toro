@@ -423,6 +423,16 @@ class Worker:
                 renewer.cancel()
         return nxt
 
+    async def _finish_lost(self, job_id: str) -> None:
+        """Our finish committed nothing: the job was taken over or removed while we
+        ran it. Its place in `active` was freed back then, and a removal wakes no one
+        because the processor may still be running. It has ended now, so say there
+        may be work: under a global concurrency cap a worker can be parked with jobs
+        waiting, and nothing else would tell it this slot is really free.
+        """
+        self._emit("lock-lost", job_id)
+        await self.redis.zadd(self.keys.marker, {"0": 0})
+
     async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_completed(
             keys=[
@@ -454,7 +464,7 @@ class Worker:
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
-            self._emit("lock-lost", job.id)
+            await self._finish_lost(job.id)
             return None
         job.returnvalue = result
         self._emit("completed", job, result)
@@ -495,7 +505,7 @@ class Worker:
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
-            self._emit("lock-lost", job.id)
+            await self._finish_lost(job.id)
             return None
         job.failed_reason = str(exc)
         self._emit("failed" if res[0] == scripts.OUTCOME_FAILED else "retrying", job, exc)

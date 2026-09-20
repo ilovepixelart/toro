@@ -27,8 +27,10 @@ worker crash.
   fetch after a finish is a swap: it cannot raise occupancy. Only
   `MOVE_TO_ACTIVE` can, so the safety of the cap rests on that one path. The
   finish scripts carry the cap so `acquireNext` knows when the queue is full.
-- **Fails closed.** A caller that omits the cap argument gets a script error,
-  not a claim that ignores the limit. The option is normalized with `int()`, so
+- **Fails closed, before any write.** A caller that omits the cap argument gets
+  a script error, not a claim that ignores the limit. Every script validates
+  the cap before its first write: Redis does not roll a script back, so an
+  error raised after a finish had committed would leave that commit standing. The option is normalized with `int()`, so
   an int subclass cannot reach Lua as an unreadable repr.
 - **No counter.** Occupancy is read from the `active` list itself, so there is
   nothing to leak: every existing exit from `active` (complete, fail, stalled
@@ -37,14 +39,18 @@ worker crash.
   pop-and-put-back, no rate-limit token spent, no attempt consumed.
 - **Wakeup.** A capped worker parks on the marker exactly like a paused one.
   `acquireNext` re-arms the marker after a claim only while a slot is still
-  free, so a full queue never wakes a worker just to turn it away. Two paths
+  free, so a claim that fills the last slot does not wake a worker just to
+  turn it away. A finish that re-enqueues before it fetches (an immediate
+  retry, a flow child releasing its parent) still arms the marker through
+  `enqueue`, as every `add` does: one refused wake each. Two paths
   free a slot without claiming and arm the marker when jobs are waiting: a
   finish with `fetch=0` (a draining worker), and a stalled job that fails
   terminally. A draining worker's own parked loop can pop that wake first, so
   a loop that pops a marker while shutting down hands it on before it exits.
   Removal of an active job deliberately does not wake: its processor may still
-  be running, so an eager wake would exceed the real cap. The freed slot is
-  found at the next wake or idle re-poll.
+  be running, so an eager wake would exceed the real cap. When the processor
+  ends, its finish comes back lock-lost, and the worker arms the marker then:
+  the one moment it knows the slot is really free.
 - **Visibility.** The heartbeat record and `Queue.workers()` gain
   `global_concurrency` (0 when unset), which is what the dashboard needs to show
   the cap and derive "waiting on cap" (`active >= cap` with jobs waiting).
@@ -70,8 +76,9 @@ worker crash.
 | GC-005 | Unset (the default) leaves claim behavior and return shapes unchanged, and workers run up to their summed `concurrency`. The two release paths of GC-004 arm the marker whether or not a cap is set, which costs an uncapped queue at most one harmless wake. | `::test_unset_cap_is_unbounded` plus the existing integration suite green |
 | GC-006 | A non-positive or non-integer `global_concurrency` raises `ValueError` at construction. An int subclass (an `IntEnum`) is stored as a plain int and caps like one. | `tests/unit/test_worker_options.py::test_global_concurrency_validation`, `::test_global_concurrency_is_stored_as_a_plain_int`, `tests/integration/test_global_concurrency.py::test_int_subclass_cap_is_enforced` |
 | GC-007 | The heartbeat record and `Queue.workers()` expose `global_concurrency`. | `tests/integration/test_workers.py::test_presence_reports_global_concurrency` |
-| GC-008 | A claim that fills the last slot does not arm the marker, on the initial claim and on the fetch after both complete and fail. While a slot is free and jobs wait, it does. | `tests/integration/test_global_concurrency.py::test_full_cap_does_not_wake_a_parked_worker` |
-| GC-009 | A claim that omits the cap argument is a script error and claims nothing. | `::test_missing_cap_argument_is_an_error` |
+| GC-008 | The re-arm after a claim is skipped when that claim filled the last slot, on the initial claim and on the fetch after both complete and fail. While a slot is free and jobs wait, the marker is armed. A finish that re-enqueues before it fetches arms it regardless. | `tests/integration/test_global_concurrency.py::test_full_cap_does_not_wake_a_parked_worker` |
+| GC-009 | A claim that omits the cap argument is a script error and claims nothing. A finish that fetches without it errors before its first write: nothing is committed and the lock stands. | `::test_missing_cap_argument_is_an_error`, `::test_finish_with_a_missing_cap_commits_nothing` |
+| GC-010 | The slot of a removed active job is reused as soon as its processor ends, not at the next idle re-poll, and not before. | `::test_slot_of_a_removed_job_is_reused_once_its_processor_ends` |
 
 ## Out of scope
 
@@ -87,8 +94,11 @@ worker crash.
 - **The swap invariant.** The cap is safe only while `acquireNext` stays the
   sole writer to `active` and the finish scripts keep removing before they
   fetch. The fuzzer check in GC-001 is the tripwire.
-- **Mixed config.** Workers passing different caps each enforce their own.
-  Documented the same way `rate_limit` is.
+- **Mixed config.** Workers passing different caps each enforce their own, as
+  happens during any rollout that introduces or changes the cap. A finisher
+  refused by its own lower cap frees a slot without a wake, so a worker with
+  room can wait up to `block_timeout` for it. The delay is bounded by the idle
+  re-poll and ends with the rollout. Documented the same way `rate_limit` is.
 - **False stalls.** The cap bounds claimed jobs. A job reclaimed after a false
   stall can run twice, exactly as it can today, which briefly exceeds the cap
   in real work while `active` stays within it.
