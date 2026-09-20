@@ -44,6 +44,14 @@ worker crash.
   Unset, the claim path issues no extra commands. While saturated, each finish
   or add wakes one parked loop that is turned away by the guard: one cheap
   script call, no spin (the bounced loop does not re-arm the marker).
+  Measured across 3 processes with 6 jobs in flight: unset and
+  set-but-unreached both run about 9,200 jobs/s at 1.0 script calls per job
+  (the guard is free); saturated with 24 loops parked runs about 7,100 jobs/s at
+  2.0 calls per job. That 22% is the zero-work worst case. With 100 ms jobs a
+  saturated cap of 3 drained 60 jobs in 2.09 s against a 2.0 s optimum.
+- **Slots stick.** A finisher swaps its own slot, so under a full queue the
+  workers holding slots keep them and others can sit idle until a holder
+  drains, stops, or crashes.
 
 ## Acceptance clauses
 

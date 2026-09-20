@@ -106,6 +106,10 @@ N connections, an API that allows N requests in flight. A rate limit bounds job
 - There is no slot counter to leak. The cap counts the `active` list itself, so
   a crashed worker's slots come back when the stalled sweep recovers its jobs
   ([Reliability](reliability.md)).
+- Slots stick. A busy worker claims its next job in the same round trip that
+  finishes the last, so while the queue stays full the workers holding the slots
+  keep them, and another worker can sit idle. Slots move when a holder drains,
+  stops, or crashes.
 - A changed value takes effect as workers restart.
 
 ## Lifecycle events
