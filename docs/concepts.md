@@ -65,6 +65,10 @@ So `live` counts workers, `slots` counts concurrent capacity. With the default
 `concurrency=1` they happen to match; bump concurrency and slots climb while the
 worker count stays put.
 
+Slots are capacity, not a limit on the queue: every worker you add brings more.
+To bound how many jobs run at once queue-wide, whatever the slot total, set
+`global_concurrency` ([Processing](processing.md)).
+
 ```
 host (machine)
 └── process (pid)
