@@ -167,6 +167,12 @@ async def _release_by_drain_finish(holder: Worker, job_id: str, fields: dict[str
     await holder._finish_completed(Job.from_hash(job_id, fields), {"ok": 1})
 
 
+async def _release_by_drain_failure(holder: Worker, job_id: str, fields: dict[str, str]) -> None:
+    """The same drain, but the job fails for good. attempts=1, so there is no retry:
+    a retry would re-arm the marker through enqueue and hide a missing wake."""
+    await holder._finish_failed(Job.from_hash(job_id, fields), RuntimeError("boom"))
+
+
 async def _release_by_stalled_failure(holder: Worker, job_id: str, fields: dict[str, str]) -> None:
     """The holder is dead. Its lock runs out and the parked worker's own sweep fails
     the job for good (max_stalled_count=0), which frees the slot with no claim."""
@@ -176,6 +182,7 @@ async def _release_by_stalled_failure(holder: Worker, job_id: str, fields: dict[
     ("release", "holder_lock_ms", "sweep_ms"),
     [
         pytest.param(_release_by_drain_finish, 30_000, 0, id="drain_finish"),
+        pytest.param(_release_by_drain_failure, 30_000, 0, id="drain_failure"),
         pytest.param(_release_by_stalled_failure, 200, 200, id="stalled_failure"),
     ],
 )
