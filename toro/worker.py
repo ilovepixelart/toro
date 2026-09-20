@@ -33,6 +33,7 @@ from typing import Any, TypedDict, cast
 from redis.asyncio import Redis
 
 from . import scripts
+from ._replies import _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, connect, read_timeout
 from .job import Backoff, Job, JobContext, JobOptions
 from .keys import Keys
@@ -385,7 +386,7 @@ class Worker:
         fields = _pairs(res[0])
         if not fields:
             return None
-        return (res[1], fields)
+        return (str(res[1]), fields)
 
     async def _handle(
         self, loaded: tuple[str, dict[str, str]]
@@ -542,7 +543,7 @@ class Worker:
 
     def _next_from(self, res: Any) -> tuple[str, dict[str, str]] | None:
         if isinstance(res, (list, tuple)) and len(res) >= 3:
-            return (res[2], _pairs(res[1]))
+            return (str(res[2]), _pairs(res[1]))
         return None
 
     # ---- locks & recovery -------------------------------------------------
@@ -623,8 +624,8 @@ class Worker:
             ],
             args=[self.max_stalled_count, _now_ms(), throttle, scripts.METRICS_RETENTION_MS],
         )
-        failed = list(res[0]) if res else []
-        recovered = list(res[1]) if res and len(res) > 1 else []
+        failed = _str_list(res[0]) if res else []
+        recovered = _str_list(res[1]) if res and len(res) > 1 else []
         return failed, recovered
 
     def _backoff_delay(self, job: Job) -> int:

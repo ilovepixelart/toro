@@ -67,4 +67,5 @@ def read_timeout(client: aioredis.Redis) -> float | None:
     The factory is what a pool subclass overrides, and building the object opens
     nothing.
     """
-    return client.connection_pool.make_connection().socket_timeout
+    timeout = client.connection_pool.make_connection().socket_timeout
+    return None if timeout is None else float(timeout)

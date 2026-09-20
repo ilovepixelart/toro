@@ -57,10 +57,13 @@ package = true
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Ruff 0.16 formats Python blocks inside Markdown by default. The docs align
+# trailing comments by hand as teaching annotations, which a formatter flattens.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 # Strictest sensible baseline: enable everything, then opt out deliberately. The
-# ruff version is pinned (dev deps) so new rules can't surprise CI.
+# lockfile pins ruff, so new rules arrive only with a deliberate `uv lock --upgrade`.
 select = ["ALL"]
 ignore = [
     "COM812", "ISC001",            # conflict with the formatter (per Ruff docs)
@@ -75,6 +78,7 @@ ignore = [
     "PLR0913",                     # Worker/Queue are config constructors - many kwargs is fine
     "BLE001", "S110", "S112",      # deliberate best-effort excepts in worker/redis cleanup paths
     "TC001", "TC002", "TC003",     # prefer normal runtime imports over TYPE_CHECKING blocks
+    "CPY001",                      # the LICENSE file covers the repo; no per-file notices
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -113,6 +117,10 @@ python-version = "3.10"
 # Strictest ty: every rule, including the warn-by-default ones, fails the build.
 [tool.ty.rules]
 all = "error"
+# Off by default in ty, and unsound for this codebase. It treats `self._running`
+# as constant across an `await`, where stop() flips it from another task, and it
+# flags the runtime guards on option shapes decoded from JSON stored in Redis.
+redundant-condition-strict = "ignore"
 
 [tool.ty.src]
 include = ["toro"]

@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from . import scripts
+from ._replies import _hash_replies, _scored, _str_dict, _str_list
 from .connection import connect
 from .errors import JobFailedError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
@@ -24,21 +25,6 @@ from .scheduler import next_run, valid_cron
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _str_list(reply: Any) -> list[str]:
-    """Type a Redis list/zset reply (decode_responses is on) as list[str]."""
-    return cast("list[str]", reply)
-
-
-def _str_dict(reply: Any) -> dict[str, str]:
-    """Type a Redis hash reply (decode_responses is on) as dict[str, str]."""
-    return cast("dict[str, str]", reply)
-
-
-def _hash_replies(reply: Any) -> list[dict[str, str]]:
-    """Type a pipeline's list of hash replies as list[dict[str, str]]."""
-    return cast("list[dict[str, str]]", reply)
 
 
 class MetricsPoint(TypedDict):
@@ -556,10 +542,7 @@ class Queue:
 
     async def schedulers(self) -> list[dict[str, Any]]:
         """List active schedulers (for the dashboard)."""
-        entries = cast(
-            "list[tuple[str, float]]",
-            await self.redis.zrange(self.keys.repeat, 0, -1, withscores=True),
-        )
+        entries = _scored(await self.redis.zrange(self.keys.repeat, 0, -1, withscores=True))
         if not entries:
             return []
         pipe = self.redis.pipeline(transaction=False)  # read fan-out; no MULTI/EXEC needed
@@ -860,8 +843,11 @@ class Queue:
             return self.keys.delayed, False
         if state == "waiting-children":
             return self.keys.waiting_children, False
-        if state in ("completed", "failed"):
-            return getattr(self.keys, state), True  # finished states read newest-first
+        # finished states read newest-first
+        if state == "completed":
+            return self.keys.completed, True
+        if state == "failed":
+            return self.keys.failed, True
         raise ValueError(f"unknown state: {state}")
 
     async def get_jobs_roots(
