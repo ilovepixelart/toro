@@ -46,7 +46,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | Key | Type | Holds |
 |---|---|---|
 | `repeat:<schedulerId>` | HASH | A scheduler's template: `name`, `every`/`cron`, `data`, `opts`. |
-| `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, current jobs, processed/failed counts, state. |
+| `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, global concurrency cap, current jobs, processed/failed counts, state. |
 | `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail` (children), `children` (parents). |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |

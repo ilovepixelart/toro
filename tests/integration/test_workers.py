@@ -126,3 +126,16 @@ async def test_lost_worker_is_recorded_when_pruned(q):
     # the death record froze WHAT IT WAS RUNNING - the whole point of the post-mortem
     assert rec["current"] == ["210", "211"]
     assert rec["last_seen"] < rec["at"]  # last heartbeat vs when the sweep detected it
+
+
+async def test_presence_reports_global_concurrency(q, run_worker, run_until):
+    async def proc(job):
+        return "ok"
+
+    async with run_worker(q, proc, global_concurrency=3):
+        assert await run_until(lambda: q.workers())
+        assert (await q.workers())[0]["global_concurrency"] == 3
+
+    async with run_worker(q, proc):
+        assert await run_until(lambda: q.workers())
+        assert (await q.workers())[0]["global_concurrency"] == 0  # unset = no cap

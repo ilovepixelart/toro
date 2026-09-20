@@ -46,6 +46,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Schedules** | repeatable **cron** and fixed-interval (`every`) jobs |
 | **Flows** | parent/child job trees: fan-out/fan-in, failure policies, flow-aware retry |
 | **Rate limiting** | queue-wide token bucket shared across all workers |
+| **Global concurrency** | one cap on jobs active at once, across every worker process |
 | **Dedup** | custom (idempotent) job ids + a throttle window (`{id, ttl}`) |
 | **Auto-removal** | keep the last N and/or finished-within-age completed/failed |
 | **Reliability** | per-job locks, lock renewal, stalled-job recovery |

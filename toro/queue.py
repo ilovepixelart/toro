@@ -760,6 +760,7 @@ class Queue:
                     "pid": int(h.get("pid", 0)),
                     "queue": h.get("queue", self.name),
                     "concurrency": int(h.get("concurrency", 0)),
+                    "global_concurrency": int(h.get("global_concurrency", 0)),
                     "started": int(h.get("started", 0)),
                     "heartbeat": heartbeat,
                     "processed": int(h.get("processed", 0)),

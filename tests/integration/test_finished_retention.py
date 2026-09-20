@@ -53,7 +53,7 @@ async def test_age_trim_is_bounded_per_finish(q):
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[token, 30_000, int(time.time() * 1000), 0, 0],
+        args=[token, 30_000, int(time.time() * 1000), 0, 0, 0],
     )
     assert res and res[1] == job.id
     out = await complete(

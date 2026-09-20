@@ -105,6 +105,7 @@ class Worker:
         prefix: str = "toro",
         concurrency: int = 1,
         rate_limit: RateLimit | None = None,
+        global_concurrency: int | None = None,
         block_timeout: float = 5.0,
         lock_duration: int = 30000,
         lock_renew_time: int | None = None,
@@ -133,6 +134,18 @@ class Worker:
             raise ValueError("rate_limit needs {'max': positive, 'duration': positive ms}")
         self.rl_max = int(rate_limit["max"]) if rate_limit else 0
         self.rl_duration = int(rate_limit["duration"]) if rate_limit else 0
+        # Queue-wide cap on jobs active at once, across every worker process. Like
+        # rate_limit, all workers on a queue should pass the SAME value. bool is an
+        # int subclass, so it is rejected by name: True would silently mean 1.
+        if global_concurrency is not None and (
+            isinstance(global_concurrency, bool)
+            or not isinstance(global_concurrency, int)
+            or global_concurrency <= 0
+        ):
+            raise ValueError("global_concurrency needs a positive integer")
+        # int(): an int subclass (an IntEnum) would reach Redis as its repr, which
+        # Lua reads as no number at all.
+        self.global_concurrency = int(global_concurrency or 0)
         self.block_timeout = block_timeout
         self._pop_timeout = pop_timeout(read_timeout(self.redis), block_timeout)
         if self._pop_timeout < block_timeout:
@@ -256,6 +269,7 @@ class Worker:
                 "pid": os.getpid(),
                 "queue": self.name,
                 "concurrency": self.concurrency,
+                "global_concurrency": self.global_concurrency,
                 "started": self.started_at,
                 "heartbeat": now,
                 "processed": self._processed,
@@ -305,9 +319,14 @@ class Worker:
                 # The marker only wakes us; the real claim is the atomic
                 # MOVE_TO_ACTIVE below. A timeout (None) is fine - we still try
                 # to acquire, so a missed marker can never strand a job.
-                await self.redis.bzpopmin(self.keys.marker, self._pop_timeout)
+                woke = await self.redis.bzpopmin(self.keys.marker, self._pop_timeout)
                 if not self._running:
-                    break  # shutting down - don't claim a new job
+                    # Shutting down - don't claim a new job. A marker we popped was
+                    # a wake for a worker that still can, so hand it on: swallowed,
+                    # the work it signalled waits out someone's block_timeout.
+                    if woke:
+                        await self.redis.zadd(self.keys.marker, {"0": 0})
+                    break
                 loaded = await self._acquire()
                 # Keep processing as long as each finish hands us the next job. No
                 # `_running` check here: a job in hand is already claimed, and stop()
@@ -335,7 +354,14 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=[self.token, self.lock_duration, _now_ms(), self.rl_max, self.rl_duration],
+            args=[
+                self.token,
+                self.lock_duration,
+                _now_ms(),
+                self.rl_max,
+                self.rl_duration,
+                self.global_concurrency,
+            ],
         )
         if res and res[0] == scripts.RL_SENTINEL:
             await self._on_rate_limited(int(res[1]))
@@ -424,6 +450,7 @@ class Worker:
                 self.rl_max,
                 self.rl_duration,
                 scripts.METRICS_RETENTION_MS,
+                self.global_concurrency,
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
@@ -464,6 +491,7 @@ class Worker:
                 self.rl_max,
                 self.rl_duration,
                 scripts.METRICS_RETENTION_MS,
+                self.global_concurrency,
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel

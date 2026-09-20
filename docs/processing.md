@@ -72,6 +72,7 @@ per job.
 |---|---|---|
 | `concurrency` | 1 | Parallel slots in this worker. |
 | `rate_limit` | `None` | `{"max": N, "duration": ms}` - queue-wide token bucket (below). |
+| `global_concurrency` | `None` | Cap on jobs active at once across all workers on the queue (below). |
 | `block_timeout` | 5.0 s | How long an idle slot blocks waiting for a wakeup before re-checking. |
 | `lock_duration` / `lock_renew_time` / `renew_locks` | 30000 / half / `True` | The at-least-once lease - see [Reliability](reliability.md). |
 | `stalled_interval` / `max_stalled_count` | 30000 / 1 | The recovery sweep - same page. |
@@ -89,6 +90,31 @@ the token bucket lives in Redis, shared, so adding workers doesn't multiply the
 limit (give every worker the same config). When a claim hits the limit the job
 goes back untouched: no attempt is consumed, and the worker sleeps until a token
 frees (emitting a `rate-limited` event with the wait).
+
+## Global concurrency
+
+```python
+worker = Worker("exports", handle, concurrency=10, global_concurrency=3)
+```
+
+At most `global_concurrency` jobs are active at once across **all** workers on
+the queue, however many processes you run (give every worker the same value).
+`concurrency` sizes one worker; this caps the queue.
+
+Use it when the constraint is *occupancy*, not arrival rate: a database pool of
+N connections, an API that allows N requests in flight. A rate limit bounds job
+*starts*, so with long jobs it says nothing about how many run together.
+
+- A claim at the cap touches nothing: the job keeps its place, no attempt is
+  consumed, no rate-limit token is spent. The worker waits for a slot.
+- There is no slot counter to leak. The cap counts the `active` list itself, so
+  a crashed worker's slots come back when the stalled sweep recovers its jobs
+  ([Reliability](reliability.md)).
+- Slots stick. A busy worker claims its next job in the same round trip that
+  finishes the last, so while the queue stays full the workers holding the slots
+  keep them, and another worker can sit idle. Slots move when a holder drains,
+  stops, or crashes.
+- A changed value takes effect as workers restart.
 
 ## Lifecycle events
 
@@ -109,11 +135,11 @@ These are this worker's own hooks. Cross-process consumers (dashboards,
 ## Presence
 
 Every `heartbeat_interval` the worker flushes a presence record (host, pid,
-concurrency, what it's running, processed/failed counts, state). That powers the
-dashboard's workers view; a worker that misses heartbeats long enough is pruned
-and logged as a `lost` departure, while `stop()` flips it to a visible
-`stopping` state first and logs `stopped` - so the dashboard can tell a drain
-from a crash.
+concurrency, global concurrency cap, what it's running, processed/failed counts,
+state). That powers the dashboard's workers view; a worker that misses
+heartbeats long enough is pruned and logged as a `lost` departure, while
+`stop()` flips it to a visible `stopping` state first and logs `stopped` - so
+the dashboard can tell a drain from a crash.
 
 ## Shutdown
 

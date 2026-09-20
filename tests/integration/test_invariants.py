@@ -195,3 +195,73 @@ async def test_invariants_hold_under_random_ops(q, seed):
     await _check_invariants(q)
     settled = (await q.counts())["waiting-children"] == 0
     assert settled, "a flow never settled -> " + await _settle_diagnostic(q)
+
+
+# ---- the same fuzz under a global concurrency cap ----------------------------------
+# _op_process claims and finishes in one step, so `active` never holds more than one
+# job and a cap assertion over it would be vacuous. These ops hold claimed jobs open
+# and finish them later WITH fetch-next: the swap that lets the cap be enforced in
+# MOVE_TO_ACTIVE alone. If a finish script ever grew `active`, this is the tripwire.
+
+_CAP = 2
+
+
+def _hold(held: list[Job], loaded: tuple[str, dict[str, str]] | None) -> None:
+    if loaded is not None:
+        held.append(Job.from_hash(*loaded))
+
+
+async def _op_claim_hold(q, w, rng, ctr):
+    _hold(ctr["held"], await w._acquire())
+
+
+async def _op_finish_held(q, w, rng, ctr):
+    held = ctr["held"]
+    if not held:
+        return
+    job = held.pop(rng.randrange(len(held)))
+    if rng.random() < 0.7:
+        _hold(held, await w._finish_completed(job, {"ok": 1}))
+    else:
+        _hold(held, await w._finish_failed(job, RuntimeError("boom")))
+
+
+# _op_process is left out: with fetch-next on it would drop the chained job, which
+# would then sit in `active` forever and eat a slot.
+_CAP_OPS = [
+    _op_add,
+    _op_add,
+    _op_add_flow,
+    _op_claim_hold,
+    _op_claim_hold,
+    _op_finish_held,
+    _op_retry,
+    _op_remove,
+    _op_clean,
+    _op_promote,
+]
+
+
+@pytest.mark.parametrize("seed", range(12))
+async def test_cap_holds_under_random_ops(q, seed):
+    rng = random.Random(seed)  # noqa: S311 - a reproducible test fuzzer, not crypto
+    w = Worker(q.name, lambda j: None, prefix=PREFIX, connection=q.redis, global_concurrency=_CAP)
+    w._running = True  # finish with fetch-next, as a running worker does
+    ctr = {"j": 0, "held": []}
+    peak = 0
+
+    for _ in range(60):
+        await rng.choice(_CAP_OPS)(q, w, rng, ctr)
+        await _check_invariants(q)
+        active = await q.redis.llen(q.keys.active)
+        assert active <= _CAP, f"{active} active jobs under a cap of {_CAP}"
+        peak = max(peak, active)
+    assert peak == _CAP, "the run never reached the cap, so it proved nothing"
+
+    w._running = False  # finish without fetching, so the held slots really free up
+    for job in ctr["held"]:
+        await w._finish_completed(job, {"ok": 1})
+    await _recover_and_drain(q, w)
+    await _check_invariants(q)
+    settled = (await q.counts())["waiting-children"] == 0
+    assert settled, "a flow never settled -> " + await _settle_diagnostic(q)
