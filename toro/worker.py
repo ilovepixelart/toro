@@ -92,6 +92,7 @@ class Worker:
         prefix: str = "toro",
         concurrency: int = 1,
         rate_limit: RateLimit | None = None,
+        global_concurrency: int | None = None,
         block_timeout: float = 5.0,
         lock_duration: int = 30000,
         lock_renew_time: int | None = None,
@@ -118,6 +119,16 @@ class Worker:
             raise ValueError("rate_limit needs {'max': positive, 'duration': positive ms}")
         self.rl_max = int(rate_limit["max"]) if rate_limit else 0
         self.rl_duration = int(rate_limit["duration"]) if rate_limit else 0
+        # Queue-wide cap on jobs active at once, across every worker process. Like
+        # rate_limit, all workers on a queue should pass the SAME value. bool is an
+        # int subclass, so it is rejected by name: True would silently mean 1.
+        if global_concurrency is not None and (
+            isinstance(global_concurrency, bool)
+            or not isinstance(global_concurrency, int)
+            or global_concurrency <= 0
+        ):
+            raise ValueError("global_concurrency needs a positive integer")
+        self.global_concurrency = global_concurrency or 0
         self.block_timeout = block_timeout
 
         # Reliability knobs.
