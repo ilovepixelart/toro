@@ -309,8 +309,12 @@ class Worker:
                 if not self._running:
                     break  # shutting down - don't claim a new job
                 loaded = await self._acquire()
-                # Keep processing as long as each finish hands us the next job.
-                while loaded is not None and self._running:
+                # Keep processing as long as each finish hands us the next job. No
+                # `_running` check here: a job in hand is already claimed, and stop()
+                # can land during the very round trip that claimed it. Dropped, it
+                # would sit locked in `active` until the sweep. Shutdown ends the
+                # chain by itself: a stopping worker finishes with fetch=0.
+                while loaded is not None:
                     loaded = await self._handle(loaded)
             except asyncio.CancelledError:
                 raise
