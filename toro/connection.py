@@ -59,9 +59,9 @@ def connect(
 def read_timeout(client: aioredis.Redis) -> float | None:
     """Return the read timeout a connection from this client's pool will really use.
 
-    Read off a connection built from the pool's own class and kwargs, so the
-    library default counts: it is absent from ``connection_kwargs`` unless the
-    caller passed it. Building the object opens nothing.
+    Read off a connection from the pool's own factory, so the library default
+    counts: it is absent from ``connection_kwargs`` unless the caller passed it.
+    The factory is what a pool subclass overrides, and building the object opens
+    nothing.
     """
-    pool = client.connection_pool
-    return pool.connection_class(**pool.connection_kwargs).socket_timeout
+    return client.connection_pool.make_connection().socket_timeout
