@@ -423,6 +423,7 @@ class Worker:
                 self.rl_max,
                 self.rl_duration,
                 scripts.METRICS_RETENTION_MS,
+                self.global_concurrency,
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
@@ -463,6 +464,7 @@ class Worker:
                 self.rl_max,
                 self.rl_duration,
                 scripts.METRICS_RETENTION_MS,
+                self.global_concurrency,
             ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel

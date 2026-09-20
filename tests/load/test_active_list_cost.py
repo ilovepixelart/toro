@@ -60,7 +60,7 @@ async def test_finish_cost_grows_with_active_list_size(q, load_scale):
                     q.keys.meta_paused,
                     q.keys.limiter,
                 ],
-                args=[token, 30_000, int(time.time() * 1000), 0, 0],
+                args=[token, 30_000, int(time.time() * 1000), 0, 0, 0],
             )
             assert res and res[1] == job.id
             t0 = time.perf_counter()

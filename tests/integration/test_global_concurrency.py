@@ -7,8 +7,9 @@ import contextlib
 import enum
 
 import pytest
+from redis.exceptions import ResponseError
 
-from toro import Queue, Worker
+from toro import Queue, Worker, scripts
 from toro.job import Job
 
 PREFIX = "torotest"
@@ -276,3 +277,49 @@ async def test_draining_worker_passes_the_wake_on(q):
         await b.stop()
         ta.cancel()
         tb.cancel()
+
+
+async def test_full_cap_does_not_wake_a_parked_worker(q):
+    """A claim that fills the last slot must not arm the marker: a worker woken then
+    can only be turned away, one wasted script call per job. While a slot is still
+    free and jobs wait, the marker must be armed as ever."""
+    for i in range(5):
+        await q.add("job", {"i": i}, attempts=1)
+    w = Worker(q.name, _noop, prefix=PREFIX, global_concurrency=2)
+    w._running = True  # finish with fetch-next, as a running worker does
+
+    await q.redis.delete(q.keys.marker)
+    first = await w._acquire()  # 1 of 2 slots taken: one free, jobs waiting
+    assert await q.redis.zcard(q.keys.marker) == 1
+
+    await q.redis.delete(q.keys.marker)
+    second = await w._acquire()  # the cap is full now
+    assert await q.redis.zcard(q.keys.marker) == 0
+
+    # a finish swaps the slot: still full, still no wake (completed and failed paths)
+    assert await w._finish_completed(Job.from_hash(*first), {"ok": 1}) is not None
+    assert await q.redis.zcard(q.keys.marker) == 0
+    assert await w._finish_failed(Job.from_hash(*second), RuntimeError("boom")) is not None
+    assert await q.redis.zcard(q.keys.marker) == 0
+    assert await q.redis.zcard(q.keys.prioritized) == 1  # a job really was still waiting
+    await w.redis.aclose()
+
+
+async def test_missing_cap_argument_is_an_error(q):
+    """A limit must never fail open. A caller that omits the cap gets a script
+    error, not a claim that quietly ignores the limit."""
+    await q.add("job", {})
+    claim = q.redis.register_script(scripts.MOVE_TO_ACTIVE)
+    keys = [
+        q.keys.prioritized,
+        q.keys.active,
+        q.keys.marker,
+        q.keys.stalled,
+        q.keys.base,
+        q.keys.pc,
+        q.keys.meta_paused,
+        q.keys.limiter,
+    ]
+    with pytest.raises(ResponseError):
+        await claim(keys=keys, args=["token", 30_000, 0, 0, 0])
+    assert await q.redis.llen(q.keys.active) == 0

@@ -101,10 +101,17 @@ local function tryRateLimit(rlKey, maxJobs, durationMs, now)
   end
   return math.ceil((1 - tokens) / refill)   -- ms until one token is available
 end
+-- `cap` is the global concurrency limit (0 = none): jobs active at once across every
+-- worker. It reads `active` itself, so there is no counter to leak. Checked before
+-- the pop, so a capped claim touches nothing: no put-back, no rate-limit token
+-- spent. Only MOVE_TO_ACTIVE can actually be refused here: a finish script LREMs
+-- its own job before it fetches, so its claim is a swap that cannot raise occupancy.
+-- A missing cap is an error, not "no cap": a limit must never fail open.
 local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
                            base, pcKey, metaKey, token, lockMs, now,
-                           rlKey, rlMax, rlDuration)
+                           rlKey, rlMax, rlDuration, cap)
   if redis.call("EXISTS", metaKey) == 1 then return false end  -- queue paused
+  if cap > 0 and redis.call("LLEN", activeKey) >= cap then return false end
   local res = redis.call("ZPOPMIN", prioritizedKey)
   if #res == 0 then
     redis.call("DEL", pcKey)
@@ -119,8 +126,11 @@ local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
     return {"__rl__", retry}
   end
   redis.call("LPUSH", activeKey, jobId)
-  if redis.call("ZCARD", prioritizedKey) > 0 then
-    redis.call("ZADD", markerKey, 0, "0")   -- re-arm so another idle worker wakes
+  -- re-arm so another idle worker wakes - unless this claim took the last slot,
+  -- when a worker woken now could only be turned away
+  if redis.call("ZCARD", prioritizedKey) > 0
+     and (cap <= 0 or redis.call("LLEN", activeKey) < cap) then
+    redis.call("ZADD", markerKey, 0, "0")
   end
   return lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
 end
@@ -412,18 +422,12 @@ return rootId
 # ARGV[6] globalConcurrency (0 = no cap)
 # Returns false (none/paused/capped), {jobHash, jobId}, or {"__rl__", retryMs} when
 # rate limited.
-# The cap is enforced HERE and nowhere else: this is the only script that can grow
-# `active`. The finish scripts LREM their own job before they fetch, so their
-# acquireNext is a swap that can never raise occupancy. Checked before the pop, so
-# a capped claim touches nothing: no put-back, no rate-limit token spent.
 MOVE_TO_ACTIVE = (
     _LIB
     + """
-local cap = tonumber(ARGV[6]) or 0
-if cap > 0 and redis.call("LLEN", KEYS[2]) >= cap then return false end
 return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7],
                    ARGV[1], tonumber(ARGV[2]), ARGV[3],
-                   KEYS[8], tonumber(ARGV[4]), tonumber(ARGV[5]))
+                   KEYS[8], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]))
 """
 )
 
@@ -448,6 +452,7 @@ return 0
 # ARGV[1] jobId  ARGV[2] returnvalue(json)  ARGV[3] now(ms)  ARGV[4] token
 # ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)  ARGV[7] keepCount  ARGV[8] keepAge(s)
 # ARGV[9] rlMax  ARGV[10] rlDuration(ms)  ARGV[11] metricsRetention(ms)
+# ARGV[12] globalConcurrency (0 = no cap)
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}.
 MOVE_TO_COMPLETED = (
     _LIB
@@ -478,7 +483,8 @@ redis.call("PUBLISH", KEYS[10], cjson.encode(completedMsg))
 if ARGV[5] == "1" then
   local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                           ARGV[4], tonumber(ARGV[6]), ARGV[3],
-                          KEYS[12], tonumber(ARGV[9]), tonumber(ARGV[10]))
+                          KEYS[12], tonumber(ARGV[9]), tonumber(ARGV[10]),
+                          tonumber(ARGV[12]))
   if nxt then
     if nxt[1] == "__rl__" then
       redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
@@ -502,6 +508,7 @@ return {1}
 # ARGV[5] maxAttempts  ARGV[6] backoff(ms)  ARGV[7] token  ARGV[8] fetch(1/0)
 # ARGV[9] lockDuration(ms)  ARGV[10] keepCount  ARGV[11] keepAge(s)
 # ARGV[12] rlMax  ARGV[13] rlDuration(ms)  ARGV[14] metricsRetention(ms)
+# ARGV[15] globalConcurrency (0 = no cap)
 # Returns -2/-3, else {outcome} or {outcome, nextHash, nextId}; outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
@@ -547,7 +554,8 @@ end
 if ARGV[8] == "1" then
   local nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
                           ARGV[7], tonumber(ARGV[9]), ARGV[3],
-                          KEYS[13], tonumber(ARGV[12]), tonumber(ARGV[13]))
+                          KEYS[13], tonumber(ARGV[12]), tonumber(ARGV[13]),
+                          tonumber(ARGV[15]))
   if nxt then
     if nxt[1] == "__rl__" then
       redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check
