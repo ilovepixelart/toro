@@ -319,7 +319,14 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=[self.token, self.lock_duration, _now_ms(), self.rl_max, self.rl_duration],
+            args=[
+                self.token,
+                self.lock_duration,
+                _now_ms(),
+                self.rl_max,
+                self.rl_duration,
+                self.global_concurrency,
+            ],
         )
         if res and res[0] == scripts.RL_SENTINEL:
             await self._on_rate_limited(int(res[1]))

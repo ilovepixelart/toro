@@ -401,10 +401,18 @@ return rootId
 # KEYS[5] key base  KEYS[6] pc  KEYS[7] meta-paused  KEYS[8] limiter
 # ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] now(ms)
 # ARGV[4] rlMax (0 = no limit)  ARGV[5] rlDuration(ms)
-# Returns false (none/paused), {jobHash, jobId}, or {"__rl__", retryMs} when rate limited.
+# ARGV[6] globalConcurrency (0 = no cap)
+# Returns false (none/paused/capped), {jobHash, jobId}, or {"__rl__", retryMs} when
+# rate limited.
+# The cap is enforced HERE and nowhere else: this is the only script that can grow
+# `active`. The finish scripts LREM their own job before they fetch, so their
+# acquireNext is a swap that can never raise occupancy. Checked before the pop, so
+# a capped claim touches nothing: no put-back, no rate-limit token spent.
 MOVE_TO_ACTIVE = (
     _LIB
     + """
+local cap = tonumber(ARGV[6]) or 0
+if cap > 0 and redis.call("LLEN", KEYS[2]) >= cap then return false end
 return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7],
                    ARGV[1], tonumber(ARGV[2]), ARGV[3],
                    KEYS[8], tonumber(ARGV[4]), tonumber(ARGV[5]))
