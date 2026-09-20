@@ -33,7 +33,7 @@ from typing import Any, TypedDict, cast
 from redis.asyncio import Redis
 
 from . import scripts
-from .connection import connect
+from .connection import connect, read_timeout
 from .job import Backoff, Job, JobContext, JobOptions
 from .keys import Keys
 from .scheduler import next_run
@@ -62,6 +62,19 @@ def _pairs(flat: list[str] | None) -> dict[str, str]:
         return {}
     it = iter(flat)
     return dict(zip(it, it, strict=False))
+
+
+def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
+    """How long the blocking pop may block: `block_timeout`, held under the
+    connection's read timeout. A pop that outlasts the read raises instead of
+    timing out quietly, the loop never reaches the claim, and a job whose wake was
+    missed is stranded. A connection the worker built has room by construction; a
+    caller-provided one can carry any read timeout.
+    """
+    if read_timeout_s is None:
+        return block_timeout
+    ceiling = max(read_timeout_s - 1.0, read_timeout_s / 2)
+    return min(block_timeout, ceiling)
 
 
 def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
@@ -108,7 +121,9 @@ class Worker:
         # Each process loop PARKS a connection inside BZPOPMIN, so the pool must
         # exceed the concurrency or loops starve waiting for connections. A
         # caller-provided connection must be sized accordingly by the caller.
-        self.redis = connection or connect(url, max_connections=max(50, concurrency + 10))
+        self.redis = connection or connect(
+            url, max_connections=max(50, concurrency + 10), blocking_timeout=block_timeout
+        )
         self.concurrency = concurrency
         # Queue-wide rate limit, shared by all workers via one token bucket in Redis.
         # `{"max": N, "duration": ms}` = at most N jobs per duration. All workers on a
@@ -132,6 +147,14 @@ class Worker:
         # Lua reads as no number at all.
         self.global_concurrency = int(global_concurrency or 0)
         self.block_timeout = block_timeout
+        self._pop_timeout = pop_timeout(read_timeout(self.redis), block_timeout)
+        if self._pop_timeout < block_timeout:
+            logger.warning(
+                "block_timeout %.2fs does not fit under the connection's read timeout; "
+                "idle workers re-poll every %.2fs instead",
+                block_timeout,
+                self._pop_timeout,
+            )
 
         # Reliability knobs.
         self.token = uuid.uuid4().hex
@@ -296,7 +319,7 @@ class Worker:
                 # The marker only wakes us; the real claim is the atomic
                 # MOVE_TO_ACTIVE below. A timeout (None) is fine - we still try
                 # to acquire, so a missed marker can never strand a job.
-                woke = await self.redis.bzpopmin(self.keys.marker, self.block_timeout)
+                woke = await self.redis.bzpopmin(self.keys.marker, self._pop_timeout)
                 if not self._running:
                     # Shutting down - don't claim a new job. A marker we popped was
                     # a wake for a worker that still can, so hand it on: swallowed,
@@ -305,8 +328,12 @@ class Worker:
                         await self.redis.zadd(self.keys.marker, {"0": 0})
                     break
                 loaded = await self._acquire()
-                # Keep processing as long as each finish hands us the next job.
-                while loaded is not None and self._running:
+                # Keep processing as long as each finish hands us the next job. No
+                # `_running` check here: a job in hand is already claimed, and stop()
+                # can land during the very round trip that claimed it. Dropped, it
+                # would sit locked in `active` until the sweep. Shutdown ends the
+                # chain by itself: a stopping worker finishes with fetch=0.
+                while loaded is not None:
                     loaded = await self._handle(loaded)
             except asyncio.CancelledError:
                 raise

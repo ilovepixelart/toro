@@ -55,7 +55,11 @@ event loop - see [workers vs. slots](concepts.md). Two practical consequences:
   treated as stalled ([Reliability](reliability.md)).
 - **Connections scale with concurrency.** Each idle slot parks a (blocking-pop)
   connection, so the worker sizes its own pool to `concurrency + headroom`. If
-  you pass your own `connection`, size its pool accordingly.
+  you pass your own `connection`, size its pool accordingly, and give it a read
+  timeout (`socket_timeout`) above `block_timeout`. redis-py 8 defaults it to 5 s.
+  The worker keeps its blocking pop under whatever it finds, so a tighter read
+  timeout means idle slots re-poll sooner than `block_timeout` asks, with a
+  warning logged.
 
 A busy slot doesn't return to the blocking wait between jobs: the finish call
 also claims the next job in the same round trip (fetch-next - see
