@@ -1,8 +1,5 @@
-"""Tests for the global concurrency cap: one limit on jobs active at once,
+"""Integration: the global concurrency cap - one limit on jobs active at once,
 across every worker on the queue.
-
-Needs a Redis on localhost:6379. Uses an isolated prefix and cleans up after
-itself, so it won't touch other data.
 """
 
 import asyncio
@@ -14,22 +11,6 @@ from toro import Queue, Worker
 from toro.job import Job
 
 PREFIX = "torotest"
-QUEUE = "globalcap"
-
-
-async def _clear(queue: Queue) -> None:
-    keys = await queue.redis.keys(queue.keys.base + "*")
-    if keys:
-        await queue.redis.delete(*keys)
-
-
-@pytest.fixture
-async def q():
-    queue = Queue(QUEUE, prefix=PREFIX)
-    await _clear(queue)
-    yield queue
-    await _clear(queue)
-    await queue.close()
 
 
 async def _noop(job):
@@ -90,7 +71,7 @@ async def test_cap_holds_across_workers(q):
             gauge.leave()
 
     workers = [
-        Worker(QUEUE, proc, prefix=PREFIX, concurrency=4, global_concurrency=2, stalled_interval=0)
+        Worker(q.name, proc, prefix=PREFIX, concurrency=4, global_concurrency=2, stalled_interval=0)
         for _ in range(3)
     ]
     peak_active = await _run_until_drained(q, workers, total)
@@ -106,8 +87,8 @@ async def test_capped_claim_touches_nothing(q):
     for i in range(3):
         await q.add("job", {"i": i})
     limit = {"max": 5, "duration": 60_000}
-    w1 = Worker(QUEUE, _noop, prefix=PREFIX, global_concurrency=1, rate_limit=limit)
-    w2 = Worker(QUEUE, _noop, prefix=PREFIX, global_concurrency=1, rate_limit=limit)
+    w1 = Worker(q.name, _noop, prefix=PREFIX, global_concurrency=1, rate_limit=limit)
+    w2 = Worker(q.name, _noop, prefix=PREFIX, global_concurrency=1, rate_limit=limit)
 
     assert await w1._acquire() is not None  # takes the only slot
     waiting = await q.redis.zrange(q.keys.prioritized, 0, -1, withscores=True)
@@ -140,7 +121,7 @@ async def test_unset_cap_is_unbounded(q):
             gauge.leave()
 
     workers = [
-        Worker(QUEUE, proc, prefix=PREFIX, concurrency=3, stalled_interval=0) for _ in range(2)
+        Worker(q.name, proc, prefix=PREFIX, concurrency=3, stalled_interval=0) for _ in range(2)
     ]
     await _run_until_drained(q, workers, total)
 
@@ -156,12 +137,12 @@ async def test_crashed_worker_slots_are_recovered(q):
     for i in range(total):
         await q.add("job", {"i": i})
 
-    dead = Worker(QUEUE, _noop, prefix=PREFIX, global_concurrency=2, lock_duration=200)
+    dead = Worker(q.name, _noop, prefix=PREFIX, global_concurrency=2, lock_duration=200)
     assert await dead._acquire() is not None
     assert await dead._acquire() is not None  # both slots held, never finished or renewed
 
     healthy = Worker(
-        QUEUE,
+        q.name,
         _noop,
         prefix=PREFIX,
         concurrency=2,
@@ -202,7 +183,9 @@ async def test_freed_slot_wakes_parked_worker(q, release, holder_lock_ms, sweep_
     deadline here."""
     await q.add("held", {})
     waiting = await q.add("waiting", {})
-    holder = Worker(QUEUE, _noop, prefix=PREFIX, global_concurrency=1, lock_duration=holder_lock_ms)
+    holder = Worker(
+        q.name, _noop, prefix=PREFIX, global_concurrency=1, lock_duration=holder_lock_ms
+    )
     held = await holder._acquire()
     assert held is not None
 
@@ -214,7 +197,7 @@ async def test_freed_slot_wakes_parked_worker(q, release, holder_lock_ms, sweep_
         started.set()
 
     parked = Worker(
-        QUEUE,
+        q.name,
         proc,
         prefix=PREFIX,
         global_concurrency=1,
