@@ -330,3 +330,42 @@ async def test_missing_cap_argument_is_an_error(q):
     with pytest.raises(ResponseError):
         await claim(keys=keys, args=["token", 30_000, 0, 0, 0])
     assert await q.redis.llen(q.keys.active) == 0
+
+
+async def test_finish_with_a_missing_cap_commits_nothing(q):
+    """Fail-closed has to be fail-BEFORE-commit. Redis does not roll a script back:
+    a finish that errors after its writes leaves the job committed, the next job
+    unclaimed, and no wake armed. Both finish scripts read the cap only when they
+    fetch, so that is where an omitted cap must be caught up front."""
+    await q.add("first", {})
+    await q.add("second", {})
+    w = Worker(q.name, _noop, prefix=PREFIX)
+    job_id, _fields = await w._acquire()
+    k = q.keys
+    now = 1_000
+
+    completed_keys = [
+        k.active, k.completed, k.job(job_id), k.lock(job_id), k.prioritized, k.marker,
+        k.stalled, k.base, k.pc, k.events, k.meta_paused, k.limiter,
+    ]  # fmt: skip
+    with pytest.raises(ResponseError, match="global concurrency"):
+        await w._move_to_completed(
+            keys=completed_keys,
+            args=[job_id, "{}", now, w.token, "1", 30_000, -1, -1, 0, 0, 60_000],
+        )
+
+    failed_keys = [
+        k.active, k.prioritized, k.delayed, k.failed, k.job(job_id), k.lock(job_id), k.marker,
+        k.stalled, k.base, k.pc, k.events, k.meta_paused, k.limiter,
+    ]  # fmt: skip
+    with pytest.raises(ResponseError, match="global concurrency"):
+        await w._move_to_failed(
+            keys=failed_keys,
+            args=[job_id, "boom", now, 1, 1, 0, w.token, "1", 30_000, -1, -1, 0, 0, 60_000],
+        )
+
+    counts = await q.counts()
+    assert (counts["completed"], counts["failed"]) == (0, 0)
+    assert await q.redis.lrange(k.active, 0, -1) == [job_id]  # still held, lock intact
+    assert await q.redis.get(k.lock(job_id)) == w.token
+    await w.redis.aclose()
