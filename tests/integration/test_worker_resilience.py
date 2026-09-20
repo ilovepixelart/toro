@@ -6,6 +6,8 @@ Redis error between the blocking pop and the finish.
 import asyncio
 import time
 
+import redis.asyncio as aioredis
+
 
 async def test_raising_event_callback_does_not_kill_the_slot(q, run_worker, run_until):
     done = []
@@ -80,3 +82,20 @@ async def test_corrupt_job_hash_does_not_kill_the_slot(q, run_worker, run_until)
         await q.add("good", {})
         assert await run_until(lambda: len(done) >= 1, timeout=10.0), "slot died on corrupt data"
         assert done == ["good"]
+
+
+async def test_idle_repoll_survives_a_read_timeout_shorter_than_the_pop(q, run_worker, run_until):
+    """The blocking pop must come back before the connection's read timeout, or it
+    raises instead of timing out quietly and the loop never reaches the claim: a
+    job whose wake was missed is then stranded for good. A caller-provided
+    connection can carry any read timeout, so the worker has to stay under it."""
+    await q.add("stranded", {})
+    await q.redis.delete(q.keys.marker)  # the missed wake: work waiting, no marker
+    done = []
+
+    async def proc(job):
+        done.append(job.id)
+
+    conn = aioredis.from_url("redis://localhost:6379", socket_timeout=0.4, decode_responses=True)
+    async with run_worker(q, proc, connection=conn, block_timeout=1.0, stalled_interval=0):
+        assert await run_until(lambda: done, timeout=3.0), "the idle re-poll never claimed it"
