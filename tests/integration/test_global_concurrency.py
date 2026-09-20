@@ -144,3 +144,34 @@ async def test_unset_cap_is_unbounded(q):
 
     assert (await q.counts())["completed"] == total
     assert gauge.peak >= 4  # well past any small cap; 6 when every loop is busy
+
+
+async def test_crashed_worker_slots_are_recovered(q):
+    """A worker that dies holding every slot must not wedge the queue: there is no
+    slot counter to leak, so the stalled sweep taking its jobs off `active` is what
+    frees them. The healthy worker is refused first, then drains everything."""
+    total = 5
+    for i in range(total):
+        await q.add("job", {"i": i})
+
+    dead = Worker(QUEUE, _noop, prefix=PREFIX, global_concurrency=2, lock_duration=200)
+    assert await dead._acquire() is not None
+    assert await dead._acquire() is not None  # both slots held, never finished or renewed
+
+    healthy = Worker(
+        QUEUE,
+        _noop,
+        prefix=PREFIX,
+        concurrency=2,
+        global_concurrency=2,
+        stalled_interval=200,
+        max_stalled_count=5,
+    )
+    assert await healthy._acquire() is None  # wedged for as long as the dead slots stand
+
+    await _run_until_drained(q, [healthy], total, timeout=8.0)
+
+    counts = await q.counts()
+    assert counts["completed"] == total
+    assert counts["active"] == 0
+    await dead.redis.aclose()
