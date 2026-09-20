@@ -18,37 +18,43 @@ worker crash.
   `rate_limit`: a constructor option sent to Lua via ARGV, and all workers on a
   queue should pass the same value. A changed cap takes effect as workers
   restart.
-- **Enforcement in one script.** `MOVE_TO_ACTIVE` returns `false` when the cap
-  is set and `LLEN active >= cap`, before it calls `acquireNext`. The shared
-  `acquireNext` routine and both finish scripts are untouched.
-- **Why one script is enough.** The only write that grows `active` is the
+- **Enforcement.** The shared `acquireNext` routine returns `false` when the cap
+  is set and `LLEN active >= cap`. All three scripts that claim pass it the cap:
+  `MOVE_TO_ACTIVE` and both finish scripts.
+- **Only one script can be refused.** The only write that grows `active` is the
   `LPUSH` in `acquireNext`. In the finish scripts that call always follows the
   finisher's own successful `LREM` (or the script has already returned), so a
   fetch after a finish is a swap: it cannot raise occupancy. Only
-  `MOVE_TO_ACTIVE` can, so only it checks.
+  `MOVE_TO_ACTIVE` can, so the safety of the cap rests on that one path. The
+  finish scripts carry the cap so `acquireNext` knows when the queue is full.
+- **Fails closed.** A caller that omits the cap argument gets a script error,
+  not a claim that ignores the limit. The option is normalized with `int()`, so
+  an int subclass cannot reach Lua as an unreadable repr.
 - **No counter.** Occupancy is read from the `active` list itself, so there is
   nothing to leak: every existing exit from `active` (complete, fail, stalled
   sweep, removal) frees the slot by construction.
 - **A capped claim touches nothing.** The guard runs before the pop: no
   pop-and-put-back, no rate-limit token spent, no attempt consumed.
 - **Wakeup.** A capped worker parks on the marker exactly like a paused one.
-  Two paths free a slot without claiming and arm the marker when jobs are
-  waiting: a finish with `fetch=0` (a draining worker), and a stalled job that
-  fails terminally. Removal of an active job deliberately does not: its
-  processor may still be running, so an eager wake would exceed the real cap;
-  a parked worker notices within `block_timeout`.
+  `acquireNext` re-arms the marker after a claim only while a slot is still
+  free, so a full queue never wakes a worker just to turn it away. Two paths
+  free a slot without claiming and arm the marker when jobs are waiting: a
+  finish with `fetch=0` (a draining worker), and a stalled job that fails
+  terminally. A draining worker's own parked loop can pop that wake first, so
+  a loop that pops a marker while shutting down hands it on before it exits.
+  Removal of an active job deliberately does not wake: its processor may still
+  be running, so an eager wake would exceed the real cap. The freed slot is
+  found at the next wake or idle re-poll.
 - **Visibility.** The heartbeat record and `Queue.workers()` gain
   `global_concurrency` (0 when unset), which is what the dashboard needs to show
   the cap and derive "waiting on cap" (`active >= cap` with jobs waiting).
-- **Cost.** One `LLEN` (O(1)) per claim attempt, only when the cap is set.
-  Unset, the claim path issues no extra commands. While saturated, each finish
-  or add wakes one parked loop that is turned away by the guard: one cheap
-  script call, no spin (the bounced loop does not re-arm the marker).
-  Measured across 3 processes with 6 jobs in flight: unset and
-  set-but-unreached both run about 9,200 jobs/s at 1.0 script calls per job
-  (the guard is free); saturated with 24 loops parked runs about 7,100 jobs/s at
-  2.0 calls per job. That 22% is the zero-work worst case. With 100 ms jobs a
-  saturated cap of 3 drained 60 jobs in 2.09 s against a 2.0 s optimum.
+- **Cost.** Up to two `LLEN` calls (O(1)) per claim, only when the cap is set.
+  Unset, the claim path issues no extra commands. Measured across 3 processes
+  with 6 jobs in flight on zero-work jobs: unset, set-but-unreached, and
+  saturated with 24 loops parked all run about 9,000 jobs/s at 1.0 script calls
+  per job. With 100 ms jobs a saturated cap of 3 drained 60 jobs in 2.09 s
+  against a 2.0 s optimum. An `add` while the queue is full still wakes one
+  parked loop that is turned away: the producer does not know the cap.
 - **Slots stick.** A finisher swaps its own slot, so under a full queue the
   workers holding slots keep them and others can sit idle until a holder
   drains, stops, or crashes.
@@ -60,10 +66,12 @@ worker crash.
 | GC-001 | With `global_concurrency=N`, no more than N jobs are active at any instant across several workers whose summed `concurrency` exceeds N, the high-water mark reaches N, and every job still completes. Covers the initial claim and the fetch after both complete and fail. | `tests/integration/test_global_concurrency.py::test_cap_holds_across_workers`, plus the seeded fuzzer in `test_invariants.py` asserting `active <= cap` after every step |
 | GC-002 | A capped claim leaves the queue untouched: the job keeps its `prioritized` score, no attempt is consumed, no rate-limit token is spent. | `::test_capped_claim_touches_nothing` |
 | GC-003 | A worker that dies holding slots frees them through the stalled sweep; the queue drains afterwards and never wedges. | `::test_crashed_worker_slots_are_recovered` (mutation-verified: fails with the sweep disabled) |
-| GC-004 | A freed slot wakes a parked worker well under `block_timeout` on both non-claiming release paths: a finish with `fetch=0`, and a stalled job failing terminally. | `::test_freed_slot_wakes_parked_worker` (parametrized per path) |
-| GC-005 | Unset (the default) changes nothing: return shapes and claim behavior are identical, and workers run up to their summed `concurrency`. | `::test_unset_cap_is_unbounded` plus the existing integration suite green |
-| GC-006 | A non-positive or non-integer `global_concurrency` raises `ValueError` at construction. | `tests/unit/test_worker_options.py::test_global_concurrency_validation` |
+| GC-004 | A freed slot wakes a parked worker well under `block_timeout` on both non-claiming release paths: a finish with `fetch=0`, and a stalled job failing terminally. A draining worker's own parked loop hands the wake on instead of swallowing it. | `::test_freed_slot_wakes_parked_worker` (parametrized per path), `::test_draining_worker_passes_the_wake_on` |
+| GC-005 | Unset (the default) leaves claim behavior and return shapes unchanged, and workers run up to their summed `concurrency`. The two release paths of GC-004 arm the marker whether or not a cap is set, which costs an uncapped queue at most one harmless wake. | `::test_unset_cap_is_unbounded` plus the existing integration suite green |
+| GC-006 | A non-positive or non-integer `global_concurrency` raises `ValueError` at construction. An int subclass (an `IntEnum`) is stored as a plain int and caps like one. | `tests/unit/test_worker_options.py::test_global_concurrency_validation`, `::test_global_concurrency_is_stored_as_a_plain_int`, `tests/integration/test_global_concurrency.py::test_int_subclass_cap_is_enforced` |
 | GC-007 | The heartbeat record and `Queue.workers()` expose `global_concurrency`. | `tests/integration/test_workers.py::test_presence_reports_global_concurrency` |
+| GC-008 | A claim that fills the last slot does not arm the marker, on the initial claim and on the fetch after both complete and fail. While a slot is free and jobs wait, it does. | `tests/integration/test_global_concurrency.py::test_full_cap_does_not_wake_a_parked_worker` |
+| GC-009 | A claim that omits the cap argument is a script error and claims nothing. | `::test_missing_cap_argument_is_an_error` |
 
 ## Out of scope
 
@@ -72,16 +80,13 @@ worker crash.
   from "empty"; the dashboard derives the condition from Redis instead.
 - Changing the cap at runtime. A value stored in Redis that overrides the
   option can be added later without breaking this API.
-- Suppressing the saturated-queue wake (threading the cap into `acquireNext`
-  so it stops re-arming the marker at the cap). Only if a load test shows the
-  bounce matters.
 - The matador "waiting on cap" UI: a paired follow-up once GC-007 lands.
 
 ## Risks
 
-- **The swap invariant.** Enforcement in one script is sound only while
-  `acquireNext` stays the sole writer to `active` and the finish scripts keep
-  removing before they fetch. The fuzzer check in GC-001 is the tripwire.
+- **The swap invariant.** The cap is safe only while `acquireNext` stays the
+  sole writer to `active` and the finish scripts keep removing before they
+  fetch. The fuzzer check in GC-001 is the tripwire.
 - **Mixed config.** Workers passing different caps each enforce their own.
   Documented the same way `rate_limit` is.
 - **False stalls.** The cap bounds claimed jobs. A job reclaimed after a false
@@ -96,16 +101,20 @@ worker crash.
 1. The cap is a Worker option, not a queue-level value in Redis: the smallest
    change, no new keys, and the same contract `rate_limit` already has.
 2. No "capped" worker event.
+3. A missing cap argument is a script error. A limit must not fail open.
 
 ## Tasks
 
 | # | Clause | Work | Files | Test strategy |
 |---|---|---|---|---|
 | 1 | GC-006 | Add the option, validate it, store it (not yet enforced) | `toro/worker.py` | unit, red first |
-| 2 | GC-001, GC-002, GC-005 | Write the cap tests (red for the right reason: the option exists but nothing enforces it), then the `LLEN` guard in `MOVE_TO_ACTIVE` and the ARGV at its one call site | `toro/scripts.py`, `toro/worker.py`, tests | high-water mark via a shared counter; direct script calls for GC-002 |
+| 2 | GC-001, GC-002, GC-005 | Write the cap tests (red for the right reason: the option exists but nothing enforces it), then the `LLEN` guard and the cap ARGV | `toro/scripts.py`, `toro/worker.py`, tests | high-water mark via a shared counter; direct script calls for GC-002 |
 | 3 | GC-001 | Cap invariant in the seeded fuzzer | `tests/integration/test_invariants.py` | `active <= cap` after every step |
 | 4 | GC-003 | Crash recovery test | tests only | zombie worker, expired locks, sweep; mutation check with the sweep off |
 | 5 | GC-004 | Arm the marker on the two non-claiming release paths | `toro/scripts.py` | large `block_timeout`, assert prompt start, red first per path |
 | 6 | GC-007 | Presence field and `workers()` | `toro/worker.py`, `toro/queue.py` | integration |
 | 7 | | Docs: `processing.md`, `concepts.md`, README feature row | docs | review |
-| 8 | | Prove: lint, types, full suite with zero skips, a saturated-cap load run to size the bounce, an end-to-end run of a capped example | | evidence captured |
+| 8 | | Prove: lint, types, full suite with zero skips, a saturated-cap load run, a multi-process run of a capped fleet | | evidence captured |
+| 9 | GC-006 | Normalize the option with `int()` | `toro/worker.py` | unit and integration, red first |
+| 10 | GC-004 | A draining loop hands on a marker it popped | `toro/worker.py` | build the blocked-client ordering that swallows the wake, red first |
+| 11 | GC-008, GC-009 | Move the cap into `acquireNext`, re-arm only while a slot is free, pass the cap from both finish scripts | `toro/scripts.py`, `toro/worker.py` | assert on the marker key, red first; re-measure the saturated load run |

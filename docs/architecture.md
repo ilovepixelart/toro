@@ -85,11 +85,13 @@ due jobs into the prioritized set.
   (`Worker(rate_limit={"max": N, "duration": ms})`), shared by every worker on the
   queue. An over-limit claim returns a sentinel and the worker waits out the window.
 - **Global concurrency** - `Worker(global_concurrency=N)` caps jobs active at once
-  across every worker. The claim script checks the length of the `active` list
-  before it pops, so there is no slot counter to leak: a crash frees its slots
-  through the stalled sweep. Only the claim script checks. A finish removes its
-  own job from `active` before it fetches the next, so that fetch is a swap and
-  can never raise occupancy.
+  across every worker. The shared claim routine checks the length of the
+  `active` list before it pops, so there is no slot counter to leak: a crash
+  frees its slots through the stalled sweep. Only a fresh claim can be refused.
+  A finish removes its own job from `active` before it fetches the next, so that
+  fetch is a swap and can never raise occupancy. A claim that fills the last
+  slot does not wake another worker, and a claim that omits the cap is a script
+  error: the limit cannot fail open.
 - **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
   `completed`, `failed`); `Queue.result()` awaits the terminal event and
   `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
