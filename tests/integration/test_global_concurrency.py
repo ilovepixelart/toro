@@ -369,3 +369,45 @@ async def test_finish_with_a_missing_cap_commits_nothing(q):
     assert await q.redis.lrange(k.active, 0, -1) == [job_id]  # still held, lock intact
     assert await q.redis.get(k.lock(job_id)) == w.token
     await w.redis.aclose()
+
+
+async def test_slot_of_a_removed_job_is_reused_once_its_processor_ends(q):
+    """Removing an active job frees its slot in `active` but deliberately wakes no
+    one: the processor may still be running. When it ends, its finish comes back
+    lock-lost, and at that moment the worker KNOWS the slot is really free. It must
+    say so, or the waiting job sits out a full idle re-poll."""
+    release = asyncio.Event()
+    started: dict[str, asyncio.Event] = {"held": asyncio.Event(), "waiting": asyncio.Event()}
+
+    async def proc(job):
+        started[job.name].set()
+        if job.name == "held":
+            await release.wait()
+
+    held = await q.add("held", {})
+    await q.add("waiting", {})
+    w = Worker(
+        q.name,
+        proc,
+        prefix=PREFIX,
+        concurrency=2,
+        global_concurrency=1,
+        block_timeout=4.0,
+        stalled_interval=0,
+    )
+    task = asyncio.create_task(w.run())
+    try:
+        await asyncio.wait_for(started["held"].wait(), timeout=2.0)
+        await asyncio.sleep(0.2)  # the spare loop is parked: the cap is full
+        assert await q.remove_job(held.id)
+        await asyncio.sleep(0.2)
+        assert not started["waiting"].is_set()  # no eager wake: `held` is still running
+
+        release.set()  # the processor ends; its finish returns lock-lost
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(started["waiting"].wait(), timeout=1.0)
+        assert started["waiting"].is_set(), "the freed slot sat idle until the re-poll"
+    finally:
+        release.set()
+        await w.stop(grace_period=1)
+        task.cancel()
