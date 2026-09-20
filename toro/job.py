@@ -8,6 +8,8 @@ from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast
 
 from redis.asyncio import Redis
 
+from ._replies import _str_dict
+
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
 # `waiting-children` is the flow-parent park: enqueued, but runnable only once
 # every child has settled.
@@ -177,9 +179,7 @@ class Job:
         """
         if self._ctx is None:
             raise RuntimeError("children_results() is only available inside a worker processor")
-        return decode_results(
-            cast("dict[str, str]", await self._ctx.redis.hgetall(self._ctx.results_key))
-        )
+        return decode_results(_str_dict(await self._ctx.redis.hgetall(self._ctx.results_key)))
 
     async def failed_children(self) -> dict[str, str]:
         """Pull child id -> failure reason for children failed under
@@ -187,7 +187,7 @@ class Job:
         """
         if self._ctx is None:
             raise RuntimeError("failed_children() is only available inside a worker processor")
-        return cast("dict[str, str]", await self._ctx.redis.hgetall(self._ctx.cfail_key))
+        return _str_dict(await self._ctx.redis.hgetall(self._ctx.cfail_key))
 
     @classmethod
     def from_hash(cls, job_id: str, h: dict[str, str]) -> Job:
