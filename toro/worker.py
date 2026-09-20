@@ -296,9 +296,14 @@ class Worker:
                 # The marker only wakes us; the real claim is the atomic
                 # MOVE_TO_ACTIVE below. A timeout (None) is fine - we still try
                 # to acquire, so a missed marker can never strand a job.
-                await self.redis.bzpopmin(self.keys.marker, self.block_timeout)
+                woke = await self.redis.bzpopmin(self.keys.marker, self.block_timeout)
                 if not self._running:
-                    break  # shutting down - don't claim a new job
+                    # Shutting down - don't claim a new job. A marker we popped was
+                    # a wake for a worker that still can, so hand it on: swallowed,
+                    # the work it signalled waits out someone's block_timeout.
+                    if woke:
+                        await self.redis.zadd(self.keys.marker, {"0": 0})
+                    break
                 loaded = await self._acquire()
                 # Keep processing as long as each finish hands us the next job.
                 while loaded is not None and self._running:

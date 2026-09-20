@@ -236,3 +236,43 @@ async def test_int_subclass_cap_is_enforced(q):
     assert await w._acquire() is None
     assert await q.redis.llen(q.keys.active) == 1
     await w.redis.aclose()
+
+
+async def test_draining_worker_passes_the_wake_on(q):
+    """A draining worker still has spare loops parked on the marker. When its last
+    job finishes (fetch=0) the freed slot's wake can be popped by one of THOSE
+    loops, since Redis serves the longest-blocked client first. It must hand the
+    wake on, or the slot sits idle until another worker's block_timeout."""
+    release = asyncio.Event()
+    ran_on_b = asyncio.Event()
+
+    async def proc_a(job):
+        await release.wait()
+
+    async def proc_b(job):
+        ran_on_b.set()
+
+    opts = {"prefix": PREFIX, "global_concurrency": 1, "block_timeout": 3.0, "stalled_interval": 0}
+    a = Worker(q.name, proc_a, concurrency=2, **opts)
+    b = Worker(q.name, proc_b, concurrency=1, **opts)
+    ta = asyncio.create_task(a.run())
+    await asyncio.sleep(0.2)  # both of A's loops are parked
+    await q.add("long", {})
+    await asyncio.sleep(0.2)  # A's first loop runs it; the second stays parked
+    tb = asyncio.create_task(b.run())
+    await asyncio.sleep(0.2)  # B parks: newer than A's spare loop
+    await q.add("waiting", {})
+    await asyncio.sleep(0.2)  # A's spare loop pops, is refused, re-parks BEHIND B
+    stop_a = asyncio.create_task(a.stop())
+    await asyncio.sleep(0.2)  # stop()'s wake goes to B, which is refused and re-parks
+    try:
+        release.set()  # `long` finishes with fetch=0 and arms the marker
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(ran_on_b.wait(), timeout=1.0)
+        assert ran_on_b.is_set(), "the freed slot's wake was swallowed by the draining worker"
+    finally:
+        release.set()
+        await stop_a
+        await b.stop()
+        ta.cancel()
+        tb.cancel()
