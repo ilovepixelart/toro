@@ -1,11 +1,13 @@
 """Unit: the connection a Worker builds for itself must outlast its blocking pop."""
 
+import logging
+
 import pytest
 import redis.asyncio as aioredis
 from redis.asyncio.connection import Connection
 
-from toro import Worker
-from toro.connection import read_timeout
+from toro import Queue, Worker
+from toro.connection import DEFAULT_BLOCK_TIMEOUT, read_timeout
 from toro.worker import pop_timeout
 
 
@@ -56,3 +58,27 @@ def test_a_caller_provided_connection_on_library_defaults_is_clamped():
         assert w._pop_timeout == 30.0
     else:
         assert w._pop_timeout < library_default
+
+
+def test_a_queue_built_connection_hosts_a_default_worker_quietly(caplog):
+    """Sharing the Queue's connection with a Worker is an ordinary setup. At the
+    default block_timeout it must neither shorten the pop nor log a warning: a
+    default configuration that warns teaches people to ignore warnings. redis-py's
+    guidance for blocking commands is a socket_timeout above the block window, so
+    every connection toro builds has to be sized for toro's own default pop."""
+    queue = Queue("q")
+    with caplog.at_level(logging.WARNING, logger="toro.worker"):
+        # spelled out: conftest shrinks the default block_timeout in tests
+        w = Worker("q", _noop, connection=queue.redis, block_timeout=DEFAULT_BLOCK_TIMEOUT)
+    assert w._pop_timeout == DEFAULT_BLOCK_TIMEOUT
+    assert [r.getMessage() for r in caplog.records] == []
+
+
+def test_a_pop_longer_than_a_shared_connection_allows_still_warns(caplog):
+    """The warning stays for the case that deserves one: asking for a pop the
+    connection in hand cannot hold."""
+    queue = Queue("q")
+    with caplog.at_level(logging.WARNING, logger="toro.worker"):
+        w = Worker("q", _noop, connection=queue.redis, block_timeout=60.0)
+    assert w._pop_timeout < 60.0
+    assert len(caplog.records) == 1
