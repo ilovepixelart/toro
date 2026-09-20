@@ -1,6 +1,8 @@
 """Unit: the connection a Worker builds for itself must outlast its blocking pop."""
 
 import pytest
+import redis.asyncio as aioredis
+from redis.asyncio.connection import Connection
 
 from toro import Worker
 from toro.connection import read_timeout
@@ -38,3 +40,19 @@ def test_read_timeout_follows_a_longer_block_timeout():
 )
 def test_pop_timeout_stays_under_the_read_timeout(read_timeout_s, block_timeout, expected):
     assert pop_timeout(read_timeout_s, block_timeout) == expected
+
+
+def test_a_caller_provided_connection_on_library_defaults_is_clamped():
+    """The common real case: a client built with no socket_timeout at all. The
+    library default applies but never shows up in the pool's kwargs. The oracle is
+    redis-py's own Connection, not toro's helper, so a helper that misses the
+    default cannot simply agree with itself."""
+    library_default = Connection().socket_timeout
+    conn = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+    assert read_timeout(conn) == library_default
+
+    w = Worker("q", _noop, connection=conn, block_timeout=30.0)
+    if library_default is None:
+        assert w._pop_timeout == 30.0
+    else:
+        assert w._pop_timeout < library_default
