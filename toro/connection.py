@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import redis.asyncio as aioredis
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+# How long an idle worker slot blocks on the marker by default. It lives here, not
+# in worker.py, because every connection toro builds is sized for it: a Queue's
+# connection is routinely shared with a Worker, and must hold that worker's pop.
+DEFAULT_BLOCK_TIMEOUT = 5.0
+
 # How far a connection's read timeout sits above the longest blocking pop it serves.
 READ_MARGIN = 5.0
 
 
 def connect(
-    url: str, *, max_connections: int = 50, blocking_timeout: float | None = None
+    url: str, *, max_connections: int = 50, blocking_timeout: float = DEFAULT_BLOCK_TIMEOUT
 ) -> aioredis.Redis:
     """Open a ``decode_responses`` client tuned for toro's long-lived connections.
 
@@ -38,20 +41,20 @@ def connect(
     ``blocking_timeout`` is the longest server-side block this client will issue.
     The read timeout is set above it: a blocking pop has to come back before the
     client gives up on the read, or it raises instead of timing out quietly.
-    redis-py 8 defaults the read timeout to 5s, which a 5s pop does not beat.
+    redis-py's own guidance for blocking commands is a ``socket_timeout`` larger
+    than the block window, and its default of 5s does not beat a 5s pop. The
+    default here fits a default worker, so a Queue's connection can be handed to
+    one as it is.
     """
-    extra: dict[str, Any] = {}
-    if blocking_timeout is not None:
-        extra["socket_timeout"] = blocking_timeout + READ_MARGIN
     pool = aioredis.BlockingConnectionPool.from_url(
         url,
         max_connections=max_connections,
         decode_responses=True,
         health_check_interval=30,
         socket_keepalive=True,
+        socket_timeout=blocking_timeout + READ_MARGIN,
         retry=Retry(ExponentialBackoff(), retries=3),
         retry_on_error=[RedisConnectionError, RedisTimeoutError],
-        **extra,
     )
     return aioredis.Redis(connection_pool=pool)
 

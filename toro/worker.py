@@ -33,7 +33,7 @@ from typing import Any, TypedDict, cast
 from redis.asyncio import Redis
 
 from . import scripts
-from .connection import connect, read_timeout
+from .connection import DEFAULT_BLOCK_TIMEOUT, connect, read_timeout
 from .job import Backoff, Job, JobContext, JobOptions
 from .keys import Keys
 from .scheduler import next_run
@@ -106,7 +106,7 @@ class Worker:
         concurrency: int = 1,
         rate_limit: RateLimit | None = None,
         global_concurrency: int | None = None,
-        block_timeout: float = 5.0,
+        block_timeout: float = DEFAULT_BLOCK_TIMEOUT,
         lock_duration: int = 30000,
         lock_renew_time: int | None = None,
         renew_locks: bool = True,
