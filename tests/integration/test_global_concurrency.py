@@ -4,6 +4,7 @@ across every worker on the queue.
 
 import asyncio
 import contextlib
+import enum
 
 import pytest
 
@@ -219,3 +220,19 @@ async def test_freed_slot_wakes_parked_worker(q, release, holder_lock_ms, sweep_
         await parked.stop()
         task.cancel()
         await holder.redis.aclose()
+
+
+class _Limits(enum.IntEnum):
+    DB_POOL = 1
+
+
+async def test_int_subclass_cap_is_enforced(q):
+    """An IntEnum is a valid int to Python. It must cap like one, not silently
+    turn the cap off."""
+    for i in range(3):
+        await q.add("job", {"i": i})
+    w = Worker(q.name, _noop, prefix=PREFIX, global_concurrency=_Limits.DB_POOL)
+    assert await w._acquire() is not None
+    assert await w._acquire() is None
+    assert await q.redis.llen(q.keys.active) == 1
+    await w.redis.aclose()

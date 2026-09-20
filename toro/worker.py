@@ -128,7 +128,9 @@ class Worker:
             or global_concurrency <= 0
         ):
             raise ValueError("global_concurrency needs a positive integer")
-        self.global_concurrency = global_concurrency or 0
+        # int(): an int subclass (an IntEnum) would reach Redis as its repr, which
+        # Lua reads as no number at all.
+        self.global_concurrency = int(global_concurrency or 0)
         self.block_timeout = block_timeout
 
         # Reliability knobs.
