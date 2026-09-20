@@ -89,9 +89,9 @@ due jobs into the prioritized set.
   `active` list before it pops, so there is no slot counter to leak: a crash
   frees its slots through the stalled sweep. Only a fresh claim can be refused.
   A finish removes its own job from `active` before it fetches the next, so that
-  fetch is a swap and can never raise occupancy. A claim that fills the last
-  slot does not wake another worker, and a claim that omits the cap is a script
-  error: the limit cannot fail open.
+  fetch is a swap and can never raise occupancy. The re-arm after a claim is
+  skipped when that claim filled the last slot, and a script that omits the cap
+  errors before its first write: the limit cannot fail open.
 - **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
   `completed`, `failed`); `Queue.result()` awaits the terminal event and
   `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
@@ -114,7 +114,9 @@ The scripts share a small library of routines:
 | `priorityScore` | Packs `(PRIORITY_OFFSET - priority) * 2^32 + seq` for the prioritized ZSET. |
 | `enqueue` | Adds a job to `prioritized` at its score and arms the marker. |
 | `lockAndLoad` | Sets the lock token and loads the hash for a just-claimed id. |
-| `acquireNext` | Pops the top prioritized job into `active` and locks it, honoring the rate limit. |
+| `acquireNext` | Pops the top prioritized job into `active` and locks it, honoring the rate limit and the global concurrency cap. |
+| `requireCap` | Reads the cap argument, raising when it is missing. Called before a script's first write. |
+| `wakeIfWaiting` | Arms the marker when jobs are waiting: a slot was freed without a claim. |
 | `tryRateLimit` | Token bucket: ms until a token frees, or 0 to proceed. |
 | `recordFinished` | Records a terminal job in `completed`/`failed` and applies auto-removal. |
 | `settleChildCompleted` / `settleChildFailed` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent - or fails it eagerly, per `on_fail`. |

@@ -114,7 +114,11 @@ N connections, an API that allows N requests in flight. A rate limit bounds job
   finishes the last, so while the queue stays full the workers holding the slots
   keep them, and another worker can sit idle. Slots move when a holder drains,
   stops, or crashes.
-- A changed value takes effect as workers restart.
+- Removing an active job does not hand its slot on at once: the processor may
+  still be running. The slot is reused when that processor ends.
+- A changed value takes effect as workers restart. While a rollout mixes caps,
+  each worker enforces its own, and a freed slot can wait up to `block_timeout`
+  for a worker with room.
 
 ## Lifecycle events
 
