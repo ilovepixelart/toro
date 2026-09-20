@@ -6,10 +6,12 @@ itself, so it won't touch other data.
 """
 
 import asyncio
+import contextlib
 
 import pytest
 
 from toro import Queue, Worker
+from toro.job import Job
 
 PREFIX = "torotest"
 QUEUE = "globalcap"
@@ -175,3 +177,62 @@ async def test_crashed_worker_slots_are_recovered(q):
     assert counts["completed"] == total
     assert counts["active"] == 0
     await dead.redis.aclose()
+
+
+async def _release_by_drain_finish(holder: Worker, job_id: str, fields: dict[str, str]) -> None:
+    """A draining worker finishes with fetch=0: it frees the slot, claims nothing."""
+    await holder._finish_completed(Job.from_hash(job_id, fields), {"ok": 1})
+
+
+async def _release_by_stalled_failure(holder: Worker, job_id: str, fields: dict[str, str]) -> None:
+    """The holder is dead. Its lock runs out and the parked worker's own sweep fails
+    the job for good (max_stalled_count=0), which frees the slot with no claim."""
+
+
+@pytest.mark.parametrize(
+    ("release", "holder_lock_ms", "sweep_ms"),
+    [
+        pytest.param(_release_by_drain_finish, 30_000, 0, id="drain_finish"),
+        pytest.param(_release_by_stalled_failure, 200, 200, id="stalled_failure"),
+    ],
+)
+async def test_freed_slot_wakes_parked_worker(q, release, holder_lock_ms, sweep_ms):
+    """A slot freed WITHOUT a claim must wake a worker parked on the cap. With a
+    30s block_timeout, a missed wake leaves the waiting job untouched far past the
+    deadline here."""
+    await q.add("held", {})
+    waiting = await q.add("waiting", {})
+    holder = Worker(QUEUE, _noop, prefix=PREFIX, global_concurrency=1, lock_duration=holder_lock_ms)
+    held = await holder._acquire()
+    assert held is not None
+
+    done: list[str] = []
+    started = asyncio.Event()
+
+    async def proc(job):
+        done.append(job.id)
+        started.set()
+
+    parked = Worker(
+        QUEUE,
+        proc,
+        prefix=PREFIX,
+        global_concurrency=1,
+        block_timeout=30.0,
+        stalled_interval=sweep_ms,
+        max_stalled_count=0,
+    )
+    task = asyncio.create_task(parked.run())
+    try:
+        await asyncio.sleep(0.3)  # woken once by the leftover marker, refused, parked again
+        assert done == []
+
+        await release(holder, *held)
+
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(started.wait(), timeout=3.0)
+        assert done == [waiting.id]
+    finally:
+        await parked.stop()
+        task.cancel()
+        await holder.redis.aclose()

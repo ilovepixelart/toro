@@ -124,6 +124,14 @@ local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
   end
   return lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
 end
+-- A slot in `active` was freed WITHOUT a claim (a draining worker's finish, a
+-- stalled job failed for good). Under a global concurrency cap a worker may be
+-- parked with jobs still waiting, and nothing else would wake it.
+local function wakeIfWaiting(prioritizedKey, markerKey)
+  if redis.call("ZCARD", prioritizedKey) > 0 then
+    redis.call("ZADD", markerKey, 0, "0")
+  end
+end
 local function delJobs(ids, base)
   for _, id in ipairs(ids) do
     redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
@@ -478,6 +486,8 @@ if ARGV[5] == "1" then
       return {1, nxt[1], nxt[2]}
     end
   end
+else
+  wakeIfWaiting(KEYS[5], KEYS[6])
 end
 return {1}
 """
@@ -545,6 +555,8 @@ if ARGV[8] == "1" then
       return {outcome, nxt[1], nxt[2]}
     end
   end
+else
+  wakeIfWaiting(KEYS[2], KEYS[7])
 end
 return {outcome}
 """
@@ -728,6 +740,8 @@ if #stalling > 0 then
     end
   end
 end
+-- recovered jobs re-arm the marker through enqueue; a terminal failure does not
+if #failed > 0 then wakeIfWaiting(KEYS[3], KEYS[7]) end
 
 local active = redis.call("LRANGE", KEYS[2], 0, -1)
 local i = 1
