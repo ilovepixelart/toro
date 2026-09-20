@@ -244,6 +244,7 @@ class Worker:
                 "pid": os.getpid(),
                 "queue": self.name,
                 "concurrency": self.concurrency,
+                "global_concurrency": self.global_concurrency,
                 "started": self.started_at,
                 "heartbeat": now,
                 "processed": self._processed,
