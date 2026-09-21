@@ -131,6 +131,9 @@ class FlowView:
     (`on_fail="continue"`) failures. The counts are derived over the root's
     direct children - completions only, so a failed flow never reads as done -
     and `live` is true while ANY node in the subtree is still non-terminal.
+    Retention can take a finished child's hash, and with it the child's node in
+    `tree`, while the flow is still running; its outcome was copied into the parent
+    when it settled, so the counts read both and never go backwards.
     Built by `Queue.flow_view()`, which reads it all in O(depth) round trips.
     """
 
@@ -145,11 +148,14 @@ class FlowView:
 
     @property
     def done(self) -> int:
-        return sum(1 for n in self.tree["children"] if n["job"].state == "completed")
+        return len(self._children_in("completed") | self.results.keys())
 
     @property
     def failed(self) -> int:
-        return sum(1 for n in self.tree["children"] if n["job"].state == "failed")
+        return len(self._children_in("failed") | self.failures.keys())
+
+    def _children_in(self, state: str) -> set[str]:
+        return {n["job"].id for n in self.tree["children"] if n["job"].state == state}
 
     @property
     def live(self) -> bool:

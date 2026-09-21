@@ -160,6 +160,42 @@ async def test_default_retention_keeps_children_results(q, run_worker, run_until
     assert await _count(q, "waiting-children") == 0
 
 
+async def test_flow_view_still_counts_children_the_default_trimmed(q, run_worker, run_until):
+    """Retention takes a finished child's hash, and with it the child's place in the
+    tree, while the flow is still running. Its result is already in the parent, so the
+    progress a dashboard shows must not go backwards."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "fetch" and job.data["part"] == 3:
+            await gate.wait()
+        return job.data.get("part")
+
+    async with run_worker(q, proc, concurrency=4):
+        parent = await q.add_flow(
+            "report", {}, children=[c("fetch", {"part": n}) for n in (1, 2, 3)]
+        )
+        assert await run_until(_count_is(q, "completed", 2))  # the third is held
+        early = await q.redis.zrange(q.keys.completed, 0, -1)
+
+        # a busy queue: 1000 newer completions, then one more finish, push both out
+        now = int(time.time() * 1000)
+        pipe = q.redis.pipeline(transaction=False)
+        for i in range(1000):
+            pipe.zadd(q.keys.completed, {f"other{i}": now + i})
+        await pipe.execute()
+        await (await q.add("unrelated", {})).result(timeout=10)
+        assert [await q.redis.exists(q.keys.job(jid)) for jid in early] == [0, 0]
+
+        view = await q.flow_view(parent.id)
+        gate.set()
+        await parent.result(timeout=10)
+
+    assert view is not None
+    assert (view.total, view.done, view.failed, view.live) == (3, 2, 0, True)
+    assert len(view.tree["children"]) == 1  # only the running child still has a hash
+
+
 async def test_nested_flow_releases_inner_then_root(q, run_worker, run_until):
     order = []
 
