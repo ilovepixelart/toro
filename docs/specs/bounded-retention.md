@@ -30,11 +30,19 @@ Keep-forever stays available, as an explicit choice.
   deletes at most 1000 jobs per finish; the count trim deletes everything past
   the bound in one pass. Flipping the default on a queue holding millions of
   finished jobs would make the first finish after the upgrade delete them all
-  in a single Redis-blocking script. The count trim gets the same 1000-per-finish
-  limit, oldest first, and the backlog drains over the following finishes.
-- **Flows are unaffected.** A child's result is copied into its parent's
-  `:results` when it settles, so a trimmed child costs the parent nothing. This
-  is already the documented behavior for an explicit `remove_on_complete`.
+  in a single Redis-blocking script. The limit is one budget of 1000 for the
+  whole script, oldest first: one script can record many jobs (a failing flow
+  child fails its ancestors with it) and one job can carry both bounds. The
+  backlog drains over the following finishes.
+- **Schedulers carry the queue's defaults.** Workers mint every occurrence from
+  the scheduler's stored template and never see a producer's
+  `default_job_options`, so `add_scheduler` merges them into the template. A
+  manual trigger leaves retention the template stores unset to the queue.
+  Without this the keep-everything setting would not cover scheduled jobs.
+- **A flow's results and progress survive a trimmed child.** A child's result is
+  copied into its parent's `:results` when it settles, so a trimmed child costs
+  the parent nothing, and `FlowView` counts `done` and `failed` from the parent's
+  copies as well as from the tree. The child's node does leave the tree.
 
 ## Acceptance clauses
 
@@ -43,9 +51,10 @@ Keep-forever stays available, as an explicit choice.
 | BR-001 | With the option unset, `completed` holds at most the newest 1000 jobs and `failed` at most the newest 5000, and the trimmed jobs' hashes and aux keys are gone. | `tests/integration/test_finished_retention.py::test_unset_option_bounds_the_finished_sets` |
 | BR-002 | `False` keeps every finished job, given per job and given through `default_job_options`. | `::test_false_keeps_everything` |
 | BR-003 | `True`, an int, and `{"count", "age"}` map exactly as before. | `tests/unit/test_job_options.py` (the existing table, with the unset row changed) |
-| BR-004 | The Lua twin agrees with `keep_args` for every option shape, unset included: a flow parent failed eagerly with `removeOnFail` unset is retained under the failed default. | `tests/integration/test_finished_retention.py::test_lua_twin_matches_python` |
-| BR-005 | A count bound met by a deep backlog deletes at most 1000 jobs in one finish, oldest first, and the set reaches the bound over later finishes. | `::test_count_trim_is_bounded_per_finish` |
-| BR-006 | A flow whose children were trimmed by the default still settles, and its parent still reads every child's result. | `tests/integration/test_flows.py::test_default_retention_keeps_children_results` |
+| BR-004 | The Lua twin agrees with `keep_args` for every option shape, unset included: a flow parent failed eagerly with `removeOnFail` unset is retained under the failed default. | `tests/integration/test_finished_retention.py::test_lua_twin_matches_python`, `::test_eagerly_failed_parent_is_kept_under_the_default` |
+| BR-005 | A count bound met by a deep backlog deletes at most 1000 jobs in one finish, oldest first, and the set reaches the bound over later finishes. The 1000 bounds the script: both bounds on one job, or a chain of ancestors failed with a leaf, still delete at most 1000. | `::test_count_trim_is_bounded_per_finish`, `::test_count_and_age_trims_share_one_budget`, `::test_failing_a_chain_of_ancestors_shares_one_budget` |
+| BR-006 | A flow whose children were trimmed by the default still settles, its parent still reads every child's result, and its progress counts do not go backwards. | `tests/integration/test_flows.py::test_default_retention_keeps_children_results`, `::test_flow_view_still_counts_children_the_default_trimmed` |
+| BR-007 | A scheduler's stored template carries the queue's `default_job_options` under its own options, so jobs a worker mints honor a queue that keeps everything. A manual trigger of a template that stores retention unset takes the queue's default. | `tests/integration/test_scheduler.py::test_scheduler_template_carries_the_queue_defaults`, `::test_scheduler_options_win_over_the_queue_defaults`, `tests/integration/test_finished_retention.py::test_scheduled_jobs_honor_a_queue_that_keeps_everything`, `tests/integration/test_admin.py::test_trigger_scheduler_leaves_unset_retention_to_the_queue` |
 
 ## Out of scope
 
@@ -67,6 +76,13 @@ Keep-forever stays available, as an explicit choice.
   finishes under a bound. That is how it works today with mixed options; the
   new default makes it common. Keeping everything means setting `False` for the
   queue, through `default_job_options` on every producer. The docs must say this.
+- **A custom `job_id` frees up sooner.** Adding an existing id is a no-op only
+  while the job's hash exists. On the old default that was forever; now it is
+  until 1000 newer jobs complete. The migration note says so.
+- **A trimmed child leaves its flow's tree.** On a busy queue that can happen
+  while the flow is still running. Results and counts are unaffected (BR-006);
+  retaining a flow as one unit would need children kept out of the rank-based
+  trim, which is a data-model change and not part of this one.
 - **`Queue.result()` on an old job.** A job trimmed from `completed` can no
   longer be read back. Awaiting a result while the job runs is unaffected.
 - **The dashboard.** matador's completed and failed tabs show at most the
@@ -74,15 +90,13 @@ Keep-forever stays available, as an explicit choice.
 - **Silent skips.** Integration tests skip with no Redis on `localhost:6379`;
   every gate must show zero skips.
 
-## Open questions
+## Decisions
 
-1. **The numbers.** Recommended: 1000 completed, 5000 failed.
-2. **Where the migration note lives.** There is no changelog and GitHub releases
-   carry no notes. Recommended: a new `docs/upgrading.md`, linked from the docs
+1. **The numbers.** 1000 completed, 5000 failed.
+2. **Where the migration note lives.** `docs/upgrading.md`, linked from the docs
    index and the README, with an entry per breaking release.
-3. **Set-wide trimming.** Recommended: document it, as above. Alternative:
-   change the semantics so a keep-forever job is exempt, which needs a second
-   index and is a larger change than this one.
+3. **Set-wide trimming.** Documented, not changed. Exempting a keep-forever job
+   needs a second index and is a larger change than this one.
 
 ## Tasks
 

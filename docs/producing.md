@@ -61,12 +61,17 @@ cleanup process to run or forget. Three things follow from that:
   a per-queue setting above.
 - **The worker applies it.** The option is stored with the job and read as the job
   finishes, so the default in force is that of the worker's toro version.
-- **A trim is bounded.** One finish deletes at most 1000 jobs, oldest first. A
-  bound that meets a deep backlog drains it over the following finishes instead
-  of blocking Redis in one pass.
+- **A trim is bounded.** One finish deletes at most 1000 jobs, oldest first,
+  whichever bounds apply and however many flow ancestors fail with it. A bound
+  that meets a deep backlog drains it over the following finishes instead of
+  blocking Redis in one pass.
+- **A scheduler stores its options when it is registered**, the queue's defaults
+  included, because workers mint each occurrence from the stored template. Call
+  `add_scheduler()` again to change them.
 
 A trimmed job is gone: its hash, logs and flow bookkeeping are deleted,
-`get_job()` returns `None`, and `result()` called after the trim times out.
+`get_job()` returns `None`, and `result()` called after the trim times out. A
+trimmed flow child leaves its flow's tree (see [Flows](flows.md)).
 Awaiting `result()` while the job runs is unaffected, and so are the metrics,
 which are separate counters. A job that fails by stalling out is recorded without
 a trim; the next ordinary failure's trim covers the set.
@@ -77,7 +82,9 @@ Two distinct tools, usable independently:
 
 - **`job_id="order-123"`** - id-based dedup. Adding a job whose id already
   exists is idempotent: nothing is enqueued and the existing job's id comes
-  back. The id frees up when the job is removed (including by auto-removal).
+  back. The id frees up when the job is removed, [retention](#retention)
+  included: on defaults, once 1000 newer jobs have completed. A queue that
+  relies on an id for longer keeps more history.
   Must be a non-empty, non-all-digits string - all-digit ids would collide with
   auto-generated ones.
 - **`deduplication={"id": "sync-user-42", "ttl": 60_000}`** - a throttle window.

@@ -59,7 +59,10 @@ async def process(job):
 A child's result is copied into the parent at the moment the child completes,
 so a child trimmed from `completed` - by the default retention, its own
 `remove_on_complete`, or routine history cleanup (`clean("completed")`) - costs
-the parent nothing: the parent's copy survives.
+the parent nothing: the parent's copy survives. Children are jobs like any other
+to [retention](producing.md#retention), so on a busy queue a finished child can be
+trimmed while its flow is still running. It then leaves the tree `get_flow()`
+returns; `flow_view()`'s `done` and `failed` still count it, from the parent's copy.
 
 ## When a child fails
 
