@@ -26,6 +26,7 @@ def _count_is(q, state, n):
 async def test_fanout_fanin_flows_at_volume(q, run_worker, run_until, load_scale):
     flows = int(20 * load_scale)
     width = 8  # children per flow
+    q.default_job_options = {"remove_on_complete": False}  # every completion is counted
 
     async def proc(job):
         if job.name == "part":
@@ -55,6 +56,7 @@ async def test_fanout_fanin_flows_at_volume(q, run_worker, run_until, load_scale
 
 async def test_deep_chain_releases_to_the_root(q, run_worker, run_until, load_scale):
     depth = int(30 * load_scale)
+    q.default_job_options = {"remove_on_complete": False}  # every completion is counted
 
     tree = c("step", {"lvl": 0})
     for lvl in range(1, depth):
