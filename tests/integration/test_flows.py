@@ -196,6 +196,47 @@ async def test_flow_view_still_counts_children_the_default_trimmed(q, run_worker
     assert len(view.tree["children"]) == 1  # only the running child still has a hash
 
 
+async def test_flow_view_still_counts_a_tolerated_failure_the_default_trimmed(
+    q, run_worker, run_until
+):
+    """The same for `failed`: a tolerated (`on_fail="continue"`) failure is copied into
+    the parent too, so it is still counted once the failed child's hash is trimmed."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name in ("bad", "unrelated"):
+            raise RuntimeError(job.name)
+        if job.name == "slow":
+            await gate.wait()
+
+    async with run_worker(q, proc, concurrency=4):
+        parent = await q.add_flow(
+            "report", {}, children=[c("bad", {}, on_fail="continue"), c("slow", {})]
+        )
+        assert await run_until(_count_is(q, "failed", 1))
+        bad = (await q.redis.zrange(q.keys.failed, 0, -1))[0]
+
+        # 5000 newer failures fill the default bound; one more pushes the child out
+        now = int(time.time() * 1000)
+        pipe = q.redis.pipeline(transaction=False)
+        for i in range(5000):
+            pipe.zadd(q.keys.failed, {f"other{i}": now + i})
+        await pipe.execute()
+        await q.add("unrelated", {})
+        assert await run_until(lambda: _hash_gone(q, bad), timeout=10)
+
+        view = await q.flow_view(parent.id)
+        gate.set()
+        await parent.result(timeout=10)
+
+    assert view is not None
+    assert (view.total, view.done, view.failed, view.live) == (2, 0, 1, True)
+
+
+async def _hash_gone(q, job_id):
+    return not await q.redis.exists(q.keys.job(job_id))
+
+
 async def test_nested_flow_releases_inner_then_root(q, run_worker, run_until):
     order = []
 
