@@ -129,6 +129,23 @@ class Queue:
         self._events_task: asyncio.Task[None] | None = None
         self._dispatcher_lock = asyncio.Lock()
 
+    def _custom_job_id(self, job_id: object) -> str:
+        """Validate a custom job id: it becomes the job's Redis key, `<base><id>`."""
+        job_id = str(job_id)
+        if not job_id or job_id.isdigit():
+            raise ValueError(
+                "custom job_id must be a non-empty, non-all-digits string "
+                "(digits collide with auto-generated ids) - try e.g. 'order-123'"
+            )
+        conflict = self.keys.job_id_conflict(job_id)
+        if conflict:
+            # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
+            # add() that finds the key and returns as if the job already existed
+            raise ValueError(
+                f"custom job_id {job_id!r} is reserved: it is {conflict} - try e.g. 'job-{job_id}'"
+            )
+        return job_id
+
     async def add(
         self,
         name: str,
@@ -156,20 +173,7 @@ class Queue:
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
         if job_id is not None:
-            job_id = str(job_id)
-            if not job_id or job_id.isdigit():
-                raise ValueError(
-                    "custom job_id must be a non-empty, non-all-digits string "
-                    "(digits collide with auto-generated ids) - try e.g. 'order-123'"
-                )
-            conflict = self.keys.job_id_conflict(job_id)
-            if conflict:
-                # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
-                # add() that finds the key and returns as if the job already existed
-                raise ValueError(
-                    f"custom job_id {job_id!r} is reserved: it is {conflict} "
-                    f"- try e.g. 'job-{job_id}'"
-                )
+            job_id = self._custom_job_id(job_id)
         dedup_id, dedup_ttl = "", 0
         if deduplication is not None:
             dedup_id = str(deduplication.get("id") or "")
