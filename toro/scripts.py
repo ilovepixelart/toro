@@ -747,25 +747,27 @@ if #stalling > 0 then
       if redis.call("LREM", KEYS[2], 1, jobId) > 0 then
         local count = redis.call("HINCRBY", jobKey, "stalledCounter", 1)
         if count > maxStalled then
-          redis.call("ZADD", KEYS[4], tonumber(ARGV[2]), jobId)
-          redis.call("HSET", jobKey, "state", "failed",
-            "failedReason", "job stalled more than allowable limit",
-            "finishedOn", ARGV[2])
-          recordMetrics(KEYS[6], "failed", tonumber(ARGV[2]), 0, tonumber(ARGV[4]),
-                        redis.call("HGET", jobKey, "name"))
+          local now = tonumber(ARGV[2])
+          local reason = "job stalled more than allowable limit"
+          -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+          local meta = redis.call("HMGET", jobKey, "name", "parentId", "onFail", "children", "opts")
+          -- no Python caller computed this job's retention, so the twin reads it: a
+          -- queue whose only failures are crashes must stay bounded like any other
+          local keepCount, keepAge = keepArgsFromOpts(meta[5])
+          recordFinished(KEYS[4], jobKey, KEYS[6], jobId, now,
+            "failedReason", reason, "failed", keepCount, keepAge)
+          recordMetrics(KEYS[6], "failed", now, 0, tonumber(ARGV[4]), meta[1])
           -- announce the terminal failure so result() waiters resolve instead
           -- of timing out (the sweeping worker's local events don't reach them)
-          redis.call("PUBLISH", KEYS[6] .. "events", cjson.encode({jobId = jobId,
-            event = "failed", reason = "job stalled more than allowable limit"}))
+          redis.call("PUBLISH", KEYS[6] .. "events",
+            cjson.encode({jobId = jobId, event = "failed", reason = reason}))
           -- the crash path settles flow parents too - a dead worker must not
           -- leave a parent parked forever
-          local pmeta = redis.call("HMGET", jobKey, "parentId", "onFail", "children")
-          if pmeta[1] then
-            settleChildFailed(KEYS[6], jobId, pmeta[1], pmeta[2],
-              "job stalled more than allowable limit", tonumber(ARGV[2]), tonumber(ARGV[4]))
-          elseif pmeta[3] then
+          if meta[2] then
+            settleChildFailed(KEYS[6], jobId, meta[2], meta[3], reason, now, tonumber(ARGV[4]))
+          elseif meta[4] then
             -- a released root flow parent that stalled out: count the flow failed
-            recordFlow(KEYS[6], false, tonumber(ARGV[2]), 0, tonumber(ARGV[4]))
+            recordFlow(KEYS[6], false, now, 0, tonumber(ARGV[4]))
           end
           table.insert(failed, jobId)
         else

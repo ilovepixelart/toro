@@ -55,12 +55,10 @@ Keep-forever stays available, as an explicit choice.
 | BR-005 | A count bound met by a deep backlog deletes at most 1000 jobs in one finish, oldest first, and the set reaches the bound over later finishes. The 1000 bounds the script: both bounds on one job, or a chain of ancestors failed with a leaf, still delete at most 1000. | `::test_count_trim_is_bounded_per_finish`, `::test_count_and_age_trims_share_one_budget`, `::test_failing_a_chain_of_ancestors_shares_one_budget` |
 | BR-006 | A flow whose children were trimmed by the default still settles, its parent still reads every child's result, and its progress counts do not go backwards. | `tests/integration/test_flows.py::test_default_retention_keeps_children_results`, `::test_flow_view_still_counts_children_the_default_trimmed` |
 | BR-007 | A scheduler's stored template carries the queue's `default_job_options` under its own options, so jobs a worker mints honor a queue that keeps everything. A manual trigger of a template that stores retention unset takes the queue's default. | `tests/integration/test_scheduler.py::test_scheduler_template_carries_the_queue_defaults`, `::test_scheduler_options_win_over_the_queue_defaults`, `tests/integration/test_finished_retention.py::test_scheduled_jobs_honor_a_queue_that_keeps_everything`, `tests/integration/test_admin.py::test_trigger_scheduler_leaves_unset_retention_to_the_queue` |
+| BR-008 | A job the stalled sweep fails for good is recorded under its own `remove_on_fail`, the default included: a queue whose only failures are crashed workers stays within the failed bound. | `tests/integration/test_finished_retention.py::test_a_crash_loop_cannot_outgrow_the_failed_bound`, `::test_a_stalled_out_job_honors_its_remove_on_fail` |
 
 ## Out of scope
 
-- Retention on the stall-failure path. `MOVE_STALLED` records a job that stalled
-  out without a trim, as `docs/flows-design.md` documents. The next ordinary
-  failure's trim covers the set.
 - An age-based default.
 - Per-job protection from another job's trim (see Risks).
 

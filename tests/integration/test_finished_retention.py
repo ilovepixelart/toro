@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-from toro import FlowChild, scripts
+from toro import FlowChild, Worker, scripts
 from toro.job import DEFAULT_KEEP_FAILED, JobOptions
 from toro.queue import Queue
 
@@ -284,3 +284,41 @@ async def test_scheduled_jobs_honor_a_queue_that_keeps_everything(q, run_worker,
         await producer.remove_scheduler("tick")
         await producer.close()
     assert not await _gone(q, "completed0")
+
+
+async def _stall_out(q: Queue, w: Worker, **opts) -> str:
+    """A job whose worker died holding it (on `active`, no lock), swept past the limit."""
+    job = await q.add("crashy", {}, **opts)
+    await q.redis.zrem(q.keys.prioritized, job.id)
+    await q.redis.rpush(q.keys.active, job.id)
+    await w.check_stalled(throttle_ms=0)  # mark
+    failed, _ = await w.check_stalled(throttle_ms=0)  # escalate past the limit
+    assert failed == [job.id]
+    return job.id
+
+
+async def test_a_crash_loop_cannot_outgrow_the_failed_bound(q):
+    """A job that kills its worker never reaches the failure script: the stalled sweep
+    fails it. A queue whose only failures are those has to stay bounded too."""
+    await _seed_finished(q, "failed", 5000)
+    w = Worker(q.name, _flaky, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+
+    for _ in range(3):
+        await _stall_out(q, w)
+
+    assert await q.redis.zcard(q.keys.failed) == 5000
+    assert [await _gone(q, f"failed{i}") for i in range(4)] == [True, True, True, False]
+
+
+@pytest.mark.parametrize(
+    ("option", "size", "kept"),
+    [(True, 10, False), (False, 11, True), (2, 2, True)],
+)
+async def test_a_stalled_out_job_honors_its_remove_on_fail(q, option, size, kept):
+    await _seed_finished(q, "failed", 10)
+    w = Worker(q.name, _flaky, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+
+    jid = await _stall_out(q, w, remove_on_fail=option)
+
+    assert await q.redis.zcard(q.keys.failed) == size
+    assert bool(await q.redis.exists(q.keys.job(jid))) is kept

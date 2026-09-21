@@ -73,8 +73,9 @@ A trimmed job is gone: its hash, logs and flow bookkeeping are deleted,
 `get_job()` returns `None`, and `result()` called after the trim times out. A
 trimmed flow child leaves its flow's tree (see [Flows](flows.md)).
 Awaiting `result()` while the job runs is unaffected, and so are the metrics,
-which are separate counters. A job that fails by stalling out is recorded without
-a trim; the next ordinary failure's trim covers the set.
+which are separate counters. Retention covers every way a job can finish: a
+worker's finish, a flow parent failed by the script, and a job the stalled sweep
+fails after its worker died.
 
 ## Custom ids and deduplication
 
