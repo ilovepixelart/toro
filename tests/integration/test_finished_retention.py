@@ -11,6 +11,8 @@ import pytest
 from toro import scripts
 from toro.queue import Queue
 
+PREFIX = "torotest"
+
 
 async def test_add_scheduler_rejects_non_positive_every(q):
     with pytest.raises(ValueError, match="positive"):
@@ -19,14 +21,18 @@ async def test_add_scheduler_rejects_non_positive_every(q):
         await q.add_scheduler("bad", every=-5000)
 
 
-async def _seed_old_completed(q: Queue, n: int) -> None:
-    old = int(time.time() * 1000) - 86_400_000  # finished a day ago
+async def _seed_finished(q: Queue, state: str, n: int) -> None:
+    """`n` jobs that finished a day ago, oldest first: `<state>0` .. `<state>{n-1}`,
+    each with its hash and a log line (an aux key a trim must take with it)."""
+    set_key = q.keys.completed if state == "completed" else q.keys.failed
+    old = int(time.time() * 1000) - 86_400_000
     pipe = q.redis.pipeline(transaction=False)
     for i in range(n):
-        jid = f"old{i}"
-        pipe.hset(q.keys.job(jid), mapping={"id": jid, "name": "bench", "state": "completed"})
-        pipe.zadd(q.keys.completed, {jid: old + i})
-        if i % 5000 == 4999:
+        jid = f"{state}{i}"
+        pipe.hset(q.keys.job(jid), mapping={"id": jid, "name": "bench", "state": state})
+        pipe.rpush(q.keys.logs(jid), "a log line")
+        pipe.zadd(set_key, {jid: old + i})
+        if i % 2000 == 1999:
             await pipe.execute()
             pipe = q.redis.pipeline(transaction=False)
     await pipe.execute()
@@ -76,7 +82,7 @@ async def _finish_one(q: Queue, keep_count: int, keep_age: int) -> None:
 
 async def test_age_trim_is_bounded_per_finish(q):
     n = 2500
-    await _seed_old_completed(q, n)
+    await _seed_finished(q, "completed", n)
 
     # keepAge=1h: every seeded entry is expired, but a single finish may only
     # trim a bounded slice of them.
@@ -87,23 +93,23 @@ async def test_age_trim_is_bounded_per_finish(q):
     remaining = await q.redis.zcard(q.keys.completed)
     assert remaining == n - 1000 + 1, f"trim not bounded: {remaining} left of {n}"
     # The trimmed slice was the oldest - its hashes are gone, newer ones remain.
-    assert not await q.redis.exists(q.keys.job("old0"))
-    assert await q.redis.exists(q.keys.job(f"old{n - 1}"))
+    assert not await q.redis.exists(q.keys.job("completed0"))
+    assert await q.redis.exists(q.keys.job(f"completed{n - 1}"))
 
 
 async def test_count_trim_is_bounded_per_finish(q):
     """BR-005: a count bound met by a deep backlog drains it a slice per finish."""
     n, keep = 2500, 10
-    await _seed_old_completed(q, n)
+    await _seed_finished(q, "completed", n)
 
     await _finish_one(q, keep_count=keep, keep_age=-1)
 
     # One slice, oldest first: the 1000 oldest are gone with their hashes, and
     # everything newer is untouched, the job that just finished included.
     assert await q.redis.zcard(q.keys.completed) == n - 1000 + 1
-    assert not await q.redis.exists(q.keys.job("old0"))
-    assert not await q.redis.exists(q.keys.job("old999"))
-    assert await q.redis.exists(q.keys.job("old1000"))
+    assert not await q.redis.exists(q.keys.job("completed0"))
+    assert not await q.redis.exists(q.keys.job("completed999"))
+    assert await q.redis.exists(q.keys.job("completed1000"))
 
     # The backlog drains over the following finishes and settles AT the bound.
     sizes = []
@@ -114,7 +120,69 @@ async def test_count_trim_is_bounded_per_finish(q):
     # What is left is the newest by finish time: the five jobs finished here and
     # the five newest of the backlog, hashes intact; the next oldest is gone.
     kept = await q.redis.zrange(q.keys.completed, 0, -1)
-    assert kept[:5] == [f"old{i}" for i in range(n - 5, n)]
-    assert all(not jid.startswith("old") for jid in kept[5:])
+    assert kept[:5] == [f"completed{i}" for i in range(n - 5, n)]
+    assert all(not jid.startswith("completed") for jid in kept[5:])
     assert all([await q.redis.exists(q.keys.job(jid)) for jid in kept])
-    assert not await q.redis.exists(q.keys.job(f"old{n - 6}"))
+    assert not await q.redis.exists(q.keys.job(f"completed{n - 6}"))
+
+
+async def _flaky(job):
+    if job.name == "boom":
+        raise RuntimeError(job.name)
+
+
+async def _gone(q: Queue, jid: str) -> bool:
+    return not await q.redis.exists(q.keys.job(jid), q.keys.logs(jid))
+
+
+async def test_unset_option_bounds_the_finished_sets(q, run_worker, run_until):
+    """BR-001: on defaults, completed keeps the newest 1000 and failed the newest 5000."""
+    await _seed_finished(q, "completed", 1000)
+    await _seed_finished(q, "failed", 5000)
+
+    async with run_worker(q, _flaky, concurrency=1):
+        for name in ("ok", "ok", "ok", "boom", "boom"):
+            await q.add(name, {})
+        assert await run_until(
+            lambda: _settled(q, completed=1000, failed=5000, newest=(3, 2)), timeout=10
+        )
+
+    # each finish pushed the oldest of its own set out, hash and aux keys with it
+    assert [await _gone(q, f"completed{i}") for i in range(4)] == [True, True, True, False]
+    assert [await _gone(q, f"failed{i}") for i in range(3)] == [True, True, False]
+
+
+async def _settled(q: Queue, *, completed: int, failed: int, newest: tuple[int, int]) -> bool:
+    """Both sets at the given size AND the jobs just run are the newest members."""
+    done = await q.redis.zrange(q.keys.completed, -newest[0], -1)
+    dead = await q.redis.zrange(q.keys.failed, -newest[1], -1)
+    return (
+        await q.redis.zcard(q.keys.completed) == completed
+        and await q.redis.zcard(q.keys.failed) == failed
+        and not any(j.startswith("completed") for j in done)
+        and not any(j.startswith("failed") for j in dead)
+    )
+
+
+@pytest.mark.parametrize("how", ["per job", "per queue"])
+async def test_false_keeps_everything(q, run_worker, run_until, how):
+    """BR-002: `False` opts out of the default, given per job or for the queue."""
+    await _seed_finished(q, "completed", 1000)
+    await _seed_finished(q, "failed", 5000)
+    keep = {"remove_on_complete": False, "remove_on_fail": False}
+    producer = Queue(
+        q.name, prefix=PREFIX, default_job_options=keep if how == "per queue" else None
+    )
+
+    try:
+        async with run_worker(q, _flaky, concurrency=1):
+            for name in ("ok", "ok", "ok", "boom", "boom"):
+                await producer.add(name, {}, **(keep if how == "per job" else {}))
+            assert await run_until(
+                lambda: _settled(q, completed=1003, failed=5002, newest=(3, 2)), timeout=10
+            )
+    finally:
+        await producer.close()
+
+    assert not await _gone(q, "completed0")
+    assert not await _gone(q, "failed0")
