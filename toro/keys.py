@@ -127,6 +127,35 @@ class Keys:
     def job(self, job_id: str | int) -> str:
         return f"{self.base}{job_id}"
 
+    # Where a custom job id could land on a key that is not its own: the namespaces
+    # built under the base (`de:` only in Lua) and the suffixes of a job's aux keys.
+    # tests/unit/test_job_id_conflicts.py derives both from this class and from the
+    # scripts, so a key added later cannot be left out.
+    _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:")
+    _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail")
+
+    def job_id_conflict(self, job_id: str) -> str | None:
+        """Name what a custom job id would collide with, or return None when it is free.
+
+        A job's hash lives at `<base><id>`, beside the queue's own keys: an id equal
+        to one of their names (`completed`, `marker`, ...) makes the job's hash and
+        that key the same Redis key.
+        """
+        own = {
+            getattr(self, name)[len(self.base) :]
+            for name, attr in vars(Keys).items()
+            if isinstance(attr, property)
+        }
+        if job_id in own:
+            return f"the queue's own {job_id!r} key"
+        for namespace in self._NAMESPACES:
+            if job_id.startswith(namespace):
+                return f"the queue's {namespace!r} keys"
+        for suffix in self._JOB_SUFFIXES:
+            if job_id.endswith(suffix):
+                return f"another job's {suffix!r} key"
+        return None
+
     def lock(self, job_id: str | int) -> str:
         return f"{self.base}{job_id}:lock"
 

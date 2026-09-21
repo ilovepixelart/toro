@@ -55,6 +55,12 @@ Two distinct tools, usable independently:
 `job_id` answers "this exact piece of work must exist at most once";
 `deduplication` answers "don't enqueue this more often than every X".
 
+A custom id becomes the job's Redis key, beside the queue's own keys, so `add()`
+refuses one that would land on another key: a queue key's name (`completed`,
+`marker`, ...), a queue namespace (`repeat:`, `worker:`, `metrics:`, `de:`), or
+another job's aux key (`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`).
+Colons are otherwise fine: `order:123`.
+
 To enqueue a parent job together with children that must run first
 (fan-out/fan-in, chains), use `add_flow()` - see [Flows](flows.md).
 

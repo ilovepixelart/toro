@@ -161,6 +161,11 @@ class Queue:
                     "custom job_id must be a non-empty, non-all-digits string "
                     "(digits collide with auto-generated ids) - try e.g. 'order-123'"
                 )
+            conflict = self.keys.job_id_conflict(job_id)
+            if conflict:
+                # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
+                # add() that finds the key and returns as if the job already existed
+                raise ValueError(f"custom job_id {job_id!r} is reserved: it is {conflict}")
         dedup_id, dedup_ttl = "", 0
         if deduplication is not None:
             dedup_id = str(deduplication.get("id") or "")

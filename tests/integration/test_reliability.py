@@ -338,6 +338,48 @@ async def test_custom_job_id_rejects_all_digits(q):
         await q.add("x", {}, job_id="123")
 
 
+@pytest.mark.parametrize(
+    "job_id",
+    [
+        "completed",  # the job hash WOULD BE the completed set: WRONGTYPE for the queue
+        "active",
+        "prioritized",  # add() found the queue's key and returned as if the job existed
+        "marker",
+        "id",
+        "repeat:nightly",  # a scheduler's template
+        "de:sync-user-42",  # a deduplication window
+        "metrics:1700000000000",
+        "7:lock",  # job 7's lock: claiming job 7 would overwrite this job
+        "order-123:results",
+    ],
+)
+async def test_custom_job_id_cannot_land_on_another_key(q, run_worker, run_until, job_id):
+    await q.add("first", {})  # the queue's own keys exist
+    with pytest.raises(ValueError, match="reserved"):
+        await q.add("victim", {}, job_id=job_id)
+
+    # nothing was written, and the queue still works end to end
+    ran = []
+
+    async def proc(job):
+        ran.append(job.name)
+
+    async with run_worker(q, proc):
+        assert await run_until(lambda: ran == ["first"])
+    assert (await q.counts())["completed"] == 1
+
+
+async def test_custom_job_id_may_use_colons(q, run_worker, run_until):
+    # `order:123` is how ids are written; only the queue's own namespaces are taken
+    async def proc(job):
+        return job.id
+
+    job = await q.add("welcome", {}, job_id="order:123")
+    async with run_worker(q, proc):
+        assert await job.result(timeout=10) == "order:123"
+    assert (await q.get_job("order:123")).state == "completed"
+
+
 async def test_deduplication_throttles_within_ttl(q):
     """A dedup id with a ttl ignores repeats within the window."""
     j1 = await q.add("notify", {"u": 1}, deduplication={"id": "user-1", "ttl": 5000})
