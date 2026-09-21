@@ -3,6 +3,7 @@ stalled escalation, removal and cleanup. See docs/flows-design.md.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -123,6 +124,40 @@ async def test_flow_result_waits_for_the_whole_flow(q, run_worker):
             "report", {}, children=[c("fetch", {"part": 2}), c("fetch", {"part": 1})]
         )
         assert await parent.result(timeout=10) == [1, 2]
+
+
+async def test_default_retention_keeps_children_results(q, run_worker, run_until):
+    """BR-006: a child the default retention already trimmed costs its parent nothing -
+    the result was copied into the parent when the child settled."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "fetch":
+            if job.data["part"] == 3:
+                await gate.wait()
+            return job.data["part"] * 10
+        return sorted((await job.children_results()).values())
+
+    async with run_worker(q, proc, concurrency=4):
+        parent = await q.add_flow(
+            "report", {}, children=[c("fetch", {"part": n}) for n in (1, 2, 3)]
+        )
+        assert await run_until(_count_is(q, "completed", 2))  # the third is held
+        early = await q.redis.zrange(q.keys.completed, 0, -1)
+
+        # a busy queue: 1000 newer completions fill the default bound, so the third
+        # child's finish pushes the two early children out before the parent runs
+        now = int(time.time() * 1000)
+        pipe = q.redis.pipeline(transaction=False)
+        for i in range(1000):
+            pipe.zadd(q.keys.completed, {f"other{i}": now + i})
+        await pipe.execute()
+        gate.set()
+
+        assert await parent.result(timeout=10) == [10, 20, 30]
+
+    assert [await q.redis.exists(q.keys.job(jid)) for jid in early] == [0, 0]
+    assert await _count(q, "waiting-children") == 0
 
 
 async def test_nested_flow_releases_inner_then_root(q, run_worker, run_until):
