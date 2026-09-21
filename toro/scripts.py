@@ -198,7 +198,12 @@ local function recordFlow(base, completed, now, durMs, retentionMs)
   end
   redis.call("PEXPIRE", bucket, retentionMs)
 end
--- Record a terminal job in a finished set, applying auto-removal:
+-- Most finished jobs one finish may trim. A bound that meets a deep backlog
+-- (a limit just enabled, a default just tightened) must not sweep it all in one
+-- Redis-blocking pass: the remainder amortizes over the following finishes
+-- (same idea as PROMOTE_DELAYED's batch).
+local TRIM_BATCH = 1000
+-- Record a terminal job in a finished set, applying auto-removal, oldest first:
 --   keepCount: -1 keep all, 0 remove immediately (don't record), N keep newest N
 --   keepAge:   -1 no age limit, S keep only those finished within S seconds
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
@@ -211,19 +216,20 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
   redis.call("HSET", jobKey, prop, val, "finishedOn", now, "state", state)
   if keepAge >= 0 then
     local cutoff = now - keepAge * 1000
-    -- Bounded per call: enabling an age limit on a deep finished backlog must
-    -- not sweep it all in one Redis-blocking pass - the remainder amortizes
-    -- over subsequent finishes (same idea as PROMOTE_DELAYED's batch).
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
-                               "LIMIT", 0, 1000)
+                               "LIMIT", 0, TRIM_BATCH)
     if #expired > 0 then
       delJobs(expired, base)
       redis.call("ZREM", setKey, unpack(expired))
     end
   end
   if keepCount > 0 then
-    delJobs(redis.call("ZREVRANGE", setKey, keepCount, -1), base)
-    redis.call("ZREMRANGEBYRANK", setKey, 0, -(keepCount + 1))
+    local excess = redis.call("ZCARD", setKey) - keepCount
+    if excess > 0 then
+      local last = math.min(excess, TRIM_BATCH) - 1
+      delJobs(redis.call("ZRANGE", setKey, 0, last), base)
+      redis.call("ZREMRANGEBYRANK", setKey, 0, last)
+    end
   end
 end
 -- Flow plumbing. A parent is parked in the `waiting-children` ZSET with a
