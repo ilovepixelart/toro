@@ -1,5 +1,5 @@
 """Retention of finished jobs: the defaults an unset option keeps, `False` as the
-way out, the per-script trim budget, the Lua twin of `keep_args`, and scheduled
+way out, the per-script trim budget, the one place an option is read, and scheduled
 jobs. (Also scheduler input validation.)
 """
 
@@ -10,7 +10,6 @@ import uuid
 import pytest
 
 from toro import FlowChild, Worker, scripts
-from toro.job import DEFAULT_KEEP_FAILED, JobOptions
 from toro.queue import Queue
 
 PREFIX = "torotest"
@@ -40,13 +39,13 @@ async def _seed_finished(q: Queue, state: str, n: int) -> None:
     await pipe.execute()
 
 
-async def _finish_one(q: Queue, keep_count: int, keep_age: int) -> None:
-    """One real claim and completion, straight through the scripts, under the
-    given retention (the ARGV pair `JobOptions.keep_args` produces)."""
+async def _finish_one(q: Queue, **opts) -> None:
+    """One real claim and completion, straight through the scripts, of a job added
+    with the given options - one finish at a time, so each trim can be counted."""
     token = uuid.uuid4().hex
     acquire = q.redis.register_script(scripts.MOVE_TO_ACTIVE)
     complete = q.redis.register_script(scripts.MOVE_TO_COMPLETED)
-    job = await q.add("bench", {})
+    job = await q.add("bench", {}, **opts)
     now = int(time.time() * 1000)
     res = await acquire(
         keys=[
@@ -77,7 +76,17 @@ async def _finish_one(q: Queue, keep_count: int, keep_age: int) -> None:
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[job.id, "null", now, token, "0", 30_000, keep_count, keep_age, 0, 0, 60_000],
+        args=scripts.completed_args(
+            job_id=job.id,
+            returnvalue="null",
+            now=now,
+            token=token,
+            fetch="0",
+            lock_duration=30_000,
+            rl_max=0,
+            rl_duration=0,
+            global_concurrency=0,
+        ),
     )
     assert out == [1]
 
@@ -88,7 +97,7 @@ async def test_age_trim_is_bounded_per_finish(q):
 
     # keepAge=1h: every seeded entry is expired, but a single finish may only
     # trim a bounded slice of them.
-    await _finish_one(q, keep_count=-1, keep_age=3600)
+    await _finish_one(q, remove_on_complete={"age": 3600})
 
     # Exactly one bounded slice trimmed (oldest first), the rest left for the
     # next finishes to amortize - plus the job that just completed.
@@ -104,7 +113,7 @@ async def test_count_trim_is_bounded_per_finish(q):
     n, keep = 2500, 10
     await _seed_finished(q, "completed", n)
 
-    await _finish_one(q, keep_count=keep, keep_age=-1)
+    await _finish_one(q, remove_on_complete=keep)
 
     # One slice, oldest first: the 1000 oldest are gone with their hashes, and
     # everything newer is untouched, the job that just finished included.
@@ -116,7 +125,7 @@ async def test_count_trim_is_bounded_per_finish(q):
     # The backlog drains over the following finishes and settles AT the bound.
     sizes = []
     for _ in range(4):
-        await _finish_one(q, keep_count=keep, keep_age=-1)
+        await _finish_one(q, remove_on_complete=keep)
         sizes.append(await q.redis.zcard(q.keys.completed))
     assert sizes == [502, keep, keep, keep]
     # What is left is the newest by finish time: the five jobs finished here and
@@ -134,7 +143,7 @@ async def test_count_and_age_trims_share_one_budget(q):
     n = 3000
     await _seed_finished(q, "completed", n)  # all a day old, all past a bound of 10
 
-    await _finish_one(q, keep_count=10, keep_age=3600)
+    await _finish_one(q, remove_on_complete={"count": 10, "age": 3600})
 
     assert await q.redis.zcard(q.keys.completed) == n + 1 - 1000
 
@@ -201,41 +210,52 @@ async def test_false_keeps_everything(q, run_worker, run_until, how):
     assert not await _gone(q, "failed0")
 
 
-# keepArgsFromOpts is local to the shared Lua, so it is run the way the scripts
-# reach it: with the library prepended.
-_TWIN = scripts._LIB + "local c, a = keepArgsFromOpts(ARGV[1]) return {c, a}"
+# keepFor is local to the shared Lua, so it is run the way the scripts reach it:
+# with the library prepended.
+_KEEP_FOR = scripts._LIB + "local c, a = keepFor(ARGV[1], ARGV[2]) return {c, a}"
+_UNSET = {"completed": (1000, -1), "failed": (5000, -1)}  # the documented defaults
 
 
+@pytest.mark.parametrize("state", ["completed", "failed"])
 @pytest.mark.parametrize(
-    "opts",
+    ("value", "kept"),
     [
-        {},  # the option was never given
-        {"removeOnFail": None},
-        {"removeOnFail": False},
-        {"removeOnFail": True},
-        {"removeOnFail": 1},
-        {"removeOnFail": 1000},
-        {"removeOnFail": {"count": 500}},
-        {"removeOnFail": {"age": 3600}},
-        {"removeOnFail": {"age": 3600, "count": 500}},
-        {"removeOnFail": {}},
-        {"removeOnFail": "nonsense"},
+        ("absent", None),  # the option was never given: the default for the set
+        (None, None),
+        (False, (-1, -1)),  # keep everything: the way out of the default
+        (True, (0, -1)),  # remove at once
+        (1, (1, -1)),  # not True: the newest one
+        (1000, (1000, -1)),
+        (2.9, (2, -1)),  # a count is whole
+        ({"count": 500}, (500, -1)),
+        ({"age": 3600}, (-1, 3600)),
+        ({"age": 3600, "count": 500}, (500, 3600)),
+        ({}, (-1, -1)),  # a bound that names neither keeps everything
+        ("nonsense", (-1, -1)),
     ],
-    ids=json.dumps,
+    ids=str,
 )
-async def test_lua_twin_matches_python(q, opts):
-    """BR-004: a parent failed by the script is retained as a worker would retain it."""
-    twin = await q.redis.eval(_TWIN, 0, json.dumps(opts))
-    assert tuple(twin) == JobOptions.keep_args(opts.get("removeOnFail"), DEFAULT_KEEP_FAILED)
+async def test_the_one_place_a_remove_option_is_read(q, state, value, kept):
+    """BR-003, BR-004: every way a job finishes reads its option HERE, in the script
+    that records it - a worker's finish, a parent failed with its child, a job the
+    stalled sweep gives up on. There is no second copy of this table to drift."""
+    option = "removeOnComplete" if state == "completed" else "removeOnFail"
+    other = "removeOnFail" if state == "completed" else "removeOnComplete"
+    opts = {other: True}  # the other set's option must not leak into this one
+    if value != "absent":
+        opts[option] = value
+    got = await q.redis.eval(_KEEP_FOR, 0, json.dumps(opts), state)
+    assert tuple(got) == (kept or _UNSET[state])
 
 
+@pytest.mark.parametrize("state", ["completed", "failed"])
 @pytest.mark.parametrize("stored", ["not json", '"a string"', "[1, 2"])
-async def test_lua_twin_counts_unreadable_opts_as_unset(q, stored):
-    assert tuple(await q.redis.eval(_TWIN, 0, stored)) == (DEFAULT_KEEP_FAILED, -1)
+async def test_unreadable_opts_count_as_unset(q, state, stored):
+    assert tuple(await q.redis.eval(_KEEP_FOR, 0, stored, state)) == _UNSET[state]
 
 
 async def test_eagerly_failed_parent_is_kept_under_the_default(q, run_worker, run_until):
-    """BR-004: no worker ever finishes this parent, so only the twin can bound it."""
+    """BR-004: no worker ever finishes this parent: the script that fails it bounds it."""
     await _seed_finished(q, "failed", 5000)
 
     async with run_worker(q, _flaky, concurrency=1):

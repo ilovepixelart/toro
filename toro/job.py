@@ -38,6 +38,7 @@ Backoff: TypeAlias = "int | float | BackoffOpts | None"
 RemoveOption: TypeAlias = "bool | int | dict[str, int] | None"
 # What an unset option keeps. A count, not an age: a count caps memory whatever
 # the throughput. Failures are what gets debugged, so more of them are kept.
+# The option is read in ONE place, `keepFor` in scripts.py, which takes these.
 DEFAULT_KEEP_COMPLETED = 1000
 DEFAULT_KEEP_FAILED = 5000
 
@@ -82,27 +83,6 @@ class JobOptions:
             remove_on_complete=d.get("removeOnComplete"),
             remove_on_fail=d.get("removeOnFail"),
         )
-
-    @staticmethod
-    def keep_args(opt: RemoveOption, default: int) -> tuple[int, int]:
-        """Map a remove option to (keepCount, keepAge_seconds) for the Lua side.
-
-        keepCount: -1 keep all · 0 remove immediately · N keep newest N.
-        keepAge:   -1 no age limit · S keep only those finished within S seconds.
-        `default` is the count an unset option keeps (DEFAULT_KEEP_COMPLETED or
-        DEFAULT_KEEP_FAILED, whichever set the job is finishing into).
-        """
-        if opt is None:
-            return (default, -1)
-        if opt is False:
-            return (-1, -1)
-        if opt is True:
-            return (0, -1)
-        if isinstance(opt, int):
-            return (int(opt), -1)
-        if isinstance(opt, dict):
-            return (int(opt.get("count", -1)), int(opt.get("age", -1)))
-        return (-1, -1)
 
 
 def decode_results(h: dict[str, str]) -> dict[str, Any]:

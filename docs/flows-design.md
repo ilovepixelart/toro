@@ -156,9 +156,8 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
   - **The stalled path gets identical parent bookkeeping**: `MOVE_STALLED`'s
     fail-branch runs the same settle logic (lesson 1: the crash path is where
     barriers historically break). The stall-escalated job itself is recorded
-    through `recordFinished` too, under its own `remove_on_fail` as read by the
-    Lua twin of `keep_args` - a queue whose only failures are crashes stays
-    bounded like any other.
+    through `recordFinished` too, which reads the job's own `remove_on_fail` - a
+    queue whose only failures are crashes stays bounded like any other.
 - **Cleanup is structural** (lesson 5): `delJobs` and `REMOVE_JOB` know the
   three aux keys, so every existing removal path (auto-removal
   keepCount/keepAge, manual remove, `clean()`) deletes them for free.

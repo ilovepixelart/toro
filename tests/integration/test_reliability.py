@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from toro import JobFailedError, Queue, Worker
+from toro import JobFailedError, Queue, Worker, scripts
 
 PREFIX = "torotest"
 QUEUE = "reliability"
@@ -141,7 +141,17 @@ async def test_fetch_next_in_finish(q):
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[cur.id, "{}", _now_ms(), w.token, "1", 30000, -1, -1, 0, 0, 60_000, 0],
+        args=scripts.completed_args(
+            job_id=cur.id,
+            returnvalue="{}",
+            now=_now_ms(),
+            token=w.token,
+            fetch="1",
+            lock_duration=30000,
+            rl_max=0,
+            rl_duration=0,
+            global_concurrency=0,
+        ),
     )
     assert isinstance(res, list) and res[0] == 1
     assert len(res) == 3 and res[2] == nxt.id  # next handed back

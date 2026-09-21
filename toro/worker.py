@@ -35,14 +35,7 @@ from redis.asyncio import Redis
 from . import scripts
 from ._replies import _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, connect, read_timeout
-from .job import (
-    DEFAULT_KEEP_COMPLETED,
-    DEFAULT_KEEP_FAILED,
-    Backoff,
-    Job,
-    JobContext,
-    JobOptions,
-)
+from .job import Backoff, Job, JobContext
 from .keys import Keys
 from .scheduler import next_run
 
@@ -457,19 +450,17 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=[
-                job.id,
-                json.dumps(result),
-                _now_ms(),
-                self.token,
-                self._fetch_flag(),
-                self.lock_duration,
-                *JobOptions.keep_args(job.opts.remove_on_complete, DEFAULT_KEEP_COMPLETED),
-                self.rl_max,
-                self.rl_duration,
-                scripts.METRICS_RETENTION_MS,
-                self.global_concurrency,
-            ],
+            args=scripts.completed_args(
+                job_id=job.id,
+                returnvalue=json.dumps(result),
+                now=_now_ms(),
+                token=self.token,
+                fetch=self._fetch_flag(),
+                lock_duration=self.lock_duration,
+                rl_max=self.rl_max,
+                rl_duration=self.rl_duration,
+                global_concurrency=self.global_concurrency,
+            ),
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             await self._finish_lost(job.id)
@@ -495,22 +486,20 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=[
-                job.id,
-                str(exc),
-                _now_ms(),
-                job.attempts_made,
-                job.opts.attempts,
-                self._backoff_delay(job),
-                self.token,
-                self._fetch_flag(),
-                self.lock_duration,
-                *JobOptions.keep_args(job.opts.remove_on_fail, DEFAULT_KEEP_FAILED),
-                self.rl_max,
-                self.rl_duration,
-                scripts.METRICS_RETENTION_MS,
-                self.global_concurrency,
-            ],
+            args=scripts.failed_args(
+                job_id=job.id,
+                reason=str(exc),
+                now=_now_ms(),
+                attempts_made=job.attempts_made,
+                max_attempts=job.opts.attempts,
+                backoff=self._backoff_delay(job),
+                token=self.token,
+                fetch=self._fetch_flag(),
+                lock_duration=self.lock_duration,
+                rl_max=self.rl_max,
+                rl_duration=self.rl_duration,
+                global_concurrency=self.global_concurrency,
+            ),
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             await self._finish_lost(job.id)

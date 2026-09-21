@@ -55,7 +55,7 @@ ran its scheduled jobs with one attempt. They now merge under the scheduler's ow
 options, as they do for `add()`. Pass the option to `add_scheduler()` to keep a
 scheduler on a different value.
 
-### `JobOptions.keep_args` takes the default
+### `JobOptions.keep_args` is removed
 
-`JobOptions.keep_args(opt)` is now `keep_args(opt, default)`, where `default` is the
-count an unset option keeps.
+It mapped a remove option to two arguments of the finish scripts. The scripts now
+read the option from the job themselves, so nothing computes it on the Python side.

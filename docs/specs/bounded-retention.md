@@ -21,11 +21,15 @@ Keep-forever stays available, as an explicit choice.
 - **`False` is the escape hatch.** It already means keep forever, and keeps that
   meaning. `True`, an int, and `{"count", "age"}` are unchanged. Today `None` and
   `False` behave alike; this change is what separates them.
-- **One source for the numbers.** `DEFAULT_KEEP_COMPLETED` and
-  `DEFAULT_KEEP_FAILED` live in `toro/job.py`. `JobOptions.keep_args` takes the
-  default that applies. Its Lua twin `keepArgsFromOpts`, used when a flow parent
-  fails with no Python caller, gets the same number interpolated into the script
-  text when it is built, so the two cannot drift.
+- **One place reads the option.** `keepFor`, in the shared Lua, maps a job's
+  stored option to what its finished set keeps, and `recordFinished` calls it for
+  every job it records. It is in Lua because two of the ways a job finishes have
+  no worker behind them (a parent failed with its child, a job the stalled sweep
+  gives up on); a second copy in Python for the worker's own finishes would be a
+  copy to keep in step. The defaults, `DEFAULT_KEEP_COMPLETED` and
+  `DEFAULT_KEEP_FAILED`, live in `toro/job.py` and are interpolated into the
+  script text. No caller passes retention, so none can pass the wrong one or
+  skip it.
 - **The count trim becomes bounded per finish. This comes first.** The age trim
   deletes at most 1000 jobs per finish; the count trim deletes everything past
   the bound in one pass. Flipping the default on a queue holding millions of
@@ -50,8 +54,8 @@ Keep-forever stays available, as an explicit choice.
 |---|---|---|
 | BR-001 | With the option unset, `completed` holds at most the newest 1000 jobs and `failed` at most the newest 5000, and the trimmed jobs' hashes and aux keys are gone. | `tests/integration/test_finished_retention.py::test_unset_option_bounds_the_finished_sets` |
 | BR-002 | `False` keeps every finished job, given per job and given through `default_job_options`. | `::test_false_keeps_everything` |
-| BR-003 | `True`, an int, and `{"count", "age"}` map exactly as before. | `tests/unit/test_job_options.py` (the existing table, with the unset row changed) |
-| BR-004 | The Lua twin agrees with `keep_args` for every option shape, unset included: a flow parent failed eagerly with `removeOnFail` unset is retained under the failed default. | `tests/integration/test_finished_retention.py::test_lua_twin_matches_python`, `::test_eagerly_failed_parent_is_kept_under_the_default` |
+| BR-003 | `False`, `True`, a count and `{"count", "age"}` map exactly as before, for both finished sets; unset, null and unreadable opts map to the set's default; the other set's option never leaks in. | `tests/integration/test_finished_retention.py::test_the_one_place_a_remove_option_is_read`, `::test_unreadable_opts_count_as_unset` |
+| BR-004 | Every way a job finishes applies that job's own option through the same routine: a flow parent failed eagerly with `removeOnFail` unset is retained under the failed default. | `tests/integration/test_finished_retention.py::test_eagerly_failed_parent_is_kept_under_the_default` (with BR-001 for a worker's finish and BR-008 for the stalled sweep) |
 | BR-005 | A count bound met by a deep backlog deletes at most 1000 jobs in one finish, oldest first, and the set reaches the bound over later finishes. The 1000 bounds the script: both bounds on one job, or a chain of ancestors failed with a leaf, still delete at most 1000. | `::test_count_trim_is_bounded_per_finish`, `::test_count_and_age_trims_share_one_budget`, `::test_failing_a_chain_of_ancestors_shares_one_budget` |
 | BR-006 | A flow whose children were trimmed by the default still settles, its parent still reads every child's result, and its progress counts do not go backwards. | `tests/integration/test_flows.py::test_default_retention_keeps_children_results`, `::test_flow_view_still_counts_children_the_default_trimmed` |
 | BR-007 | A scheduler's stored template carries the queue's `default_job_options` under its own options, so jobs a worker mints honor a queue that keeps everything. A manual trigger of a template that stores retention unset takes the queue's default. | `tests/integration/test_scheduler.py::test_scheduler_template_carries_the_queue_defaults`, `::test_scheduler_options_win_over_the_queue_defaults`, `tests/integration/test_finished_retention.py::test_scheduled_jobs_honor_a_queue_that_keeps_everything`, `tests/integration/test_admin.py::test_trigger_scheduler_leaves_unset_retention_to_the_queue` |
@@ -101,9 +105,9 @@ Keep-forever stays available, as an explicit choice.
 | # | Clause | Work | Files | Test strategy |
 |---|---|---|---|---|
 | 1 | BR-005 | Bound the count trim per finish, oldest first | `toro/scripts.py` | seed a deep backlog, one finish, count the deletions; red first |
-| 2 | BR-003 | `keep_args` takes the applicable default; unset maps to it | `toro/job.py`, `toro/worker.py` | the unit table, red first |
+| 2 | BR-003 | `keepFor` reads the option for either set; the worker stops passing retention | `toro/scripts.py`, `toro/worker.py`, `toro/job.py` | the option table run inside Redis, red first |
 | 3 | BR-001, BR-002 | End to end through a worker | tests | finish past both bounds; `False` per job and per queue |
-| 4 | BR-004 | The Lua twin takes the same constant | `toro/scripts.py` | eager parent failure with the option unset; parity table |
+| 4 | BR-004 | `recordFinished` calls `keepFor` itself; the finish scripts' ARGV is built in one place | `toro/scripts.py` | eager parent failure with the option unset |
 | 5 | BR-006 | Flows under the default | tests only | children trimmed before the parent runs |
 | 6 | | Docs: `producing.md`, README row, `docs/upgrading.md`, the docs index | docs | review |
 | 7 | | Prove: full suite with zero skips, mutation audit, memory stays flat over a long run on defaults | | evidence captured |
