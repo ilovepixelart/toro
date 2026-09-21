@@ -1,6 +1,6 @@
-"""Auto-removal retention edges: scheduler input validation and the bounded
-age-trim - enabling `remove_on_complete={"age": ...}` on a queue with a deep
-finished backlog must not sweep it all in one Redis-blocking call.
+"""Retention of finished jobs: the defaults an unset option keeps, `False` as the
+way out, the per-script trim budget, the Lua twin of `keep_args`, and scheduled
+jobs. (Also scheduler input validation.)
 """
 
 import json
@@ -128,6 +128,17 @@ async def test_count_trim_is_bounded_per_finish(q):
     assert not await q.redis.exists(q.keys.job(f"completed{n - 6}"))
 
 
+async def test_count_and_age_trims_share_one_budget(q):
+    """Both bounds on one job: the age trim and the count trim together still delete
+    at most one batch in a finish."""
+    n = 3000
+    await _seed_finished(q, "completed", n)  # all a day old, all past a bound of 10
+
+    await _finish_one(q, keep_count=10, keep_age=3600)
+
+    assert await q.redis.zcard(q.keys.completed) == n + 1 - 1000
+
+
 async def _flaky(job):
     if job.name == "boom":
         raise RuntimeError(job.name)
@@ -238,3 +249,38 @@ async def test_eagerly_failed_parent_is_kept_under_the_default(q, run_worker, ru
 
 async def _state_is(q: Queue, job_id: str, state: str) -> bool:
     return await q.redis.hget(q.keys.job(job_id), "state") == state
+
+
+async def test_failing_a_chain_of_ancestors_shares_one_budget(q, run_worker, run_until):
+    """A failing leaf fails its ancestors in the SAME script, one recordFinished each.
+    The batch bounds the script, not each of them: a deep flow must not multiply it."""
+    n = 9000
+    await _seed_finished(q, "failed", n)  # 4000 past the default bound
+
+    async with run_worker(q, _flaky, concurrency=1):
+        mid = FlowChild("mid", {}, children=[FlowChild("boom", {})])
+        root = await q.add_flow("root", {}, children=[mid])
+        assert await run_until(lambda: _state_is(q, root.id, "failed"), timeout=10)
+
+    # leaf, mid and root were recorded by one script: three jobs in, one batch out
+    assert await q.redis.zcard(q.keys.failed) == n + 3 - 1000
+
+
+async def test_scheduled_jobs_honor_a_queue_that_keeps_everything(q, run_worker, run_until):
+    """End to end: the first occurrence comes from the producer, every later one is
+    minted by the WORKER, and none of them may trim a queue that opted out."""
+    await _seed_finished(q, "completed", 1000)
+    keep = {"remove_on_complete": False, "remove_on_fail": False}
+    producer = Queue(q.name, prefix=PREFIX, default_job_options=keep)
+
+    async def grown() -> bool:
+        return await q.redis.zcard(q.keys.completed) >= 1003
+
+    try:
+        async with run_worker(q, _flaky, concurrency=1):
+            await producer.add_scheduler("tick", every=50)
+            assert await run_until(grown, timeout=10), "scheduled jobs were trimmed"
+    finally:
+        await producer.remove_scheduler("tick")
+        await producer.close()
+    assert not await _gone(q, "completed0")

@@ -205,11 +205,13 @@ local function recordFlow(base, completed, now, durMs, retentionMs)
   end
   redis.call("PEXPIRE", bucket, retentionMs)
 end
--- Most finished jobs one finish may trim. A bound that meets a deep backlog
--- (a limit just enabled, a default just tightened) must not sweep it all in one
--- Redis-blocking pass: the remainder amortizes over the following finishes
--- (same idea as PROMOTE_DELAYED's batch).
-local TRIM_BATCH = 1000
+-- Finished jobs this SCRIPT may still trim. A bound that meets a deep backlog (a
+-- limit just enabled, a default just tightened) must not sweep it all in one
+-- Redis-blocking pass: the remainder amortizes over the following finishes (same
+-- idea as PROMOTE_DELAYED's batch). One budget for the whole script, because one
+-- script can record many jobs (a failing flow child fails its ancestors with it)
+-- and one job can carry both bounds.
+local trimBudget = 1000
 -- Record a terminal job in a finished set, applying auto-removal, oldest first:
 --   keepCount: -1 keep all, 0 remove immediately (don't record), N keep newest N
 --   keepAge:   -1 no age limit, S keep only those finished within S seconds
@@ -221,21 +223,24 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
   end
   redis.call("ZADD", setKey, now, jobId)
   redis.call("HSET", jobKey, prop, val, "finishedOn", now, "state", state)
-  if keepAge >= 0 then
+  if keepAge >= 0 and trimBudget > 0 then
     local cutoff = now - keepAge * 1000
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
-                               "LIMIT", 0, TRIM_BATCH)
+                               "LIMIT", 0, trimBudget)
     if #expired > 0 then
       delJobs(expired, base)
       redis.call("ZREM", setKey, unpack(expired))
+      trimBudget = trimBudget - #expired
     end
   end
-  if keepCount > 0 then
+  -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
+  if keepCount > 0 and trimBudget > 0 then
     local excess = redis.call("ZCARD", setKey) - keepCount
     if excess > 0 then
-      local last = math.min(excess, TRIM_BATCH) - 1
+      local last = math.min(excess, trimBudget) - 1
       delJobs(redis.call("ZRANGE", setKey, 0, last), base)
       redis.call("ZREMRANGEBYRANK", setKey, 0, last)
+      trimBudget = trimBudget - (last + 1)
     end
   end
 end
