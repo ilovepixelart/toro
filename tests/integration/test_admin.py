@@ -106,12 +106,21 @@ async def test_trigger_missing_scheduler_returns_false(q):
 
 async def test_trigger_scheduler_carries_configured_opts(q):
     # a manual "run now" must match a scheduled occurrence's options, not defaults
-    await q.add_scheduler("nightly", cron="0 0 * * *", name="rollup", priority=7, attempts=5)
+    await q.add_scheduler(
+        "nightly",
+        cron="0 0 * * *",
+        name="rollup",
+        priority=7,
+        attempts=5,
+        remove_on_complete=25,
+        remove_on_fail=False,
+    )
     assert await q.trigger_scheduler("nightly") is True
     job = (await q.get_jobs("wait", 0, 0))[0]
     assert job.name == "rollup"
     assert job.opts.priority == 7
     assert job.opts.attempts == 5
+    assert (job.opts.remove_on_complete, job.opts.remove_on_fail) == (25, False)
 
 
 async def test_trigger_scheduler_leaves_unset_retention_to_the_queue(q):
