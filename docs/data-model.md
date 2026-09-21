@@ -36,7 +36,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `stalled` | SET | Candidate ids for the mark-and-sweep recovery pass. |
 | `stalled-check` | string (PX) | Throttle key so the stalled sweep runs about once per interval cluster-wide. |
 | `repeat` | ZSET | Scheduler id -> next-run timestamp. |
-| `workers` | ZSET | Live worker id -> last-heartbeat ms; stale entries pruned lazily on read. |
+| `workers` | ZSET | Live worker id -> last-heartbeat ms; stale entries pruned on read, and entries a day old by any worker's heartbeat. |
 | `departed` | LIST (capped) | Recent worker departures: graceful `stopped` or `lost` (crashed). |
 | `metrics:<minute>` | HASH | Per-minute counters (`added`/`completed`/`failed`/`ms`, per-name fields, histograms); self-expiring. |
 | `de:<dedupId>` | string (PX) | A live deduplication throttle window; holds the already-queued job's id. |
@@ -46,7 +46,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | Key | Type | Holds |
 |---|---|---|
 | `repeat:<schedulerId>` | HASH | A scheduler's template: `name`, `every`/`cron`, `data`, `opts`. |
-| `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, global concurrency cap, current jobs, processed/failed counts, state. |
+| `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, global concurrency cap, current jobs, processed/failed counts, state. Expires a day after the last heartbeat. |
 | `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail` (children), `children` (parents). |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |

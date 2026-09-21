@@ -78,6 +78,11 @@ def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
     return min(block_timeout, ceiling)
 
 
+# How long a presence record outlives its worker's last heartbeat. Long enough that a
+# dashboard opened the next day still finds a crashed worker and logs it as lost.
+PRESENCE_TTL_MS = 24 * 60 * 60 * 1000
+
+
 def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
     """Delay (ms) before the next attempt. `backoff` is None/0, an int (fixed ms),
     or {"type": "fixed"|"exponential", "delay": ms}. Exponential doubles per attempt.
@@ -262,7 +267,8 @@ class Worker:
     async def _write_heartbeat(self) -> None:
         """Flush this worker's presence record and register it as live."""
         now = _now_ms()
-        await self.redis.hset(
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.hset(
             self.keys.worker(self.token),
             mapping={
                 "id": self.token,
@@ -279,7 +285,13 @@ class Worker:
                 "state": self._state,
             },
         )
-        await self.redis.zadd(self.keys.workers, {self.token: now})
+        pipe.zadd(self.keys.workers, {self.token: now})
+        # Dead workers are pruned by whoever reads workers() - a dashboard. With no
+        # reader, a worker killed without deregistering would leave its record for
+        # good: so the record expires, and the index drops what has outlived it.
+        pipe.pexpire(self.keys.worker(self.token), PRESENCE_TTL_MS)
+        pipe.zremrangebyscore(self.keys.workers, "-inf", now - PRESENCE_TTL_MS)
+        await pipe.execute()
 
     async def _deregister(self) -> None:
         await self._record_departure("stopped")  # graceful shutdown
