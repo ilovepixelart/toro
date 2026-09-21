@@ -19,7 +19,10 @@ queue = Queue(
 `remove_on_complete` and `remove_on_fail` left unset used to keep every finished
 job, so a queue on its defaults grew until Redis ran out of memory. Unset now
 keeps the newest 1000 completed jobs and the newest 5000 failed jobs. `False`,
-`True`, a count and `{"count", "age"}` mean what they meant before.
+`True`, a count and `{"count", "age"}` mean what they meant before, with one
+edge made whole: a count or an age is now floored to an integer wherever it is
+given (`2.9` keeps 2), where a fractional bare count kept everything and a
+fractional `count` in the dict form failed the finish inside Redis.
 
 | | Before | Now |
 |---|---|---|

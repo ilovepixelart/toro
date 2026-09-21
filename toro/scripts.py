@@ -222,6 +222,14 @@ local trimBudget = 1000
 -- of the ways a job finishes have no worker behind them: a parent failed with its
 -- child, and a job the stalled sweep gives up on. Unset, null and unreadable opts
 -- keep the default for the set.
+-- A count is a rank and an age is multiplied into a score: both must be whole, and
+-- neither may be NaN or infinite, which compare as nothing and would slip past
+-- every bound below. Anything else means "no bound".
+local function whole(v)
+  local n = tonumber(v)
+  if n == nil or n ~= n or n < 0 or n == math.huge then return -1 end
+  return math.floor(n)
+end
 local function keepFor(optsJson, state)
   local completed = state == "completed"
   local default = completed and DEFAULT_KEEP_COMPLETED or DEFAULT_KEEP_FAILED
@@ -232,8 +240,8 @@ local function keepFor(optsJson, state)
   if v == nil or v == cjson.null then return default, -1 end
   if v == false then return -1, -1 end
   if v == true then return 0, -1 end
-  if type(v) == "number" then return math.floor(v), -1 end
-  if type(v) == "table" then return tonumber(v.count) or -1, tonumber(v.age) or -1 end
+  if type(v) == "number" then return whole(v), -1 end
+  if type(v) == "table" then return whole(v.count), whole(v.age) end
   return -1, -1
 end
 -- Record a terminal job in its finished set and apply the job's own retention,

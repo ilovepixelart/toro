@@ -52,7 +52,7 @@ queue = Queue(
 ```
 
 Retention is enforced inside the finish script itself - there is no separate
-cleanup process to run or forget. Three things follow from that:
+cleanup process to run or forget. It follows that:
 
 - **Retention belongs to the set, not to the job.** A trim runs when a job
   finishes, under *that job's* option, and trims the whole `completed` (or

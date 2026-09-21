@@ -226,12 +226,17 @@ _UNSET = {"completed": (1000, -1), "failed": (5000, -1)}  # the documented defau
         (True, (0, -1)),  # remove at once
         (1, (1, -1)),  # not True: the newest one
         (1000, (1000, -1)),
-        (2.9, (2, -1)),  # a count is whole
+        (2.9, (2, -1)),  # a count is whole (the finish below proves it: this
+        ({"count": 2.9}, (2, -1)),  # reply truncates, a rank command does not)
         ({"count": 500}, (500, -1)),
         ({"age": 3600}, (-1, 3600)),
         ({"age": 3600, "count": 500}, (500, 3600)),
         ({}, (-1, -1)),  # a bound that names neither keeps everything
         ("nonsense", (-1, -1)),
+        ({"count": "abc"}, (-1, -1)),  # not a number: no bound, not an error
+        ({"count": 1e400}, (-1, -1)),  # infinity would compare as no bound anyway
+        ({"count": -5}, (-1, -1)),  # any negative means no bound, as -1 does
+        ({"age": 2.5}, (-1, 2)),
     ],
     ids=str,
 )
@@ -315,6 +320,18 @@ async def _stall_out(q: Queue, w: Worker, **opts) -> str:
     failed, _ = await w.check_stalled(throttle_ms=0)  # escalate past the limit
     assert failed == [job.id]
     return job.id
+
+
+@pytest.mark.parametrize("option", [2.9, {"count": 2.9}, {"count": 2.9, "age": 86_400 * 2}])
+async def test_a_fractional_count_is_a_whole_rank(q, option):
+    """A rank command takes integers only. A count that reached ZREMRANGEBYRANK as
+    2.9 raised inside the finish script, after the finish had committed: no event,
+    no metrics, no trim, and a flow child would never settle its parent."""
+    await _seed_finished(q, "completed", 5)
+
+    await _finish_one(q, remove_on_complete=option)
+
+    assert await q.redis.zcard(q.keys.completed) == 2
 
 
 async def test_a_crash_loop_cannot_outgrow_the_failed_bound(q):
