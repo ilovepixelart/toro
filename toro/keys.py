@@ -6,6 +6,8 @@ disagree about where a list/zset/hash lives.
 
 from __future__ import annotations
 
+import inspect
+
 
 class Keys:
     """Computes the Redis key names for one queue from its prefix + name."""
@@ -129,8 +131,6 @@ class Keys:
 
     # Where a custom job id could land on a key that is not its own: the namespaces
     # built under the base (`de:` only in Lua) and the suffixes of a job's aux keys.
-    # tests/unit/test_job_id_conflicts.py derives both from this class and from the
-    # scripts, so a key added later cannot be left out.
     _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:")
     _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail")
 
@@ -142,14 +142,14 @@ class Keys:
         that key the same Redis key.
         """
         own = {
-            getattr(self, name)[len(self.base) :]
-            for name, attr in vars(Keys).items()
-            if isinstance(attr, property)
+            key.fget(self)[len(self.base) :]
+            for _, key in inspect.getmembers(type(self), lambda m: isinstance(m, property))
         }
         if job_id in own:
             return f"the queue's own {job_id!r} key"
         for namespace in self._NAMESPACES:
-            if job_id.startswith(namespace):
+            # `de` as well as `de:x`: a job called `de` owns `de:lock` and `de:logs`
+            if f"{job_id}:".startswith(namespace):
                 return f"the queue's {namespace!r} keys"
         for suffix in self._JOB_SUFFIXES:
             if job_id.endswith(suffix):

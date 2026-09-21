@@ -348,6 +348,7 @@ async def test_custom_job_id_rejects_all_digits(q):
         "id",
         "repeat:nightly",  # a scheduler's template
         "de:sync-user-42",  # a deduplication window
+        "de",  # its own lock, `de:lock`, is the window of the deduplication id `lock`
         "metrics:1700000000000",
         "7:lock",  # job 7's lock: claiming job 7 would overwrite this job
         "order-123:results",

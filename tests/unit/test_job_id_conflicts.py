@@ -40,16 +40,49 @@ def test_another_jobs_aux_key_is_not_a_job_id(method):
     assert KEYS.job_id_conflict(_suffix(getattr(KEYS, method)("order-123"))) is not None
 
 
-def test_every_key_the_lua_builds_from_the_base_is_guarded():
-    """`base .. "name"` and `base .. "ns:" .. id` in the scripts: keys Python may
-    never build (the dedup window `de:<id>` is one) are reserved all the same."""
-    literals = set(
-        re.findall(r'base \.\. "([^"]+)"', scripts._LIB + scripts.ADD_JOB + scripts.ADD_FLOW)
-    )
-    assert "de:" in literals  # the scan sees the Lua-only namespace
-    for literal in literals:
-        probe = literal + "x" if literal.endswith(":") else literal
-        assert KEYS.job_id_conflict(probe) is not None, literal
+LUA = "".join(v for k, v in vars(scripts).items() if k.isupper() and isinstance(v, str))
+# `base .. "name"`, `KEYS[6] .. "events"`, `base .. "de:" .. id`: what the scripts hang
+# off the queue's base. And `jobKey .. ":lock"`, `base .. id .. ":deps"`: a job's aux keys.
+LUA_NAMES = sorted(set(re.findall(r'(?:base|KEYS\[\d+\]) \.\. "([a-z][a-z:-]*)"', LUA)))
+LUA_SUFFIXES = sorted(set(re.findall(r'\.\. "(:[a-z]+)"', LUA)))
+
+
+def test_the_scan_sees_what_only_the_lua_builds():
+    assert "de:" in LUA_NAMES  # the dedup window has no `Keys` method
+    assert {":lock", ":deps", ":results", ":cfail"} <= set(LUA_SUFFIXES)
+
+
+@pytest.mark.parametrize("literal", LUA_NAMES)
+def test_every_key_the_lua_hangs_off_the_base_is_guarded(literal):
+    probe = literal + "x" if literal.endswith(":") else literal
+    assert KEYS.job_id_conflict(probe) is not None
+
+
+@pytest.mark.parametrize("suffix", LUA_SUFFIXES)
+def test_every_aux_suffix_the_lua_builds_is_guarded(suffix):
+    assert KEYS.job_id_conflict("order-123" + suffix) is not None
+
+
+BARE_NAMESPACES = sorted(
+    {n[:-1] for n in LUA_NAMES if n.endswith(":")}
+    | {_suffix(getattr(KEYS, method)(7)).split(":")[0] for method in NAMESPACED}
+)
+
+
+@pytest.mark.parametrize("name", BARE_NAMESPACES)
+def test_a_bare_namespace_name_is_not_a_job_id(name):
+    """A job called `de` owns `de:lock` and `de:logs`: the dedup windows of the dedup
+    ids `lock` and `logs`. The job's own aux keys collide, not its hash."""
+    assert KEYS.job_id_conflict(name) is not None
+
+
+def test_a_property_added_by_a_subclass_is_guarded():
+    class Extended(Keys):
+        @property
+        def audit(self) -> str:
+            return f"{self.base}audit"
+
+    assert Extended("emails").job_id_conflict("audit") is not None
 
 
 @pytest.mark.parametrize(

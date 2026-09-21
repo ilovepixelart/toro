@@ -146,7 +146,8 @@ class Queue:
         `job_id`: a custom id. Adding a second job with an id that already exists
         is IDEMPOTENT - it's ignored, not duplicated (id-based dedup). Once the job
         is removed, the id is free to reuse. Must be a non-empty, non-all-digits
-        string (all-digit ids collide with auto-generated ones).
+        string (all-digit ids collide with auto-generated ones) that does not land
+        on another key of the queue (`Keys.job_id_conflict`).
 
         `deduplication`: `{"id": str, "ttl": ms}` - a throttle window. While the
         ttl is live, repeat adds with the same dedup id are ignored and the
@@ -165,7 +166,10 @@ class Queue:
             if conflict:
                 # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
                 # add() that finds the key and returns as if the job already existed
-                raise ValueError(f"custom job_id {job_id!r} is reserved: it is {conflict}")
+                raise ValueError(
+                    f"custom job_id {job_id!r} is reserved: it is {conflict} "
+                    f"- try e.g. 'job-{job_id}'"
+                )
         dedup_id, dedup_ttl = "", 0
         if deduplication is not None:
             dedup_id = str(deduplication.get("id") or "")
