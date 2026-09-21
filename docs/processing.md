@@ -150,7 +150,8 @@ the dashboard can tell a drain from a crash.
 That pruning happens when something reads `Queue.workers()`. With no reader, a
 worker killed without deregistering still does not leave its record for good: the
 record expires a day after its last heartbeat, and any live worker's heartbeat
-drops index entries older than that.
+drops index entries older than that. A worker that died more than a day before
+the first read is gone without a `lost` departure.
 
 ## Shutdown
 
