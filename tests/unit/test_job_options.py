@@ -32,8 +32,8 @@ def test_from_dict_tolerates_missing_keys():
 @pytest.mark.parametrize(
     "opt, expected",
     [
-        (None, (-1, -1)),  # keep all (default)
-        (False, (-1, -1)),  # keep all
+        (None, (77, -1)),  # unset: bounded by the default that applies
+        (False, (-1, -1)),  # keep all: the explicit way out of the default
         (True, (0, -1)),  # remove immediately
         (1000, (1000, -1)),  # keep newest 1000
         ({"count": 500}, (500, -1)),  # keep newest 500
@@ -44,10 +44,10 @@ def test_from_dict_tolerates_missing_keys():
     ],
 )
 def test_keep_args_maps_every_removal_form(opt, expected):
-    assert JobOptions.keep_args(opt) == expected
+    assert JobOptions.keep_args(opt, 77) == expected
 
 
 def test_keep_args_distinguishes_true_from_one():
     # bool is an int subclass - guard that True/1 don't collapse together.
-    assert JobOptions.keep_args(True) == (0, -1)
-    assert JobOptions.keep_args(1) == (1, -1)
+    assert JobOptions.keep_args(True, 77) == (0, -1)
+    assert JobOptions.keep_args(1, 77) == (1, -1)

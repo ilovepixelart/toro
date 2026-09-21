@@ -33,9 +33,13 @@ class Deduplication(TypedDict):
 # What the `backoff` option accepts: nothing, fixed ms, or a BackoffOpts dict.
 # (String aliases: evaluated only by type checkers, never at import time.)
 Backoff: TypeAlias = "int | float | BackoffOpts | None"
-# Auto-removal: None/False keep all · True remove at once · int keep the newest N ·
-# {"count": N, "age": seconds} bound both.
+# Auto-removal: None (unset) keep the newest DEFAULT_KEEP_* · False keep all ·
+# True remove at once · int keep the newest N · {"count": N, "age": seconds} bound both.
 RemoveOption: TypeAlias = "bool | int | dict[str, int] | None"
+# What an unset option keeps. A count, not an age: a count caps memory whatever
+# the throughput. Failures are what gets debugged, so more of them are kept.
+DEFAULT_KEEP_COMPLETED = 1000
+DEFAULT_KEEP_FAILED = 5000
 
 
 class SupportsResult(Protocol):
@@ -80,13 +84,17 @@ class JobOptions:
         )
 
     @staticmethod
-    def keep_args(opt: RemoveOption) -> tuple[int, int]:
+    def keep_args(opt: RemoveOption, default: int) -> tuple[int, int]:
         """Map a remove option to (keepCount, keepAge_seconds) for the Lua side.
 
         keepCount: -1 keep all · 0 remove immediately · N keep newest N.
         keepAge:   -1 no age limit · S keep only those finished within S seconds.
+        `default` is the count an unset option keeps (DEFAULT_KEEP_COMPLETED or
+        DEFAULT_KEEP_FAILED, whichever set the job is finishing into).
         """
-        if opt is None or opt is False:
+        if opt is None:
+            return (default, -1)
+        if opt is False:
             return (-1, -1)
         if opt is True:
             return (0, -1)

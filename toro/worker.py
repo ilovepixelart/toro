@@ -35,7 +35,14 @@ from redis.asyncio import Redis
 from . import scripts
 from ._replies import _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, connect, read_timeout
-from .job import Backoff, Job, JobContext, JobOptions
+from .job import (
+    DEFAULT_KEEP_COMPLETED,
+    DEFAULT_KEEP_FAILED,
+    Backoff,
+    Job,
+    JobContext,
+    JobOptions,
+)
 from .keys import Keys
 from .scheduler import next_run
 
@@ -457,7 +464,7 @@ class Worker:
                 self.token,
                 self._fetch_flag(),
                 self.lock_duration,
-                *JobOptions.keep_args(job.opts.remove_on_complete),
+                *JobOptions.keep_args(job.opts.remove_on_complete, DEFAULT_KEEP_COMPLETED),
                 self.rl_max,
                 self.rl_duration,
                 scripts.METRICS_RETENTION_MS,
@@ -498,7 +505,7 @@ class Worker:
                 self.token,
                 self._fetch_flag(),
                 self.lock_duration,
-                *JobOptions.keep_args(job.opts.remove_on_fail),
+                *JobOptions.keep_args(job.opts.remove_on_fail, DEFAULT_KEEP_FAILED),
                 self.rl_max,
                 self.rl_duration,
                 scripts.METRICS_RETENTION_MS,
