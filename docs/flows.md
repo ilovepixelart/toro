@@ -57,8 +57,9 @@ async def process(job):
 ```
 
 A child's result is copied into the parent at the moment the child completes,
-so children are free to use `remove_on_complete` - the parent's copy survives,
-and so does routine history cleanup (`clean("completed")`).
+so a child trimmed from `completed` - by the default retention, its own
+`remove_on_complete`, or routine history cleanup (`clean("completed")`) - costs
+the parent nothing: the parent's copy survives.
 
 ## When a child fails
 

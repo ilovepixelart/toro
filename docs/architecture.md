@@ -95,8 +95,10 @@ due jobs into the prioritized set.
 - **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
   `completed`, `failed`); `Queue.result()` awaits the terminal event and
   `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
-- **Auto-removal** - `remove_on_complete` / `remove_on_fail` (bool / count /
-  `{count, age}`) enforced inside the finish script, not by a separate sweeper.
+- **Retention** - `remove_on_complete` / `remove_on_fail` (bool / count /
+  `{count, age}`, bounded when unset) enforced inside the finish script, not by a
+  separate sweeper, at most 1000 deletions per finish. See
+  [Producing jobs](producing.md#retention).
 - **Flows** - `add_flow()` creates a parent/child tree atomically; children
   settle into the parent's `:deps` barrier inside the same finish scripts that
   commit their own transitions, so the fan-in resolves on the crash path too.
