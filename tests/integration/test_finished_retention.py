@@ -3,12 +3,14 @@ age-trim - enabling `remove_on_complete={"age": ...}` on a queue with a deep
 finished backlog must not sweep it all in one Redis-blocking call.
 """
 
+import json
 import time
 import uuid
 
 import pytest
 
-from toro import scripts
+from toro import FlowChild, scripts
+from toro.job import DEFAULT_KEEP_FAILED, JobOptions
 from toro.queue import Queue
 
 PREFIX = "torotest"
@@ -186,3 +188,53 @@ async def test_false_keeps_everything(q, run_worker, run_until, how):
 
     assert not await _gone(q, "completed0")
     assert not await _gone(q, "failed0")
+
+
+# keepArgsFromOpts is local to the shared Lua, so it is run the way the scripts
+# reach it: with the library prepended.
+_TWIN = scripts._LIB + "local c, a = keepArgsFromOpts(ARGV[1]) return {c, a}"
+
+
+@pytest.mark.parametrize(
+    "opts",
+    [
+        {},  # the option was never given
+        {"removeOnFail": None},
+        {"removeOnFail": False},
+        {"removeOnFail": True},
+        {"removeOnFail": 1},
+        {"removeOnFail": 1000},
+        {"removeOnFail": {"count": 500}},
+        {"removeOnFail": {"age": 3600}},
+        {"removeOnFail": {"age": 3600, "count": 500}},
+        {"removeOnFail": {}},
+        {"removeOnFail": "nonsense"},
+    ],
+    ids=json.dumps,
+)
+async def test_lua_twin_matches_python(q, opts):
+    """BR-004: a parent failed by the script is retained as a worker would retain it."""
+    twin = await q.redis.eval(_TWIN, 0, json.dumps(opts))
+    assert tuple(twin) == JobOptions.keep_args(opts.get("removeOnFail"), DEFAULT_KEEP_FAILED)
+
+
+@pytest.mark.parametrize("stored", ["not json", '"a string"', "[1, 2"])
+async def test_lua_twin_counts_unreadable_opts_as_unset(q, stored):
+    assert tuple(await q.redis.eval(_TWIN, 0, stored)) == (DEFAULT_KEEP_FAILED, -1)
+
+
+async def test_eagerly_failed_parent_is_kept_under_the_default(q, run_worker, run_until):
+    """BR-004: no worker ever finishes this parent, so only the twin can bound it."""
+    await _seed_finished(q, "failed", 5000)
+
+    async with run_worker(q, _flaky, concurrency=1):
+        parent = await q.add_flow("report", {}, children=[FlowChild("boom", {})])
+        assert await run_until(lambda: _state_is(q, parent.id, "failed"), timeout=10)
+
+    # the child's failure and the parent's each pushed one old job out
+    assert await q.redis.zcard(q.keys.failed) == 5000
+    assert [await _gone(q, f"failed{i}") for i in range(3)] == [True, True, False]
+
+
+async def _state_is(q: Queue, job_id: str, state: str) -> bool:
+    return await q.redis.hget(q.keys.job(job_id), "state") == state

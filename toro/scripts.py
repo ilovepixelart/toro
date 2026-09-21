@@ -29,6 +29,8 @@ KEYS[]. This keeps the scripts simple for a single Redis; running on Redis Clust
 would require hash-tagging the keys (e.g. `{queue}`) so a queue's keys share a slot.
 """
 
+from .job import DEFAULT_KEEP_FAILED
+
 # Priority score packing constants (kept well under 2^53 so ZSET double scores
 # stay exact). priority in [0, PRIORITY_OFFSET]; sequence in [0, SEQ_MOD).
 PRIORITY_OFFSET = 1048576  # 2^20  - max priority (most urgent)
@@ -57,6 +59,9 @@ LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already recla
 NOT_ACTIVE = -3  # a finish script: the job was no longer in `active`
 OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will retry)
 
+# Python-side numbers the Lua needs, interpolated so the two cannot drift.
+_CONSTANTS = f"local DEFAULT_KEEP_FAILED = {DEFAULT_KEEP_FAILED}\n"
+
 # Shared routines, prepended to every script that enqueues or acquires a job.
 # This is the single definition of "how a job is ordered, woken, claimed":
 #   priorityScore  - (priority, seq) -> ZSET score (lower score = sooner)
@@ -64,7 +69,9 @@ OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will ret
 #   lockAndLoad    - lock a job already on `active`, stamp it, return its hash
 #   acquireNext    - ZPOPMIN the next job into `active`, then lockAndLoad it
 # To add markers-with-delay or grouping later, we change only these functions.
-_LIB = """
+_LIB = (
+    _CONSTANTS
+    + """
 local function priorityScore(priority, pcKey)
   local seq = redis.call("INCR", pcKey) % 4294967296
   return (1048576 - priority) * 4294967296 + seq
@@ -255,12 +262,14 @@ local function settleChildCompleted(base, jobId, parentId, returnvalue)
 end
 -- The Lua twin of JobOptions.keep_args for the `removeOnFail` option - eager
 -- parent failure has no Python caller to compute retention, so it reads the
--- parent's stored opts. Mirrors keep_args exactly (see job.py).
+-- parent's stored opts. Mirrors keep_args exactly (see job.py), the default an
+-- unset option keeps included; opts that cannot be read count as unset.
 local function keepArgsFromOpts(optsJson)
   local ok, opts = pcall(cjson.decode, optsJson or "{}")
-  if not ok or type(opts) ~= "table" then return -1, -1 end
+  if not ok or type(opts) ~= "table" then return DEFAULT_KEEP_FAILED, -1 end
   local v = opts.removeOnFail
-  if v == nil or v == cjson.null or v == false then return -1, -1 end
+  if v == nil or v == cjson.null then return DEFAULT_KEEP_FAILED, -1 end
+  if v == false then return -1, -1 end
   if v == true then return 0, -1 end
   if type(v) == "number" then return v, -1 end
   if type(v) == "table" then return tonumber(v.count) or -1, tonumber(v.age) or -1 end
@@ -305,6 +314,7 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
   end
 end
 """
+)
 
 # Add a job. With no custom id, generates one server-side (INCR) so concurrent
 # producers never collide. With a custom id, the add is IDEMPOTENT: if a job with
