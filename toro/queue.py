@@ -106,7 +106,7 @@ class Queue:
     ) -> None:
         self.name = name
         # Defaults merged into every add() (per-call options win) - e.g.
-        # default_job_options={"remove_on_complete": 1000} so you don't repeat it.
+        # default_job_options={"remove_on_complete": 100} so you don't repeat it.
         self.default_job_options = dict(default_job_options or {})
         self.keys = Keys(name, prefix)
         # NB: created with decode_responses=True, so every command returns str -
@@ -476,7 +476,10 @@ class Queue:
             # fail at enqueue, not later inside a worker's _schedule_next (a silent
             # scheduler that errors on the backend)
             raise ValueError(f"invalid cron expression: {cron!r}")
-        opts = JobOptions(priority=_clamp_priority(priority), **job_opts).to_dict()
+        # The queue's defaults go INTO the template: a worker mints every later
+        # occurrence from it, and a worker never sees the producer's defaults.
+        merged = {**self.default_job_options, **job_opts, "priority": _clamp_priority(priority)}
+        opts = JobOptions(**merged).to_dict()
         template = {
             "name": name or scheduler_id,
             "every": str(every) if every else "",
@@ -528,16 +531,19 @@ class Queue:
         if not t:
             return False
         name = cast("str", t.get("name", scheduler_id))
-        opts = JobOptions.from_dict(json.loads(t.get("opts") or "{}"))
-        await self.add(
-            name,
-            json.loads(t.get("data") or "null"),
-            attempts=opts.attempts,
-            backoff=opts.backoff,
-            priority=opts.priority,
-            remove_on_complete=opts.remove_on_complete,
-            remove_on_fail=opts.remove_on_fail,
-        )
+        stored = JobOptions.from_dict(json.loads(t.get("opts") or "{}"))
+        opts: dict[str, Any] = {
+            "attempts": stored.attempts,
+            "backoff": stored.backoff,
+            "priority": stored.priority,
+        }
+        # Retention the template leaves unset stays the queue's call: passed on as an
+        # explicit None it would override `default_job_options`.
+        if stored.remove_on_complete is not None:
+            opts["remove_on_complete"] = stored.remove_on_complete
+        if stored.remove_on_fail is not None:
+            opts["remove_on_fail"] = stored.remove_on_fail
+        await self.add(name, json.loads(t.get("data") or "null"), **opts)
         return True
 
     async def schedulers(self) -> list[dict[str, Any]]:

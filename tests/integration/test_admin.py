@@ -6,6 +6,10 @@ returns False rather than silently succeeding).
 
 import pytest
 
+from toro import Queue
+
+PREFIX = "torotest"
+
 
 async def _count(q, state):
     return (await q.counts())[state]
@@ -108,6 +112,20 @@ async def test_trigger_scheduler_carries_configured_opts(q):
     assert job.name == "rollup"
     assert job.opts.priority == 7
     assert job.opts.attempts == 5
+
+
+async def test_trigger_scheduler_leaves_unset_retention_to_the_queue(q):
+    """A template that stores retention unset (every scheduler registered by an
+    earlier release does) must not beat the queue's default with an explicit None."""
+    await q.add_scheduler("nightly", cron="0 0 * * *")  # no defaults: stored unset
+    keep = {"remove_on_complete": False, "remove_on_fail": False}
+    producer = Queue(q.name, prefix=PREFIX, default_job_options=keep)
+    try:
+        assert await producer.trigger_scheduler("nightly") is True
+    finally:
+        await producer.close()
+    job = (await q.get_jobs("wait", 0, 0))[0]
+    assert (job.opts.remove_on_complete, job.opts.remove_on_fail) == (False, False)
 
 
 async def _all_failed(q, n):
