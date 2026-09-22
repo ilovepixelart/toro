@@ -61,7 +61,7 @@ the queue while they wait. Other keys are unaffected, and so is the claim path.
 | CK-006 | Flow nodes: a held leaf keeps its parent parked; a parent takes its key when released; removing a flow frees the keys its nodes hold. | `::test_a_held_leaf_keeps_its_parent_parked`, `::test_a_flow_parent_waits_for_its_own_key`, `::test_removing_a_flow_whose_keyed_child_was_retried_frees_the_key` |
 | CK-007 | A key is validated as a key segment on every path that enqueues: `add`, a flow node, a scheduler. The option round-trips through `JobOptions` and is visible on the job. | `tests/unit/test_job_options.py`, `::test_a_flow_node_and_a_scheduler_validate_their_key` |
 | CK-008 | A held job is a `held` job everywhere: `counts()`, `roots_counts()`, `get_jobs("held")`, `get_jobs_roots("held")`, `remove_job`, `clean("held")`; `retry_job` and `promote_job` on it are no-ops that return False. | `::test_held_is_a_state`, `::test_roots_listings_know_the_held_state` |
-| CK-009 | A queue that passes no key pays nothing measurable: the enqueue and claim paths take one comparison and the finish scripts one read. | measured, as in `flow-retention.md` |
+| CK-009 | A queue that passes no key pays nothing measurable: the enqueue and claim paths take one comparison and the finish scripts one read. | measured against main, interleaved runs of 5,000 jobs at concurrency 20: no key 9,150 against 9,134 jobs/s, and a key per job 8,910 against 8,880 |
 
 ## Out of scope
 
