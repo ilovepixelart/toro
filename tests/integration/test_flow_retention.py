@@ -330,7 +330,10 @@ async def test_a_nested_flow_keeps_its_grandchildren(q, run_worker, run_until):
         done = await q.redis.zrange(q.keys.completed, 0, -1)
         await _seed_history(q, DEFAULT_KEEP_COMPLETED, newer_than_now=True)
 
-        await (await q.add("unrelated", {})).result(timeout=10)
+        # this one is the oldest settled job, so its own finish trims it: wait for that
+        # rather than for its result, which a removed job can no longer report
+        trimmer = await q.add("unrelated", {})
+        await _until(lambda: _gone(q, trimmer.id))
 
         assert await _present(q, done) == 3, "a running flow's grandchildren were trimmed"
         gate.set()
@@ -715,7 +718,10 @@ async def test_a_child_of_a_settled_parent_under_a_running_root_is_live(
         assert (await _scores(q, [slow]))[slow] > LIVE_SCORE, "a running flow's job settled"
 
         await _seed_history(q, DEFAULT_KEEP_COMPLETED, newer_than_now=True)
-        await (await q.add("unrelated", {})).result(timeout=10)
+        # this one is the oldest settled job, so its own finish trims it: wait for that
+        # rather than for its result, which a removed job can no longer report
+        trimmer = await q.add("unrelated", {})
+        await _until(lambda: _gone(q, trimmer.id))
         assert await _present(q, [slow]) == 1, "a running flow's job was trimmed"
         held_gate.set()
 
