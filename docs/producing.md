@@ -28,6 +28,7 @@ JSON-serializable payload.
 | `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms}`. Exponential doubles per attempt. |
 | `remove_on_complete` | unset | Which successes to keep: unset keeps the newest 1000, `False` keeps all, `True` removes at once, `N` keeps the newest N, `{"count": N, "age": seconds}` bounds both. |
 | `remove_on_fail` | unset | Same, for terminal failures; unset keeps the newest 5000. |
+| `concurrency_key` | `None` | Jobs sharing a key run one at a time, in the order they were added. See [Serializing on a key](#serializing-on-a-key). |
 
 Per-queue defaults go on the constructor and merge under per-call options:
 
@@ -82,6 +83,44 @@ which are separate counters. Retention covers every way a job can finish: a
 worker's finish, a flow parent failed by the script, and a job the stalled sweep
 fails after its worker died.
 
+## Serializing on a key
+
+Work that touches the same thing must not run at once: one order's payment steps,
+one tenant's sync, one document's edits.
+
+```python
+await queue.add("charge", {"order": 42}, concurrency_key="order-42")
+await queue.add("invoice", {"order": 42}, concurrency_key="order-42")  # runs after
+```
+
+At most one job per key is claimed at a time, however many workers are running.
+At-least-once still applies: a job whose worker stops reporting is recovered by the
+stalled sweep and runs again, beside a processor that may still be going, so a key
+orders work rather than making a second run impossible. A job
+added under a taken key is **held**: it sits in no other collection, holds no
+worker slot and no place in the queue, and takes the key when the holder reaches
+a terminal state. Held jobs run in the order they were added, and a more urgent
+one added later goes first, at the position it would have had in the queue.
+
+- **The key is held from enqueue to a terminal state**, so a delayed job holds it
+  while it waits and a retrying job holds it through its backoff. That is what
+  "in order" means for a key; a job released with time still on its delay goes
+  back to `delayed` and waits that out.
+- **Every way of finishing hands the key on**: a completion, a terminal failure,
+  a parent failed by a child, a job the stalled sweep gives up on, one removed at
+  once by its retention, and one removed with `remove_job()`.
+- **Flow nodes may carry a key.** A leaf takes it at enqueue; a parent takes it
+  when its children settle and it becomes runnable. A held child has not settled,
+  so its flow waits for it as for any child.
+- **Nothing is left per key**: the bookkeeping exists only while jobs are using it.
+- A key is a Redis key segment, so it must be a non-empty string with no `:` or
+  control characters, like a scheduler or deduplication id.
+
+A held job is a job in the `held` state: `counts()`, `get_jobs("held")`,
+`search`, `remove_job()` and `clean("held")` all see it. `retry_job()` and
+`promote_job()` return `False` for one: it has not failed, and it is not waiting
+on a clock.
+
 ## Custom ids and deduplication
 
 Two distinct tools, usable independently:
@@ -129,7 +168,7 @@ waiting; only the terminal outcome resolves the call.
 
 | Call | Returns |
 |---|---|
-| `await queue.counts()` | `{"wait": n, "active": n, "delayed": n, "waiting-children": n, "completed": n, "failed": n}` |
+| `await queue.counts()` | One count per `JobState`: `wait`, `active`, `delayed`, `held`, `waiting-children`, `completed`, `failed`. |
 | `await queue.get_job(job_id)` | A `Job` snapshot, or `None`. |
 | `await queue.get_jobs(state, start, end)` | A page of jobs; `wait` comes back in global priority order, finished states newest-first. |
 | `await queue.get_logs(job_id)` | Log lines appended by the processor. |

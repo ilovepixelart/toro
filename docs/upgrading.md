@@ -2,6 +2,22 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 0.8.0
+
+### Upgrade every worker before you use a concurrency key
+
+A key is taken when a job is enqueued and passed on by the script that commits the
+job's finish, and that script is the one the WORKER registers. A worker from an
+earlier release commits a finish without passing the key on, so the key stays held
+by a job that is already done and every job behind it waits forever. Roll the whole
+fleet to 0.8.0 first, then start passing `concurrency_key`. Nothing changes for a
+queue that never passes one.
+
+`held` is a new `JobState`, so anything that enumerates states (a dashboard, a
+`counts()` reader, a `get_jobs` loop) sees a seventh. A held job waits on its key
+rather than on a worker: it is in no other collection, `latency()` does not see it,
+and `remove_job` is what cancels it.
+
 ## 0.7.0
 
 ### Finished jobs are bounded by default

@@ -91,6 +91,68 @@ local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
   redis.call("ZADD", markerKey, 0, "0")
 end
+-- Jobs that share a concurrency key run one at a time, in the order they were added.
+-- The key is held from enqueue until the holder reaches a terminal state: `ck:<key>`
+-- names the holder and `held:<key>` is the queue behind it, scored as `prioritized`
+-- would have scored those jobs, so a job keeps its place among the ones added with it.
+-- A held job is in no other collection: it waits on the key, not on a worker.
+local function takeKey(base, jobKey, jobId, ckey, priority, pcKey, now)
+  if ckey == "" then return true end
+  redis.call("HSET", jobKey, "ckey", ckey)
+  if redis.call("SET", base .. "ck:" .. ckey, jobId, "NX") then return true end
+  redis.call("HSET", jobKey, "state", "held")
+  redis.call("ZADD", base .. "held:" .. ckey, priorityScore(priority, pcKey), jobId)
+  redis.call("ZADD", base .. "held", now, jobId)
+  return false
+end
+-- Hand a key to the job that has waited longest at the highest priority, or give it
+-- up. A job released with time still to run on its delay goes back to `delayed`: it
+-- waited on the key, which is not the same as having waited out its delay.
+local function releaseKey(base, jobKey, jobId, now)
+  local ckey = redis.call("HGET", jobKey, "ckey")
+  if not ckey then return end
+  local holder = base .. "ck:" .. ckey
+  if redis.call("GET", holder) ~= jobId then return end
+  local queued = base .. "held:" .. ckey
+  while true do
+    local nxt = redis.call("ZPOPMIN", queued)
+    if not nxt[1] then
+      redis.call("DEL", holder)
+      return
+    end
+    local nid = nxt[1]
+    redis.call("ZREM", base .. "held", nid)
+    local meta = redis.call("HMGET", base .. nid, "timestamp", "delay", "state")
+    -- An id whose hash is gone is not a job. Made the holder it would be resurrected
+    -- as an empty one, run, and pin the key to itself for good, so it is skipped and
+    -- the next real job takes the key instead.
+    if meta[3] then
+      redis.call("SET", holder, nid)
+      local due = (tonumber(meta[1]) or now) + (tonumber(meta[2]) or 0)
+      if due > now then
+        redis.call("HSET", base .. nid, "state", "delayed")
+        redis.call("ZADD", base .. "delayed", due, nid)
+      else
+        redis.call("HSET", base .. nid, "state", "wait")
+        redis.call("ZADD", base .. "prioritized", tonumber(nxt[2]), nid)
+        redis.call("ZADD", base .. "marker", 0, "0")
+      end
+      return
+    end
+  end
+end
+-- Take a job out of the key machinery before its hash goes: a holder hands the key
+-- on, a job queued behind one leaves that queue (its place in the `held` listing
+-- goes with its state, like any other). Nothing reads the key once the hash is gone,
+-- so a job deleted while still named there would hold it forever.
+local function unkey(base, jobId, state, ckey, now)
+  if not ckey then return end
+  if state == "held" then
+    redis.call("ZREM", base .. "held:" .. ckey, jobId)
+  else
+    releaseKey(base, base .. jobId, jobId, now)
+  end
+end
 local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   local jobKey = base .. jobId
   redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
@@ -131,7 +193,10 @@ local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
   if cap > 0 and redis.call("LLEN", activeKey) >= cap then return false end
   local res = redis.call("ZPOPMIN", prioritizedKey)
   if #res == 0 then
-    redis.call("DEL", pcKey)
+    -- Held jobs carry a sequence minted from this counter and keep it until their key
+    -- frees, so resetting it while any of them waits would sort a later job ahead of
+    -- an earlier one. Nothing waiting anywhere: the counter is free to start over.
+    if redis.call("ZCARD", base .. "held") == 0 then redis.call("DEL", pcKey) end
     return false
   end
   local jobId = res[1]
@@ -178,10 +243,15 @@ local function delJobs(ids, base)
     -- A running flow's finished jobs are scored above every bound (see recordFinished),
     -- so if the flow goes without them nothing else would ever reclaim them. Its live
     -- index holds the whole subtree, so one pass covers a node that is already gone.
+    -- Settled nodes only: a node the index still lists but that is running again (a
+    -- retry) is reachable from its own state, and deleting it here would delete a job
+    -- mid-flight and strand the concurrency key it holds.
     for _, cid in ipairs(redis.call("ZRANGE", base .. id .. ":live", 0, -1)) do
       local cstate = redis.call("HGET", base .. cid, "state")
-      if cstate then redis.call("ZREM", base .. cstate, cid) end
-      delKeys(base, cid)
+      if cstate == "completed" or cstate == "failed" then
+        redis.call("ZREM", base .. cstate, cid)
+        delKeys(base, cid)
+      end
     end
     delKeys(base, id)
   end
@@ -344,6 +414,7 @@ local function reviveSubtree(base, rootId, jobId, now)
   end
 end
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state)
+  releaseKey(base, jobKey, jobId, now)  -- terminal: whatever happens below, the key goes on
   local meta = redis.call("HMGET", jobKey, "opts", "parentId", "rootId", "children")
   local keepCount, keepAge = keepFor(meta[1], state)
   local root = meta[2] and runningRoot(base, meta[2], meta[3])
@@ -392,20 +463,27 @@ end
 -- inside the SAME script that commits their own transition (finish, stalled
 -- escalation, removal), so the fan-in barrier resolves on the crash path too.
 -- Queue-level keys derive from `base` (single-node assumption, see header).
-local function releaseParent(base, parentId)
+local function releaseParent(base, parentId, now)
   -- no-op unless the parent is still parked (it may have failed eagerly)
   if redis.call("ZREM", base .. "waiting-children", parentId) == 0 then return end
-  local priority = tonumber(redis.call("HGET", base .. parentId, "priority")) or 0
-  redis.call("HSET", base .. parentId, "state", "wait")
-  enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc")
+  local parentKey = base .. parentId
+  local priority = tonumber(redis.call("HGET", parentKey, "priority")) or 0
+  -- a parent takes its key only now: it was not runnable while its children ran. The
+  -- key is a field (written at enqueue) rather than a decode of `opts`: this runs after
+  -- a child's commit, and Redis rolls nothing back, so it may not raise.
+  local ckey = redis.call("HGET", parentKey, "ckey") or ""
+  if takeKey(base, parentKey, parentId, ckey, priority, base .. "pc", now) then
+    redis.call("HSET", parentKey, "state", "wait")
+    enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc")
+  end
 end
-local function settleChildCompleted(base, jobId, parentId, returnvalue)
+local function settleChildCompleted(base, jobId, parentId, returnvalue, now)
   -- a fully-removed parent (retention trim) must not get orphan keys recreated
   if redis.call("EXISTS", base .. parentId) == 0 then return end
   redis.call("HSET", base .. parentId .. ":results", jobId, returnvalue)
   redis.call("SREM", base .. parentId .. ":deps", jobId)
   if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
-    releaseParent(base, parentId)
+    releaseParent(base, parentId, now)
   end
 end
 -- A terminally-failed child settles its parent per its `onFail` policy:
@@ -423,7 +501,7 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
         redis.call("HSET", base .. pid .. ":cfail", cid, reason)
         redis.call("SREM", base .. pid .. ":deps", cid)
         if redis.call("SCARD", base .. pid .. ":deps") == 0 then
-          releaseParent(base, pid)
+          releaseParent(base, pid, now)
         end
       end
       return
@@ -459,33 +537,38 @@ end
 # ARGV[1] name  ARGV[2] data(json)  ARGV[3] opts(json)
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
-# ARGV[10] metricsRetention(ms)
+# ARGV[10] metricsRetention(ms)  ARGV[11] concurrency key ("" = none)
+# Returns {jobId, state}: on a dedup hit or an id replay, the id of the job that is
+# already there and the state it is really in.
 ADD_JOB = (
     _LIB
     + """
+local base = KEYS[5]
 local function announce(jobId)
   -- whole-message cjson.encode: no hand-built JSON anywhere on the event bus
   redis.call("PUBLISH", KEYS[7],
     cjson.encode({jobId = tostring(jobId), event = "added"}))
 end
-local base = KEYS[5]
+-- An add that enqueued nothing answers with the job that is already there, in the
+-- state it is really in: the caller's Job must not read `wait` for one that is
+-- running, or for one held on its key.
+local function alreadyThere(jobId)
+  announce(jobId)
+  return {tostring(jobId), redis.call("HGET", base .. jobId, "state") or ""}
+end
 -- Throttle dedup: within the TTL window, a repeat dedup id is ignored and the
 -- already-queued job's id is returned (self-expiring, no finish-side cleanup).
 local dedupKey
 if ARGV[8] ~= "" then
   dedupKey = base .. "de:" .. ARGV[8]
   local existing = redis.call("GET", dedupKey)
-  if existing then
-    announce(existing)
-    return existing
-  end
+  if existing then return alreadyThere(existing) end
 end
 local jobId = ARGV[7]
 if jobId == "" then
   jobId = redis.call("INCR", KEYS[1])
 elseif redis.call("EXISTS", base .. jobId) == 1 then
-  announce(jobId)
-  return jobId
+  return alreadyThere(jobId)
 end
 local jobKey = base .. jobId
 redis.call("HSET", jobKey,
@@ -496,17 +579,24 @@ if dedupKey then
   redis.call("HSET", jobKey, "deid", ARGV[8])
 end
 local delay = tonumber(ARGV[5])
-if delay > 0 then
-  redis.call("HSET", jobKey, "delay", delay, "state", "delayed")
-  redis.call("ZADD", KEYS[4], tonumber(ARGV[4]) + delay, jobId)
-else
-  redis.call("HSET", jobKey, "state", "wait")
-  enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
+local now = tonumber(ARGV[4])
+if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
+local state = "held"  -- takeKey parks it there when the key is taken
+if takeKey(base, jobKey, jobId, ARGV[11], tonumber(ARGV[6]), KEYS[6], now) then
+  if delay > 0 then
+    state = "delayed"
+    redis.call("HSET", jobKey, "state", state)
+    redis.call("ZADD", KEYS[4], now + delay, jobId)
+  else
+    state = "wait"
+    redis.call("HSET", jobKey, "state", state)
+    enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
+  end
 end
 -- only real inserts count (dedup hits and id replays returned above)
 recordMetrics(base, "added", tonumber(ARGV[4]), 0, tonumber(ARGV[10]))
 announce(jobId)
-return jobId
+return {tostring(jobId), state}
 """
 )
 
@@ -544,16 +634,24 @@ local function createNode(node, parentId, rootId)
     redis.call("SADD", jobKey .. ":deps", unpack(cids))
     redis.call("HSET", jobKey, "children", cjson.encode(cids),
                "state", "waiting-children")
+    -- a parked parent queues for its key when its children settle (see releaseParent)
+    if node.concurrencyKey ~= "" then
+      redis.call("HSET", jobKey, "ckey", node.concurrencyKey)
+    end
     redis.call("ZADD", base .. "waiting-children", now, jobId)
   else
     local delay = tonumber(node.delay)
-    if delay > 0 then
-      redis.call("HSET", jobKey, "delay", delay, "state", "delayed")
-      redis.call("ZADD", base .. "delayed", now + delay, jobId)
-    else
-      redis.call("HSET", jobKey, "state", "wait")
-      enqueue(base .. "prioritized", base .. "marker", jobId,
-              tonumber(node.priority), base .. "pc")
+    if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
+    if takeKey(base, jobKey, jobId, node.concurrencyKey, tonumber(node.priority),
+               base .. "pc", now) then
+      if delay > 0 then
+        redis.call("HSET", jobKey, "state", "delayed")
+        redis.call("ZADD", base .. "delayed", now + delay, jobId)
+      else
+        redis.call("HSET", jobKey, "state", "wait")
+        enqueue(base .. "prioritized", base .. "marker", jobId,
+                tonumber(node.priority), base .. "pc")
+      end
     end
   end
   return jobId
@@ -630,7 +728,7 @@ if meta[4] and not meta[3] then
   recordFlow(KEYS[8], true, now, now - (tonumber(meta[5]) or now), tonumber(ARGV[9]))
 end
 -- a flow child settles into its parent here, atomically with its own commit
-if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2]) end
+if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2], now) end
 -- the result is decoded and re-encoded as part of ONE cjson document: a
 -- return value full of JSON metacharacters can never corrupt the message
 local okr, resultDoc = pcall(cjson.decode, ARGV[2])
@@ -732,17 +830,27 @@ return {outcome}
 # KEYS[1] delayed  KEYS[2] key base
 # ARGV[1] jobId  ARGV[2] name  ARGV[3] data(json)  ARGV[4] opts(json)
 # ARGV[5] now(ms)  ARGV[6] processAt(ms)  ARGV[7] priority  ARGV[8] schedulerId
-ADD_SCHEDULED = """
-local jobKey = KEYS[2] .. ARGV[1]
+# ARGV[9] concurrency key ("" = none)
+ADD_SCHEDULED = (
+    _LIB
+    + """
+local base = KEYS[2]
+local jobKey = base .. ARGV[1]
 if redis.call("EXISTS", jobKey) == 1 then return 0 end
+local now = tonumber(ARGV[5])
 redis.call("HSET", jobKey,
   "id", ARGV[1], "name", ARGV[2], "data", ARGV[3], "opts", ARGV[4],
-  "timestamp", ARGV[5], "attemptsMade", 0, "priority", ARGV[7],
-  "delay", tonumber(ARGV[6]) - tonumber(ARGV[5]), "state", "delayed",
-  "schedulerId", ARGV[8])
-redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
+  "timestamp", now, "attemptsMade", 0, "priority", ARGV[7],
+  "delay", tonumber(ARGV[6]) - now, "schedulerId", ARGV[8])
+-- an occurrence waits for its key like any job: held now, and back to `delayed` at
+-- its own due time when the key frees (see releaseKey)
+if takeKey(base, jobKey, ARGV[1], ARGV[9], tonumber(ARGV[7]), base .. "pc", now) then
+  redis.call("HSET", jobKey, "state", "delayed")
+  redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
+end
 return 1
 """
+)
 
 # Promote a delayed job to run now (admin/dashboard action).
 # KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] job hash  KEYS[5] pc
@@ -793,8 +901,13 @@ if redis.call("SCARD", base .. ARGV[1] .. ":deps") > 0 then
   return 1
 end
 local priority = tonumber(redis.call("HGET", KEYS[4], "priority")) or 0
-redis.call("HSET", KEYS[4], "state", "wait")
-enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
+-- it gave its key up when it failed, so it queues for it again rather than
+-- running beside whoever holds it now
+local ckey = redis.call("HGET", KEYS[4], "ckey") or ""
+if takeKey(base, KEYS[4], ARGV[1], ckey, priority, KEYS[5], tonumber(ARGV[2])) then
+  redis.call("HSET", KEYS[4], "state", "wait")
+  enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
+end
 return 1
 """
 )
@@ -804,11 +917,16 @@ return 1
 # from its parent's barrier, releasing the parent when it was the last
 # dependency (nothing left to wait for).
 # KEYS[1] prioritized  KEYS[2] active  KEYS[3] delayed  KEYS[4] completed
-# KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base   ARGV[1] jobId
+# KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base  KEYS[8] held
+# ARGV[1] jobId  ARGV[2] now(ms)
 REMOVE_JOB = (
     _LIB
     + """
 local base = KEYS[7]
+-- Read BEFORE the first write, like requireCap: Redis rolls nothing back, so a
+-- missing clock has to fail the call rather than halfway through it.
+local now = tonumber(ARGV[2])
+if now == nil then error("REMOVE_JOB needs a now argument") end
 -- The job's `state` field says which single collection holds it (every
 -- transition writes it atomically); only an unreadable state pays the blanket
 -- sweep - notably the O(active) LREM.
@@ -819,6 +937,7 @@ local function removeFromState(jobId, state)
   elseif state == "completed" then redis.call("ZREM", KEYS[4], jobId)
   elseif state == "failed" then redis.call("ZREM", KEYS[5], jobId)
   elseif state == "waiting-children" then redis.call("ZREM", KEYS[6], jobId)
+  elseif state == "held" then redis.call("ZREM", KEYS[8], jobId)
   else
     redis.call("ZREM", KEYS[1], jobId)
     redis.call("LREM", KEYS[2], 0, jobId)
@@ -826,11 +945,13 @@ local function removeFromState(jobId, state)
     redis.call("ZREM", KEYS[4], jobId)
     redis.call("ZREM", KEYS[5], jobId)
     redis.call("ZREM", KEYS[6], jobId)
+    redis.call("ZREM", KEYS[8], jobId)
   end
 end
 local function removeTree(jobId)
-  local meta = redis.call("HMGET", base .. jobId, "children", "state")
+  local meta = redis.call("HMGET", base .. jobId, "children", "state", "ckey")
   removeFromState(jobId, meta[2])
+  unkey(base, jobId, meta[2], meta[3], now)
   delJobs({jobId}, base)
   if meta[1] then
     for _, cid in ipairs(cjson.decode(meta[1])) do removeTree(cid) end
@@ -845,7 +966,7 @@ if parentId then
   -- cleanup (clean('completed')) must never mutate a pending parent's data
   redis.call("SREM", base .. parentId .. ":deps", ARGV[1])
   if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
-    releaseParent(base, parentId)
+    releaseParent(base, parentId, now)
   end
 end
 return existed
@@ -969,12 +1090,13 @@ return {total, ids}
 # Exact roots-only count per state - the root-first counterpart of counts().
 # Each ZSET state is diffed against the children index in turn through one shared
 # scratch key (DELeted between uses); `active` is a LIST, so its roots are
-# counted by membership in the children index. One atomic round trip for all six.
+# counted by membership in the children index. One atomic round trip for all seven.
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] completed  KEYS[4] failed
-# KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] children  KEYS[8] scratch
+# KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] held
+# KEYS[8] children  KEYS[9] scratch
 ROOTS_COUNTS = """
-local ch = KEYS[7]
-local sc = KEYS[8]
+local ch = KEYS[8]
+local sc = KEYS[9]
 local function rc(k)
   local n = redis.call("ZDIFFSTORE", sc, 2, k, ch)
   redis.call("DEL", sc)
@@ -984,13 +1106,42 @@ local active = 0
 for _, jid in ipairs(redis.call("LRANGE", KEYS[6], 0, -1)) do
   if redis.call("ZSCORE", ch, jid) == false then active = active + 1 end
 end
-return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), active}
+return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS[7]), active}
 """
 
 
-# The ARGV of the two finish scripts, in the order their headers document. Built here
-# and nowhere else: a hand-rolled list keeps "working" when the layout changes, with
-# its values in the wrong slots.
+# The ARGV of the scripts with many parameters, in the order their headers document.
+# Built here and nowhere else: a hand-rolled list keeps "working" when the layout
+# changes, with its values in the wrong slots.
+def add_job_args(
+    *,
+    name: str,
+    data: str,
+    opts: str,
+    now: int,
+    delay: int,
+    priority: int,
+    job_id: str,
+    dedup_id: str,
+    dedup_ttl: int,
+    concurrency_key: str,
+) -> list[str | int]:
+    """ARGV for ADD_JOB."""
+    return [
+        name,
+        data,
+        opts,
+        now,
+        delay,
+        priority,
+        job_id,
+        dedup_id,
+        dedup_ttl,
+        METRICS_RETENTION_MS,
+        concurrency_key,
+    ]
+
+
 def completed_args(
     *,
     job_id: str,

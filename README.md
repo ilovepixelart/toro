@@ -50,6 +50,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Rate limiting** | queue-wide token bucket shared across all workers |
 | **Global concurrency** | one cap on jobs active at once, across every worker process |
 | **Dedup** | custom (idempotent) job ids + a throttle window (`{id, ttl}`) |
+| **Serialize by key** | `concurrency_key`: jobs sharing a key run one at a time, in order, without holding a worker |
 | **Bounded history** | keeps the newest 1000 completed / 5000 failed by default; or the last N, an age, or everything |
 | **Reliability** | per-job locks, lock renewal, stalled-job recovery |
 | **Observability** | progress, per-job logs, lifecycle events, `await result()` |

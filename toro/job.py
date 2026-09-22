@@ -12,8 +12,8 @@ from ._replies import _str_dict
 
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
 # `waiting-children` is the flow-parent park: enqueued, but runnable only once
-# every child has settled.
-JobState = Literal["wait", "active", "delayed", "completed", "failed", "waiting-children"]
+# every child has settled. `held` waits on a concurrency key, not on a worker.
+JobState = Literal["wait", "active", "delayed", "held", "completed", "failed", "waiting-children"]
 
 
 class BackoffOpts(TypedDict, total=False):
@@ -52,6 +52,20 @@ class SupportsResult(Protocol):
     async def result(self, job_id: str, *, timeout: float = ...) -> Any: ...
 
 
+def key_segment(value: object, what: str) -> str | None:
+    """Validate a value that becomes a Redis key segment, or None when unset.
+
+    `:` or a control character would let two distinct values collide into one key,
+    and silently share what belongs to one of them.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or ":" in value or any(ord(c) < 0x20 for c in value):
+        msg = f"{what} must be a non-empty string with no ':' or control characters"
+        raise ValueError(msg)
+    return value
+
+
 @dataclass
 class JobOptions:
     """Per-job options (delay, attempts, backoff, priority, auto-removal)."""
@@ -62,6 +76,13 @@ class JobOptions:
     priority: int = 0  # higher = more urgent (global order); 0 = default, FIFO
     remove_on_complete: RemoveOption = None
     remove_on_fail: RemoveOption = None
+    # Jobs that share a key run one at a time, in the order they were added.
+    concurrency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        # Validated here rather than in Queue.add, so every way of enqueuing - a job,
+        # a flow node, a scheduler template - is covered by construction.
+        self.concurrency_key = key_segment(self.concurrency_key, "concurrency_key")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +92,7 @@ class JobOptions:
             "priority": self.priority,
             "removeOnComplete": self.remove_on_complete,
             "removeOnFail": self.remove_on_fail,
+            "concurrencyKey": self.concurrency_key,
         }
 
     @classmethod
@@ -82,6 +104,7 @@ class JobOptions:
             priority=d.get("priority", 0),
             remove_on_complete=d.get("removeOnComplete"),
             remove_on_fail=d.get("removeOnFail"),
+            concurrency_key=d.get("concurrencyKey"),
         )
 
 

@@ -30,6 +30,9 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `completed` | ZSET | Successfully-finished ids, scored by retention position: finish time, except a running flow's children (above every timestamp) and a settled flow's children (just above their root). |
 | `failed` | ZSET | Terminally-failed ids, scored the same way. |
 | `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |
+| `held` | ZSET | Jobs waiting on a concurrency key, scored by enqueue time (the listing). |
+| `ck:<key>` | STRING | The job that holds a concurrency key. Exists only while a job holds it. |
+| `held:<key>` | ZSET | The jobs queued behind one key, scored as `prioritized` would score them. |
 | `meta-paused` | string (flag) | Exists only while the queue is paused; workers stop claiming new jobs. |
 | `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed`; drives `result()` and live dashboards. |
 | `limiter` | HASH | The queue-wide rate-limit token bucket (`{tokens, ts}`), shared by every worker. |
@@ -47,7 +50,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 |---|---|---|
 | `repeat:<schedulerId>` | HASH | A scheduler's template: `name`, `every`/`cron`, `data`, `opts`. |
 | `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, global concurrency cap, current jobs, processed/failed counts, state. Expires a day after the last heartbeat. |
-| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail`/`rootId` (children), `children` (parents). |
+| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail`/`rootId` (children), `children` (parents), and `ckey` on a job with a concurrency key. |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |
 | `<jobId>:deps` | SET | A flow parent's still-pending child ids - the fan-in barrier; the parent releases when it empties. |
@@ -61,9 +64,9 @@ Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a
 
 ## How the pieces connect
 
-- A job moves between `prioritized` / `active` / `delayed` / `waiting-children` /
-  `completed` / `failed` as its state changes; the move and the hash update happen
-  in one Lua script. See [Architecture](architecture.md).
+- A job moves between `prioritized` / `active` / `delayed` / `held` /
+  `waiting-children` / `completed` / `failed` as its state changes; the move and the
+  hash update happen in one Lua script. See [Architecture](architecture.md).
 - `:deps` + `:results` + `:cfail` are the flow fan-in machinery - children settle
   into them as they finish. See [Flows](flows.md).
 - The `lock` + `stalled` keys are the at-least-once machinery. See

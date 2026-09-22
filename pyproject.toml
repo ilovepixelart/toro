@@ -97,6 +97,9 @@ asyncio_mode = "auto"
 # The test pyramid, by marker. Run a layer with `pytest -m unit` (fast, no Redis),
 # `-m integration` (needs Redis), or `-m load` (slow). conftest auto-marks by folder.
 addopts = "--strict-markers --import-mode=importlib"
+# A coroutine nobody awaited is a bug, not a warning: `lambda: counts() == 2` compares
+# a coroutine to an int, which is always false, and a poll on it would never hold.
+filterwarnings = ["error::RuntimeWarning"]
 markers = [
     "unit: pure-logic tests, no I/O - fast and deterministic",
     "integration: Redis-backed tests of real state transitions",
