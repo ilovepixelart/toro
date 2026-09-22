@@ -212,7 +212,11 @@ async def test_false_keeps_everything(q, run_worker, run_until, how):
 
 # keepFor is local to the shared Lua, so it is run the way the scripts reach it:
 # with the library prepended.
-_KEEP_FOR = scripts._LIB + "local c, a = keepFor(ARGV[1], ARGV[2]) return {c, a}"
+# Returned as strings: Redis truncates a Lua number to an integer on the way out, which
+# would hide a fraction or a NaN that reached the trim.
+_KEEP_FOR = (
+    scripts._LIB + "local c, a = keepFor(ARGV[1], ARGV[2]) return {tostring(c), tostring(a)}"
+)
 _UNSET = {"completed": (1000, -1), "failed": (5000, -1)}  # the documented defaults
 
 
@@ -234,6 +238,7 @@ _UNSET = {"completed": (1000, -1), "failed": (5000, -1)}  # the documented defau
         ({}, (-1, -1)),  # a bound that names neither keeps everything
         ("nonsense", (-1, -1)),
         ({"count": "abc"}, (-1, -1)),  # not a number: no bound, not an error
+        ({"count": "nan"}, (-1, -1)),  # Lua reads the string as NaN, which no bound sees
         ({"count": 1e400}, (-1, -1)),  # infinity would compare as no bound anyway
         ({"count": -5}, (-1, -1)),  # any negative means no bound, as -1 does
         ({"age": 2.5}, (-1, 2)),
@@ -250,13 +255,14 @@ async def test_the_one_place_a_remove_option_is_read(q, state, value, kept):
     if value != "absent":
         opts[option] = value
     got = await q.redis.eval(_KEEP_FOR, 0, json.dumps(opts), state)
-    assert tuple(got) == (kept or _UNSET[state])
+    assert tuple(int(x) for x in got) == (kept or _UNSET[state])  # a float or NaN fails
 
 
 @pytest.mark.parametrize("state", ["completed", "failed"])
 @pytest.mark.parametrize("stored", ["not json", '"a string"', "[1, 2"])
 async def test_unreadable_opts_count_as_unset(q, state, stored):
-    assert tuple(await q.redis.eval(_KEEP_FOR, 0, stored, state)) == _UNSET[state]
+    got = await q.redis.eval(_KEEP_FOR, 0, stored, state)
+    assert tuple(int(x) for x in got) == _UNSET[state]
 
 
 async def test_eagerly_failed_parent_is_kept_under_the_default(q, run_worker, run_until):
