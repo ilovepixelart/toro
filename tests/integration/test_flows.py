@@ -127,8 +127,8 @@ async def test_flow_result_waits_for_the_whole_flow(q, run_worker):
 
 
 async def test_default_retention_keeps_children_results(q, run_worker, run_until):
-    """BR-006: a child the default retention already trimmed costs its parent nothing -
-    the result was copied into the parent when the child settled."""
+    """BR-006: a busy queue under the default bound costs a running flow nothing - its
+    finished children are out of the trim's reach, and the parent reads every result."""
     gate = asyncio.Event()
 
     async def proc(job):
@@ -156,12 +156,12 @@ async def test_default_retention_keeps_children_results(q, run_worker, run_until
 
         assert await parent.result(timeout=10) == [10, 20, 30]
 
-    assert [await q.redis.exists(q.keys.job(jid)) for jid in early] == [0, 0]
+    assert [await q.redis.exists(q.keys.job(jid)) for jid in early] == [1, 1]
     assert await _count(q, "waiting-children") == 0
 
 
-async def test_flow_view_still_counts_children_the_default_trimmed(q, run_worker, run_until):
-    """Retention takes a finished child's hash, and with it the child's place in the
+async def test_flow_view_still_counts_children_removed_mid_flow(q, run_worker, run_until):
+    """Routine cleanup can remove a finished child, and with it the child's place in the
     tree, while the flow is still running. Its result is already in the parent, so the
     progress a dashboard shows must not go backwards."""
     gate = asyncio.Event()
@@ -178,13 +178,8 @@ async def test_flow_view_still_counts_children_the_default_trimmed(q, run_worker
         assert await run_until(_count_is(q, "completed", 2))  # the third is held
         early = await q.redis.zrange(q.keys.completed, 0, -1)
 
-        # a busy queue: 1000 newer completions, then one more finish, push both out
-        now = int(time.time() * 1000)
-        pipe = q.redis.pipeline(transaction=False)
-        for i in range(1000):
-            pipe.zadd(q.keys.completed, {f"other{i}": now + i})
-        await pipe.execute()
-        await (await q.add("unrelated", {})).result(timeout=10)
+        for jid in early:  # cleaned away by an operator, results already in the parent
+            assert await q.remove_job(jid)
         assert [await q.redis.exists(q.keys.job(jid)) for jid in early] == [0, 0]
 
         view = await q.flow_view(parent.id)
@@ -196,11 +191,11 @@ async def test_flow_view_still_counts_children_the_default_trimmed(q, run_worker
     assert len(view.tree["children"]) == 1  # only the running child still has a hash
 
 
-async def test_flow_view_still_counts_a_tolerated_failure_the_default_trimmed(
+async def test_flow_view_still_counts_a_tolerated_failure_removed_mid_flow(
     q, run_worker, run_until
 ):
     """The same for `failed`: a tolerated (`on_fail="continue"`) failure is copied into
-    the parent too, so it is still counted once the failed child's hash is trimmed."""
+    the parent too, so it is still counted once the failed child's hash is gone."""
     gate = asyncio.Event()
 
     async def proc(job):
@@ -216,14 +211,8 @@ async def test_flow_view_still_counts_a_tolerated_failure_the_default_trimmed(
         assert await run_until(_count_is(q, "failed", 1))
         bad = (await q.redis.zrange(q.keys.failed, 0, -1))[0]
 
-        # 5000 newer failures fill the default bound; one more pushes the child out
-        now = int(time.time() * 1000)
-        pipe = q.redis.pipeline(transaction=False)
-        for i in range(5000):
-            pipe.zadd(q.keys.failed, {f"other{i}": now + i})
-        await pipe.execute()
-        await q.add("unrelated", {})
-        assert await run_until(lambda: _hash_gone(q, bad), timeout=10)
+        assert await q.remove_job(bad)  # cleaned away by an operator
+        assert await _hash_gone(q, bad)
 
         view = await q.flow_view(parent.id)
         gate.set()

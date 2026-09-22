@@ -59,10 +59,16 @@ LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already recla
 NOT_ACTIVE = -3  # a finish script: the job was no longer in `active`
 OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will retry)
 
+# A finished child of a RUNNING flow is scored LIVE + now in its finished set: above
+# every timestamp and out of the trims' reach, which look below LIVE only. Under 2^53
+# with a timestamp added, so the score stays exact.
+LIVE_SCORE = 2**52
+
 # Python-side numbers the Lua needs, interpolated so the two cannot drift.
 _CONSTANTS = (
     f"local DEFAULT_KEEP_COMPLETED = {DEFAULT_KEEP_COMPLETED}\n"
     f"local DEFAULT_KEEP_FAILED = {DEFAULT_KEEP_FAILED}\n"
+    f"local LIVE = {LIVE_SCORE}\n"
 )
 
 # Shared routines, prepended to every script that enqueues or acquires a job.
@@ -247,14 +253,41 @@ end
 -- Record a terminal job in its finished set and apply the job's own retention,
 -- oldest first. Every way a job finishes comes through here, so none of them can
 -- skip the trim or apply another job's bound.
+-- A job whose parent has not settled belongs to a running flow: kept as long as
+-- the flow runs, whatever the queue's bound does meanwhile.
+local function inRunningFlow(base, jobKey)
+  local parentId = redis.call("HGET", jobKey, "parentId")
+  if not parentId then return false end
+  local pstate = redis.call("HGET", base .. parentId, "state")
+  return pstate and pstate ~= "completed" and pstate ~= "failed"
+end
+-- Re-score every finished descendant of a job to `score + depth`, in whichever
+-- finished set holds it. Two callers: a root that settles (score = its finish time,
+-- so it is the oldest of its flow and the trim reaches it first, taking the subtree
+-- with it) and a failed root that is retried (score = LIVE + now: the flow runs
+-- again). A descendant still running places its own subtree when it settles.
+local function placeSubtree(base, jobId, score, depth)
+  local children = redis.call("HGET", base .. jobId, "children")
+  if not children then return end
+  for _, cid in ipairs(cjson.decode(children)) do
+    local state = redis.call("HGET", base .. cid, "state")
+    if state == "completed" or state == "failed" then
+      redis.call("ZADD", base .. state, score + depth, cid)
+      placeSubtree(base, cid, score, depth + 1)
+    end
+  end
+end
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state)
   local keepCount, keepAge = keepFor(redis.call("HGET", jobKey, "opts"), state)
   if keepCount == 0 and keepAge < 0 then
     delJobs({jobId}, base)
     return
   end
-  redis.call("ZADD", setKey, now, jobId)
+  local score = now
+  if inRunningFlow(base, jobKey) then score = LIVE + now end
+  redis.call("ZADD", setKey, score, jobId)
   redis.call("HSET", jobKey, prop, val, "finishedOn", now, "state", state)
+  if score == now then placeSubtree(base, jobId, now, 1) end
   if keepAge >= 0 and trimBudget > 0 then
     local cutoff = now - keepAge * 1000
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
@@ -267,7 +300,8 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
   end
   -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
   if keepCount > 0 and trimBudget > 0 then
-    local excess = redis.call("ZCARD", setKey) - keepCount
+    -- the bound counts what has settled: a running flow's children sit above LIVE
+    local excess = redis.call("ZCOUNT", setKey, "-inf", "(" .. LIVE) - keepCount
     if excess > 0 then
       local last = math.min(excess, trimBudget) - 1
       delJobs(redis.call("ZRANGE", setKey, 0, last), base)
@@ -661,6 +695,7 @@ RETRY_JOB = (
 if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
 redis.call("HDEL", KEYS[4], "failedReason", "finishedOn")
 local base = KEYS[6]
+placeSubtree(base, ARGV[1], LIVE + tonumber(ARGV[2]), 1)  -- the flow runs again
 local parentId = redis.call("HGET", KEYS[4], "parentId")
 if parentId then
   redis.call("HDEL", base .. parentId .. ":cfail", ARGV[1])
