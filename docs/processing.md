@@ -175,9 +175,9 @@ async def process(job):
 - **Work that must not be interrupted** can `await asyncio.shield(...)`, which
   finishes it before the cancellation takes effect.
 - **Do not swallow `CancelledError`.** A processor that catches it and returns
-  normally keeps running work the queue has already given up on; its completion then
-  commits nothing (the job is no longer active and the lock is gone) and the worker
-  reports a lost lock instead.
+  normally does not complete the job: the worker knows it asked this one to stop, so
+  the job still ends `cancelled` and the return value is thrown away. The same holds
+  for a cleanup that raises on the way out, which is not a failure to retry.
 - Workers hear a cancellation over a channel of their own and act at once. A worker
   that missed the message finds it at its next lock renewal instead, so the delay is
   bounded by `lock_renew_time`, never lost.

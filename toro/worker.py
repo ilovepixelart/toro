@@ -448,19 +448,7 @@ class Worker:
         task = asyncio.create_task(run_processor())
         self._processors[job_id] = task
         try:
-            result = await task
-        except asyncio.CancelledError:
-            if job_id not in self._cancelling:
-                raise  # the worker is going down, not a cancellation: let it through
-            self._cancelled += 1
-            nxt = await self._finish_cancelled(job)
-        except Exception as exc:
-            await self.redis.hset(self.keys.job(job_id), "stacktrace", traceback.format_exc())
-            self._failed += 1
-            nxt = await self._finish_failed(job, exc)
-        else:
-            self._processed += 1
-            nxt = await self._finish_completed(job, result)
+            nxt = await self._outcome(job, task)
         finally:
             self._current.discard(job_id)
             self._processors.pop(job_id, None)
@@ -468,6 +456,34 @@ class Worker:
             if renewer is not None:
                 renewer.cancel()
         return nxt
+
+    async def _outcome(
+        self, job: Job, task: asyncio.Task[Any]
+    ) -> tuple[str, dict[str, str]] | None:
+        """Commit whatever the processor's task came back with.
+
+        A job this worker asked to stop ends `cancelled` however its processor
+        unwound. A cleanup that raises on the way out is not a failure to retry, and a
+        processor that caught the cancellation and returned did not complete the work:
+        its lock is still held and it is still in `active`, so either commit would
+        otherwise succeed and stand.
+        """
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            if job.id not in self._cancelling:
+                raise  # the worker is going down, not a cancellation: let it through
+            return await self._finish_cancelled(job)
+        except Exception as exc:
+            if job.id in self._cancelling:
+                return await self._finish_cancelled(job)
+            await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
+            self._failed += 1
+            return await self._finish_failed(job, exc)
+        if job.id in self._cancelling:
+            return await self._finish_cancelled(job)
+        self._processed += 1
+        return await self._finish_completed(job, result)
 
     def _request_cancel(self, job_id: str) -> None:
         """Stop a job this worker is running, once.
@@ -490,6 +506,7 @@ class Worker:
         task.cancel()
 
     async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
+        self._cancelled += 1
         res = await self._move_to_cancelled(
             keys=[
                 self.keys.active,

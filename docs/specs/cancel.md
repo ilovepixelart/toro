@@ -76,10 +76,12 @@ told so rather than left waiting.
 
 ## Risks
 
-- **A processor that swallows `CancelledError`** keeps running and then commits a
-  completion for a job the queue has already cancelled. The commit is token-guarded
-  and the job is no longer active, so it commits nothing, and the worker reports it
-  as a lost lock. Documented on the consuming page.
+- **A processor that swallows `CancelledError`** would otherwise commit a completion
+  that stands: cancelling an active job only flags it, so its lock is still held and
+  it is still in `active`. The worker therefore decides the outcome by what it asked
+  for, not by how the processor unwound: a job it asked to stop ends `cancelled`
+  whether the processor returned a value or raised from its cleanup. The work itself
+  can still be running afterwards, which is why the processing page says not to.
 - **A worker subscribes before its first claim**, so a job it is running is always
   one it can hear about. Subscribed afterwards, the claim path (which wakes on the
   marker) starts a processor before the subscribe round trip lands, and every

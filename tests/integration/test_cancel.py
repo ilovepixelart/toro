@@ -323,3 +323,61 @@ async def test_a_cleanup_that_outlives_a_renewal_is_not_cut_short(q, run_worker)
         assert await q.cancel_job(job.id) is True
 
         await asyncio.wait_for(cleaned.wait(), 5)  # the cleanup ran to the end
+
+
+async def test_a_processor_that_swallows_the_cancellation_is_still_cancelled(q, run_worker):
+    """CN-002: the worker asked this job to stop. A processor that catches the
+    cancellation and returns a value must not land the job in `completed`: its lock is
+    still held and it is still in `active`, so the commit would succeed."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return "done anyway"
+        return None
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("stubborn", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+
+        with pytest.raises(JobCancelledError):
+            await job.result(timeout=10)
+
+    assert await _state(q, job.id) == "cancelled"
+    assert await _count(q, "completed") == 0
+
+
+async def test_a_cleanup_that_raises_does_not_resurrect_a_cancelled_job(q, run_worker):
+    """CN-004: a cleanup failing on the way out is ordinary. It must not turn the
+    cancellation into a failure, which with attempts left would run the job again."""
+    runs = []
+    started = asyncio.Event()
+
+    async def proc(job):
+        runs.append(job.name)
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            raise ConnectionError("the cleanup could not reach its store")
+
+    async with run_worker(q, proc, concurrency=2) as w:
+        w.on("failed", lambda *a, **k: None)
+        job = await q.add("long", {}, attempts=5, backoff=10)
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+
+        with pytest.raises(JobCancelledError):
+            await job.result(timeout=10)
+        await asyncio.sleep(0.3)  # a retry would have landed by now
+
+    assert runs == ["long"]
+    assert await _state(q, job.id) == "cancelled"
+    assert await _count(q, "failed") == 0
+    assert await _count(q, "delayed") == 0
