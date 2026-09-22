@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from toro import FlowChild, JobCancelledError, Queue
+from toro import FlowChild, JobCancelledError, Queue, scripts
 
 PREFIX = "torotest"
 
@@ -766,3 +766,102 @@ async def test_a_parent_can_read_which_children_were_stopped(q, run_worker, run_
 
     assert list(seen["failed"]) != [stopped], "a stopped child was reported as failed"
     assert seen["cancelled"] == {stopped: "not needed"}
+
+
+async def test_cancelling_a_running_child_settles_its_parent_once(q, run_worker, run_until):
+    """CN-007: a running child is settled by its worker when it stops, not by the
+    request. Settling it in both places records the parent twice: a second terminal
+    write over a job that has already settled, and a second trip up the ancestors."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=4):
+        root = await q.add_flow("report", {}, children=[FlowChild("runs", {}, on_fail="continue")])
+        child = (await q.get_flow(root.id))["children"][0]["job"].id
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(child, reason="stop") is True
+
+        assert await run_until(lambda: _in_state(q, child, "cancelled"), timeout=10)
+        # Released once: the parent left its barrier and is running or done, not still
+        # parked. Catching it in `wait` would race the worker that claims it.
+        assert await run_until(lambda: _left_parked(q, root.id), timeout=10)
+        # and settled once: one entry in the record, and a barrier that drained once
+        assert await q.redis.hgetall(q.keys.ccancel(root.id)) == {child: "stop"}
+        assert await q.redis.scard(q.keys.deps(root.id)) == 0
+        assert await q.redis.zscore(q.keys.waiting_children, root.id) is None
+
+
+async def test_a_cancelled_flow_child_is_retained_like_any_settled_job(q, run_worker, run_until):
+    """CN-005: retention and the flow machinery ask "has this settled" about every
+    terminal state. A cancelled job that does not answer yes is scored as if its flow
+    were still running, and nothing ever reclaims it."""
+
+    async def proc(job):
+        return job.name
+
+    root = await q.add_flow(
+        "report", {}, children=[FlowChild("stopped", {}, delay=60_000, on_fail="continue")]
+    )
+    child = (await q.get_flow(root.id))["children"][0]["job"].id
+    assert await q.cancel_job(child) is True
+
+    async with run_worker(q, proc, concurrency=2):
+        assert await run_until(lambda: _in_state(q, root.id, "completed"), timeout=10)
+
+    # the whole flow has settled, so the child is scored as history, not as live work
+    score = await q.redis.zscore(q.keys.cancelled, child)
+    assert score is not None
+    assert score < scripts.LIVE_SCORE, "a cancelled child was scored out of retention's reach"
+
+
+async def _left_parked(q: Queue, job_id: str) -> bool:
+    return await _state(q, job_id) != "waiting-children"
+
+
+async def test_a_parent_waits_for_its_child_to_actually_stop(q, run_worker, run_until):
+    """CN-007: a running child is stopped by its worker, not by the request, and its
+    parent must not settle until it really has. Settling on the request alone reports
+    the flow finished while a child of it is still unwinding."""
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            await release.wait()  # still unwinding: the child has not stopped yet
+
+    async with run_worker(q, proc, concurrency=4):
+        root = await q.add_flow("report", {}, children=[FlowChild("runs", {})])
+        child = (await q.get_flow(root.id))["children"][0]["job"].id
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(child) is True
+        await asyncio.sleep(0.4)
+
+        assert await _state(q, root.id) == "waiting-children", "the parent settled early"
+        release.set()
+        assert await run_until(lambda: _in_state(q, root.id, "cancelled"), timeout=10)
+
+
+async def test_removing_a_cancelled_job_does_not_scan_the_active_list(q):
+    """CN-005: a job's state says which single collection holds it. Without an answer
+    for `cancelled`, removal falls back to the blanket sweep, which includes an
+    O(active) LREM: `clean("cancelled")` would pay it once per job."""
+    job = await q.add("doomed", {})
+    assert await q.cancel_job(job.id) is True
+    before = await _lrem_calls(q)
+
+    assert await q.remove_job(job.id) is True
+
+    assert await _lrem_calls(q) == before
+    assert await _count(q, "cancelled") == 0
+
+
+async def _lrem_calls(q: Queue) -> int:
+    stats = await q.redis.info("commandstats")
+    return int(stats.get("cmdstat_lrem", {}).get("calls", 0))
