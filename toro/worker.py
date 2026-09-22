@@ -130,6 +130,9 @@ class Worker:
         self.redis = connection or connect(
             url, max_connections=max(50, concurrency + 10), blocking_timeout=block_timeout
         )
+        # A connection we opened is ours to give back when we stop; one handed to us
+        # belongs to the caller, who may still be using it elsewhere.
+        self._owns_connection = connection is None
         self.concurrency = concurrency
         # Queue-wide rate limit, shared by all workers via one token bucket in Redis.
         # `{"max": N, "duration": ms}` = at most N jobs per duration. All workers on a
@@ -254,7 +257,7 @@ class Worker:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         with contextlib.suppress(Exception):
             await self._deregister()  # drop our presence record so we vanish at once
-        await self.redis.aclose()
+        await self.redis.aclose(close_connection_pool=self._owns_connection)
 
     # ---- presence / heartbeat ---------------------------------------------
 
