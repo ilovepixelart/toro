@@ -21,7 +21,7 @@ from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
-from .openmetrics import render
+from .openmetrics import OUTCOMES, render
 from .scheduler import next_run, valid_cron
 
 
@@ -659,6 +659,19 @@ class Queue:
             "cancelled": cancelled,
         }
 
+    async def lifetime_totals(self) -> dict[str, int]:
+        """Counters since the queue was created, one per outcome, present at zero.
+
+        A dashboard serving several queues renders them together, so it needs the
+        numbers rather than one queue's finished text: a render per queue concatenated
+        declares every family twice. This is that seam, so nothing outside has to know
+        which key the totals live in.
+        """
+        raw = _str_dict(await self.redis.hgetall(self.keys.totals))
+        totals = dict.fromkeys(OUTCOMES, 0)
+        totals.update({k: int(v) for k, v in raw.items()})
+        return totals
+
     async def metrics_text(self) -> str:
         """OpenMetrics text for this queue: lifetime counters and current depth.
 
@@ -667,10 +680,7 @@ class Queue:
         has to be running for the figures to be right. The depth half is `counts()`,
         so a scraper and a dashboard can never disagree about what a state holds.
         """
-        totals = {
-            k: int(v) for k, v in _str_dict(await self.redis.hgetall(self.keys.totals)).items()
-        }
-        return render(self.name, totals, await self.counts())
+        return render(self.name, await self.lifetime_totals(), await self.counts())
 
     async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
         """Fetch the last `minutes` per-minute metric buckets, oldest first, in

@@ -90,3 +90,17 @@ async def test_metrics_text_reports_the_queue_a_scraper_would_see(q, run_worker,
     for state in await q.counts():
         assert f'state="{state}"' in text
     assert text.endswith("# EOF\n")
+
+
+async def test_lifetime_totals_are_readable_on_their_own(q):
+    """A dashboard serving several queues needs the numbers, not one queue's rendered
+    text: concatenating renders would declare every family twice. So the totals are
+    readable without reaching into the queue's keys."""
+    await q.add("j", {})
+
+    totals = await q.lifetime_totals()
+
+    assert totals["added"] == 1
+    assert totals["completed"] == 0  # present at zero, like the exposition
+    assert totals["failed"] == 0
+    assert totals["cancelled"] == 0
