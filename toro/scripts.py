@@ -690,23 +690,18 @@ return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7]
 """
 )
 
+# What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
+# and the script cannot drift over a bare 2.
+LOCK_CANCEL_REQUESTED = 2
+
 # Renew a lock we still own. Token-guarded: we can NEVER renew a lock another
 # worker has taken over. A successful renew also resets the stalled window.
-# KEYS[1] lock key  KEYS[2] stalled set
-# ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] jobId
-# What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
-# and the script cannot drift over a bare 2.
-LOCK_CANCEL_REQUESTED = 2
-
-# What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
-# and the script cannot drift over a bare 2.
-LOCK_CANCEL_REQUESTED = 2
-
-# Returns 0 (the lock is gone), 1 (renewed) or 2 (renewed, and a cancellation has
-# been asked for). The renewal is the backstop for a cancel message that never
-# arrived: a worker that stops asking has lost the job to the stalled sweep anyway,
-# so this cannot be the thing that is missed.
+# Returns 0 (the lock is gone), 1 (renewed) or LOCK_CANCEL_REQUESTED (renewed, and a
+# cancellation has been asked for). The renewal is the backstop for a cancel message
+# that never arrived: a worker that stops renewing has lost the job to the stalled
+# sweep anyway, so this cannot be the thing that is missed.
 # KEYS[1] lock  KEYS[2] stalled  KEYS[3] job hash
+# ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] jobId
 EXTEND_LOCK = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   redis.call("SET", KEYS[1], ARGV[1], "PX", tonumber(ARGV[2]))

@@ -303,6 +303,7 @@ class Worker:
                 "heartbeat": now,
                 "processed": self._processed,
                 "failed": self._failed,
+                "cancelled": self._cancelled,
                 "current": json.dumps(sorted(self._current)),
                 "state": self._state,
             },
@@ -332,6 +333,7 @@ class Worker:
                 "concurrency": self.concurrency,
                 "processed": self._processed,
                 "failed": self._failed,
+                "cancelled": self._cancelled,
                 "started": self.started_at,
                 "last_seen": now,
                 "current": sorted(self._current),  # what it was running at the end
