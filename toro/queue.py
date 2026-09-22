@@ -7,6 +7,7 @@ import contextlib
 import json
 import math
 import time
+from dataclasses import asdict
 from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
@@ -599,7 +600,7 @@ class Queue:
         skip = {"delay"} | {
             k for k in ("remove_on_complete", "remove_on_fail") if getattr(stored, k) is None
         }
-        opts: dict[str, Any] = {k: v for k, v in vars(stored).items() if k not in skip}
+        opts: dict[str, Any] = {k: v for k, v in asdict(stored).items() if k not in skip}
         await self.add(name, json.loads(t.get("data") or "null"), **opts)
         return True
 
