@@ -107,7 +107,8 @@ class Keys:
     @property
     def workers(self) -> str:
         # ZSET of live worker ids -> last-heartbeat timestamp (ms). Stale entries
-        # are pruned lazily on read; powers the dashboard's "who's running" view.
+        # are pruned on read, and day-old ones by any worker's heartbeat; powers the
+        # dashboard's "who's running" view.
         return f"{self.base}workers"
 
     def worker(self, worker_id: str) -> str:

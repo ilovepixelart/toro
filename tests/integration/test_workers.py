@@ -6,6 +6,11 @@ records (a crashed worker that never deregistered) get pruned on read.
 import asyncio
 import time
 
+from toro import Worker
+from toro.worker import PRESENCE_TTL_MS
+
+PREFIX = "torotest"
+
 
 async def _workers_has(q, predicate):
     ws = await q.workers()
@@ -139,3 +144,44 @@ async def test_presence_reports_global_concurrency(q, run_worker, run_until):
     async with run_worker(q, proc):
         assert await run_until(lambda: q.workers())
         assert (await q.workers())[0]["global_concurrency"] == 0  # unset = no cap
+
+
+async def _noop(job):
+    return None
+
+
+async def test_presence_expires_without_a_reader(q):
+    """Dead workers are pruned when something reads `workers()` - in practice a
+    dashboard. With no reader, a worker killed without deregistering (an OOM, a
+    SIGKILL) must not leave its record behind forever: the record carries an expiry
+    that every heartbeat renews."""
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+    await w._write_heartbeat()
+
+    ttl = await q.redis.pttl(q.keys.worker(w.token))
+    assert PRESENCE_TTL_MS - 5_000 < ttl <= PRESENCE_TTL_MS
+
+
+async def test_a_heartbeat_sweeps_entries_whose_record_has_expired(q):
+    """The `workers` index has no expiry of its own: a live worker's heartbeat drops
+    entries older than the record's lifetime. One the dashboard could still report as
+    lost (its record is alive) is left for `workers()` to log and prune."""
+    now = int(time.time() * 1000)
+    await q.redis.zadd(
+        q.keys.workers,
+        {"long-gone": now - PRESENCE_TTL_MS - 60_000, "just-died": now - 60_000},
+    )
+    await q.redis.hset(q.keys.worker("just-died"), mapping={"heartbeat": now - 60_000})
+
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+    await w._write_heartbeat()
+
+    assert await q.redis.zscore(q.keys.workers, "long-gone") is None
+    assert await q.redis.zscore(q.keys.workers, "just-died") is not None
+    assert await q.redis.zscore(q.keys.workers, w.token) is not None
+    assert [d["id"] for d in await _lost(q)] == ["just-died"]  # still reported
+
+
+async def _lost(q):
+    await q.workers()
+    return [d for d in await q.departed_workers() if d["reason"] == "lost"]
