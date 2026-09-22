@@ -219,7 +219,8 @@ end
 -- Redis-blocking pass: the remainder amortizes over the following finishes (same
 -- idea as PROMOTE_DELAYED's batch). One budget for the whole script, because one
 -- script can record many jobs (a failing flow child fails its ancestors with it)
--- and one job can carry both bounds.
+-- and one job can carry both bounds. A flow goes whole: the last root removed may
+-- overrun the budget by the rest of its subtree, at most MAX_FLOW_NODES.
 local trimBudget = 1000
 -- How much of a finished set a job's remove option keeps:
 --   keepCount: -1 keep all, 0 remove immediately (don't record), N keep newest N
@@ -261,6 +262,21 @@ local function inRunningFlow(base, jobKey)
   local pstate = redis.call("HGET", base .. parentId, "state")
   return pstate and pstate ~= "completed" and pstate ~= "failed"
 end
+-- Remove a finished job and, with it, the finished subtree of a flow it roots: the
+-- trim reaches a root first (it is the oldest of its flow) and a partial flow is
+-- worth nothing. Returns how many jobs went, which the trim budget pays for. A
+-- descendant still running is left; it settles as an orphan and is trimmed alone.
+local function removeFinished(base, jobId)
+  local meta = redis.call("HMGET", base .. jobId, "state", "children")
+  if meta[1] ~= "completed" and meta[1] ~= "failed" then return 0 end
+  redis.call("ZREM", base .. meta[1], jobId)
+  delJobs({jobId}, base)
+  local gone = 1
+  if meta[2] then
+    for _, cid in ipairs(cjson.decode(meta[2])) do gone = gone + removeFinished(base, cid) end
+  end
+  return gone
+end
 -- Re-score every finished descendant of a job to `score + depth`, in whichever
 -- finished set holds it. Two callers: a root that settles (score = its finish time,
 -- so it is the oldest of its flow and the trim reaches it first, taking the subtree
@@ -292,10 +308,9 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
     local cutoff = now - keepAge * 1000
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
                                "LIMIT", 0, trimBudget)
-    if #expired > 0 then
-      delJobs(expired, base)
-      redis.call("ZREM", setKey, unpack(expired))
-      trimBudget = trimBudget - #expired
+    for _, id in ipairs(expired) do
+      if trimBudget <= 0 then break end
+      trimBudget = trimBudget - removeFinished(base, id)
     end
   end
   -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
@@ -303,10 +318,11 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
     -- the bound counts what has settled: a running flow's children sit above LIVE
     local excess = redis.call("ZCOUNT", setKey, "-inf", "(" .. LIVE) - keepCount
     if excess > 0 then
-      local last = math.min(excess, trimBudget) - 1
-      delJobs(redis.call("ZRANGE", setKey, 0, last), base)
-      redis.call("ZREMRANGEBYRANK", setKey, 0, last)
-      trimBudget = trimBudget - (last + 1)
+      local victims = redis.call("ZRANGE", setKey, 0, math.min(excess, trimBudget) - 1)
+      for _, id in ipairs(victims) do
+        if trimBudget <= 0 then break end
+        trimBudget = trimBudget - removeFinished(base, id)
+      end
     end
   end
 end

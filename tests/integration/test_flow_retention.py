@@ -5,6 +5,7 @@ a flow runs, nothing of it is trimmed; when its root is trimmed, the subtree goe
 """
 
 import asyncio
+import random
 import time
 
 import pytest
@@ -224,3 +225,133 @@ async def test_a_retried_flow_is_running_again(q, run_worker, run_until):
         assert await run_until(lambda: _in_state(q, root_id, "completed"), timeout=10)
     scores = await _scores(q, list(names.values()))
     _placed(scores, names, scores[root_id])
+
+
+# ---- a trimmed root takes its subtree -------------------------------------------------
+
+
+async def _finished_ids(q: Queue) -> set[str]:
+    done = await q.redis.zrange(q.keys.completed, 0, -1)
+    dead = await q.redis.zrange(q.keys.failed, 0, -1)
+    return set(done) | set(dead)
+
+
+async def test_trimming_a_root_takes_its_subtree(q, run_worker, run_until):
+    """FR-004: the root is the oldest of its flow, so it is the trim's first victim; the
+    whole subtree goes with it, in one script, hashes and aux keys included."""
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=4):
+        root_id, names = await _nested(q)
+        assert await run_until(lambda: _settled(q, root_id), timeout=10)
+        assert await _count_state(q, "completed", 5)
+
+        # a bound of five: one job too many, and the one oldest is the root
+        await (await q.add("unrelated", {}, remove_on_complete=5)).result(timeout=10)
+
+    assert await _finished_ids(q) == {(await q.redis.zrange(q.keys.completed, 0, -1))[0]}
+    assert await _present(q, list(names.values())) == 0
+    assert await q.redis.exists(q.keys.results(root_id), q.keys.deps(root_id)) == 0
+    assert await q.get_flow(root_id) is None
+
+
+async def test_a_cascade_spends_the_trim_budget(q, run_worker, run_until):
+    """FR-004: a root's tolerated failures sit in the OTHER set, where the trim's rank
+    window does not see them. Removing them still counts: once the budget is spent,
+    the remaining victims wait for the next finish."""
+    width = 999  # the root and its children fill a flow
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc, concurrency=16):
+        root = await q.add_flow(
+            "report", {}, children=[c("bad", {}, on_fail="continue") for _ in range(width)]
+        )
+        assert await run_until(lambda: _settled(q, root.id), timeout=60)
+        assert await _count_state(q, "failed", width)
+        seeds = await _seed_history(q, 2, newer_than_now=True)
+
+        # keep one: three too many, the root first. Its cascade costs the whole budget.
+        await (await q.add("unrelated", {}, remove_on_complete=1)).result(timeout=10)
+
+    assert await _count_state(q, "failed", 0)  # the subtree went with the root
+    assert await _present(q, seeds) == 2, "victims past a spent budget were still trimmed"
+    assert await _count_state(q, "completed", 3)
+
+
+async def test_orphans_are_ordinary_jobs(q, run_worker, run_until):
+    """FR-006: a child that finishes after its parent was failed eagerly belongs to no
+    running flow: scored at its finish time and trimmed like any job."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        if job.name == "slow":
+            await gate.wait()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        root = await q.add_flow("report", {}, children=[c("bad", {}), c("slow", {})])
+        assert await run_until(lambda: _in_state(q, root.id, "failed"), timeout=10)
+        gate.set()
+        assert await run_until(lambda: _count_state(q, "completed", 1), timeout=10)
+        slow = (await q.redis.zrange(q.keys.completed, 0, -1))[0]
+        assert (await _scores(q, [slow]))[slow] < LIVE_SCORE
+
+        await (await q.add("unrelated", {}, remove_on_complete=1)).result(timeout=10)
+
+    assert await _present(q, [slow]) == 0
+    assert await _count_state(q, "completed", 1)
+
+
+# ---- over a long run --------------------------------------------------------------
+
+
+async def test_no_retained_flow_is_partial(q, run_worker, run_until):
+    """FR-005: many flows of uneven size past the default bound, so the trim's window
+    never lines up with a flow by luck. Whatever it took, every root still kept has
+    its whole tree, and no child outlives its root."""
+    # widths 1 to 5 in no pattern: a pattern whose period divides the bound would let
+    # every trim remove a flow of exactly the size just placed, whole by arithmetic
+    widths = random.Random(7).choices(range(1, 6), k=300)  # noqa: S311 - reproducible
+
+    async def proc(job):
+        return job.name
+
+    async with run_worker(q, proc, concurrency=16):
+        roots = []
+        for n, width in enumerate(widths):
+            parts = [c("part", {"i": i}) for i in range(width)]
+            roots.append(await q.add_flow("report", {"n": n}, children=parts))
+        assert await run_until(lambda: _all_settled(q, [r.id for r in roots]), timeout=60)
+
+    kept = await q.redis.zrange(q.keys.completed, 0, -1)
+    assert 0 < len(kept) <= DEFAULT_KEEP_COMPLETED + 6  # the bound, plus one subtree
+    hashes = await _hashes(q, kept)
+    for jid, h in hashes.items():
+        assert h, f"{jid} is listed but has no hash"
+        if "parentId" in h:
+            assert h["parentId"] in hashes, f"child {jid} outlived its root"
+        else:
+            tree = await q.get_flow(jid)
+            assert tree is not None and len(tree["children"]) == len(h["children"].split(",")), (
+                f"root {jid} is partial"
+            )
+            assert all(n["job"].id in hashes for n in tree["children"]), f"root {jid} is partial"
+
+
+async def _all_settled(q: Queue, ids: list[str]) -> bool:
+    pipe = q.redis.pipeline(transaction=False)
+    for jid in ids:
+        pipe.hget(q.keys.job(jid), "state")
+    states = await pipe.execute()
+    return all(s in ("completed", "failed", None) for s in states)
+
+
+async def _hashes(q: Queue, ids: list[str]) -> dict[str, dict]:
+    pipe = q.redis.pipeline(transaction=False)
+    for jid in ids:
+        pipe.hgetall(q.keys.job(jid))
+    return dict(zip(ids, await pipe.execute(), strict=True))
