@@ -416,17 +416,21 @@ async def test_the_events_dispatcher_is_live_before_a_result_waits(q):
             await waiter.close()
 
 
-class _MuteSubscription:
-    """A subscription Redis never confirms."""
+class _Subscription:
+    """A subscription whose replies are scripted, and silent once they run out."""
 
-    def __init__(self) -> None:
+    def __init__(self, *replies: dict) -> None:
+        self.left = list(replies)
         self.closed = False
 
     async def subscribe(self, *_channels: str) -> None:
         return None
 
-    async def get_message(self, timeout: float) -> None:
+    async def get_message(self, timeout: float) -> dict | None:
+        if self.left:
+            return self.left.pop(0)
         await asyncio.sleep(timeout)
+        return None
 
     async def aclose(self) -> None:
         self.closed = True
@@ -436,7 +440,7 @@ async def test_an_unconfirmed_subscription_gives_up_and_closes(q, monkeypatch):
     """Redis never answers the SUBSCRIBE: the wait says so rather than hanging, and the
     half-made subscription is closed instead of holding a pool connection."""
     monkeypatch.setattr("toro.queue.SUBSCRIBE_TIMEOUT", 0.05)
-    mute = _MuteSubscription()
+    mute = _Subscription()
     monkeypatch.setattr(q.redis, "pubsub", lambda *a, **kw: mute)
 
     with pytest.raises(TimeoutError, match="did not confirm"):
@@ -444,6 +448,19 @@ async def test_an_unconfirmed_subscription_gives_up_and_closes(q, monkeypatch):
 
     assert mute.closed
     assert q._events_task is None
+
+
+async def test_a_job_event_before_the_confirmation_is_not_taken_for_it(q, monkeypatch):
+    """Another client's job event can arrive on the channel before Redis confirms the
+    subscription. Only the confirmation itself may end the wait."""
+    replies = _Subscription({"type": "message"}, {"type": "subscribe"})
+    monkeypatch.setattr(q.redis, "pubsub", lambda *a, **kw: replies)
+
+    await q._ensure_dispatcher()
+
+    assert replies.left == []  # the event was read, and did not end the wait
+    assert not replies.closed
+    q._events_task.cancel()
 
 
 async def test_result_reads_a_job_that_removed_itself(q, run_worker):
