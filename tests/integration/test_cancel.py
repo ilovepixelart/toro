@@ -256,8 +256,10 @@ async def test_cancelling_a_flow_takes_its_subtree(q, run_worker, run_until):
 
         assert await q.cancel_job(root.id) is True
 
-        # the root, the running child and the queued one
-        assert await run_until(lambda: _count_is(q, "cancelled", 3), timeout=10)
+        # the root, the running child and the queued one. `_count_is` already returns
+        # the predicate, so wrapping it in a lambda hands run_until a function object:
+        # not a coroutine, and truthy, so the poll would pass without ever counting.
+        assert await run_until(_count_is(q, "cancelled", 3), timeout=10)
 
     assert await _count(q, "active") == 0
     assert await _count(q, "delayed") == 0
