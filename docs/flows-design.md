@@ -155,10 +155,9 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
     `fail_parent`.
   - **The stalled path gets identical parent bookkeeping**: `MOVE_STALLED`'s
     fail-branch runs the same settle logic (lesson 1: the crash path is where
-    barriers historically break). One pre-existing nuance: the stall-escalated
-    child itself is recorded into `failed` without `recordFinished`, so its
-    own `remove_on_fail` retention does not apply on the stall path - true
-    for all stalled jobs, not just flow children.
+    barriers historically break). The stall-escalated job itself is recorded
+    through `recordFinished` too, which reads the job's own `remove_on_fail` - a
+    queue whose only failures are crashes stays bounded like any other.
 - **Cleanup is structural** (lesson 5): `delJobs` and `REMOVE_JOB` know the
   three aux keys, so every existing removal path (auto-removal
   keepCount/keepAge, manual remove, `clean()`) deletes them for free.

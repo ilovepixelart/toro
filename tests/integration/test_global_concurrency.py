@@ -351,7 +351,17 @@ async def test_finish_with_a_missing_cap_commits_nothing(q):
     with pytest.raises(ResponseError, match="global concurrency"):
         await w._move_to_completed(
             keys=completed_keys,
-            args=[job_id, "{}", now, w.token, "1", 30_000, -1, -1, 0, 0, 60_000],
+            args=scripts.completed_args(
+                job_id=job_id,
+                returnvalue="{}",
+                now=now,
+                token=w.token,
+                fetch="1",
+                lock_duration=30_000,
+                rl_max=0,
+                rl_duration=0,
+                global_concurrency=0,
+            )[:-1],  # the cap is the last argument: a caller that never sends it
         )
 
     failed_keys = [
@@ -361,7 +371,20 @@ async def test_finish_with_a_missing_cap_commits_nothing(q):
     with pytest.raises(ResponseError, match="global concurrency"):
         await w._move_to_failed(
             keys=failed_keys,
-            args=[job_id, "boom", now, 1, 1, 0, w.token, "1", 30_000, -1, -1, 0, 0, 60_000],
+            args=scripts.failed_args(
+                job_id=job_id,
+                reason="boom",
+                now=now,
+                attempts_made=1,
+                max_attempts=1,
+                backoff=0,
+                token=w.token,
+                fetch="1",
+                lock_duration=30_000,
+                rl_max=0,
+                rl_duration=0,
+                global_concurrency=0,
+            )[:-1],
         )
 
     counts = await q.counts()

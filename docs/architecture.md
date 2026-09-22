@@ -95,8 +95,10 @@ due jobs into the prioritized set.
 - **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
   `completed`, `failed`); `Queue.result()` awaits the terminal event and
   `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
-- **Auto-removal** - `remove_on_complete` / `remove_on_fail` (bool / count /
-  `{count, age}`) enforced inside the finish script, not by a separate sweeper.
+- **Retention** - `remove_on_complete` / `remove_on_fail` (bool / count /
+  `{count, age}`, bounded when unset) enforced inside the finish script, not by a
+  separate sweeper, at most 1000 deletions per finish. See
+  [Producing jobs](producing.md#retention).
 - **Flows** - `add_flow()` creates a parent/child tree atomically; children
   settle into the parent's `:deps` barrier inside the same finish scripts that
   commit their own transitions, so the fan-in resolves on the crash path too.
@@ -118,9 +120,9 @@ The scripts share a small library of routines:
 | `requireCap` | Reads the cap argument, raising when it is missing. Called before a script's first write. |
 | `wakeIfWaiting` | Arms the marker when jobs are waiting: a slot was freed without a claim. |
 | `tryRateLimit` | Token bucket: ms until a token frees, or 0 to proceed. |
-| `recordFinished` | Records a terminal job in `completed`/`failed` and applies auto-removal. |
+| `recordFinished` | Records a terminal job in `completed`/`failed` and applies the job's own retention. Every way a job finishes comes through it, and it is the only writer to those sets. |
 | `settleChildCompleted` / `settleChildFailed` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent - or fails it eagerly, per `on_fail`. |
-| `keepArgsFromOpts` | The Lua twin of `JobOptions.keep_args`, for eager parent failures that have no Python caller. |
+| `keepFor` | The one place a `remove_on_complete` / `remove_on_fail` option is read. In Lua because two ways a job finishes have no worker behind them: a parent failed with its child, and a job the stalled sweep gives up on. |
 
 And the scripts themselves:
 

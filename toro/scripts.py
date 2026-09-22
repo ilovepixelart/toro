@@ -29,6 +29,8 @@ KEYS[]. This keeps the scripts simple for a single Redis; running on Redis Clust
 would require hash-tagging the keys (e.g. `{queue}`) so a queue's keys share a slot.
 """
 
+from .job import DEFAULT_KEEP_COMPLETED, DEFAULT_KEEP_FAILED
+
 # Priority score packing constants (kept well under 2^53 so ZSET double scores
 # stay exact). priority in [0, PRIORITY_OFFSET]; sequence in [0, SEQ_MOD).
 PRIORITY_OFFSET = 1048576  # 2^20  - max priority (most urgent)
@@ -57,6 +59,12 @@ LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already recla
 NOT_ACTIVE = -3  # a finish script: the job was no longer in `active`
 OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will retry)
 
+# Python-side numbers the Lua needs, interpolated so the two cannot drift.
+_CONSTANTS = (
+    f"local DEFAULT_KEEP_COMPLETED = {DEFAULT_KEEP_COMPLETED}\n"
+    f"local DEFAULT_KEEP_FAILED = {DEFAULT_KEEP_FAILED}\n"
+)
+
 # Shared routines, prepended to every script that enqueues or acquires a job.
 # This is the single definition of "how a job is ordered, woken, claimed":
 #   priorityScore  - (priority, seq) -> ZSET score (lower score = sooner)
@@ -64,7 +72,9 @@ OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will ret
 #   lockAndLoad    - lock a job already on `active`, stamp it, return its hash
 #   acquireNext    - ZPOPMIN the next job into `active`, then lockAndLoad it
 # To add markers-with-delay or grouping later, we change only these functions.
-_LIB = """
+_LIB = (
+    _CONSTANTS
+    + """
 local function priorityScore(priority, pcKey)
   local seq = redis.call("INCR", pcKey) % 4294967296
   return (1048576 - priority) * 4294967296 + seq
@@ -198,32 +208,72 @@ local function recordFlow(base, completed, now, durMs, retentionMs)
   end
   redis.call("PEXPIRE", bucket, retentionMs)
 end
--- Record a terminal job in a finished set, applying auto-removal:
+-- Finished jobs this SCRIPT may still trim. A bound that meets a deep backlog (a
+-- limit just enabled, a default just tightened) must not sweep it all in one
+-- Redis-blocking pass: the remainder amortizes over the following finishes (same
+-- idea as PROMOTE_DELAYED's batch). One budget for the whole script, because one
+-- script can record many jobs (a failing flow child fails its ancestors with it)
+-- and one job can carry both bounds.
+local trimBudget = 1000
+-- How much of a finished set a job's remove option keeps:
 --   keepCount: -1 keep all, 0 remove immediately (don't record), N keep newest N
 --   keepAge:   -1 no age limit, S keep only those finished within S seconds
-local function recordFinished(setKey, jobKey, base, jobId, now, prop, val,
-                              state, keepCount, keepAge)
+-- The ONE place the option is read. It lives here and not in the worker because two
+-- of the ways a job finishes have no worker behind them: a parent failed with its
+-- child, and a job the stalled sweep gives up on. Unset, null and unreadable opts
+-- keep the default for the set.
+-- A count is a rank and an age is multiplied into a score: both must be whole, and
+-- neither may be NaN or infinite, which compare as nothing and would slip past
+-- every bound below. Anything else means "no bound".
+local function whole(v)
+  local n = tonumber(v)
+  if n == nil or n ~= n or n < 0 or n == math.huge then return -1 end
+  return math.floor(n)
+end
+local function keepFor(optsJson, state)
+  local completed = state == "completed"
+  local default = completed and DEFAULT_KEEP_COMPLETED or DEFAULT_KEEP_FAILED
+  local ok, opts = pcall(cjson.decode, optsJson or "{}")
+  if not ok or type(opts) ~= "table" then return default, -1 end
+  local v = opts.removeOnFail
+  if completed then v = opts.removeOnComplete end
+  if v == nil or v == cjson.null then return default, -1 end
+  if v == false then return -1, -1 end
+  if v == true then return 0, -1 end
+  if type(v) == "number" then return whole(v), -1 end
+  if type(v) == "table" then return whole(v.count), whole(v.age) end
+  return -1, -1
+end
+-- Record a terminal job in its finished set and apply the job's own retention,
+-- oldest first. Every way a job finishes comes through here, so none of them can
+-- skip the trim or apply another job's bound.
+local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state)
+  local keepCount, keepAge = keepFor(redis.call("HGET", jobKey, "opts"), state)
   if keepCount == 0 and keepAge < 0 then
     delJobs({jobId}, base)
     return
   end
   redis.call("ZADD", setKey, now, jobId)
   redis.call("HSET", jobKey, prop, val, "finishedOn", now, "state", state)
-  if keepAge >= 0 then
+  if keepAge >= 0 and trimBudget > 0 then
     local cutoff = now - keepAge * 1000
-    -- Bounded per call: enabling an age limit on a deep finished backlog must
-    -- not sweep it all in one Redis-blocking pass - the remainder amortizes
-    -- over subsequent finishes (same idea as PROMOTE_DELAYED's batch).
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
-                               "LIMIT", 0, 1000)
+                               "LIMIT", 0, trimBudget)
     if #expired > 0 then
       delJobs(expired, base)
       redis.call("ZREM", setKey, unpack(expired))
+      trimBudget = trimBudget - #expired
     end
   end
-  if keepCount > 0 then
-    delJobs(redis.call("ZREVRANGE", setKey, keepCount, -1), base)
-    redis.call("ZREMRANGEBYRANK", setKey, 0, -(keepCount + 1))
+  -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
+  if keepCount > 0 and trimBudget > 0 then
+    local excess = redis.call("ZCARD", setKey) - keepCount
+    if excess > 0 then
+      local last = math.min(excess, trimBudget) - 1
+      delJobs(redis.call("ZRANGE", setKey, 0, last), base)
+      redis.call("ZREMRANGEBYRANK", setKey, 0, last)
+      trimBudget = trimBudget - (last + 1)
+    end
   end
 end
 -- Flow plumbing. A parent is parked in the `waiting-children` ZSET with a
@@ -246,19 +296,6 @@ local function settleChildCompleted(base, jobId, parentId, returnvalue)
   if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
     releaseParent(base, parentId)
   end
-end
--- The Lua twin of JobOptions.keep_args for the `removeOnFail` option - eager
--- parent failure has no Python caller to compute retention, so it reads the
--- parent's stored opts. Mirrors keep_args exactly (see job.py).
-local function keepArgsFromOpts(optsJson)
-  local ok, opts = pcall(cjson.decode, optsJson or "{}")
-  if not ok or type(opts) ~= "table" then return -1, -1 end
-  local v = opts.removeOnFail
-  if v == nil or v == cjson.null or v == false then return -1, -1 end
-  if v == true then return 0, -1 end
-  if type(v) == "number" then return v, -1 end
-  if type(v) == "table" then return tonumber(v.count) or -1, tonumber(v.age) or -1 end
-  return -1, -1
 end
 -- A terminally-failed child settles its parent per its `onFail` policy:
 -- "continue" records the failure and releases the parent once nothing is
@@ -284,10 +321,9 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
     if redis.call("ZREM", base .. "waiting-children", pid) == 0 then return end
     reason = "child " .. cid .. " failed: " .. reason
     -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
-    local pmeta = redis.call("HMGET", base .. pid, "parentId", "onFail", "name", "opts")
-    local keepCount, keepAge = keepArgsFromOpts(pmeta[4])
+    local pmeta = redis.call("HMGET", base .. pid, "parentId", "onFail", "name")
     recordFinished(base .. "failed", base .. pid, base, pid, now,
-      "failedReason", reason, "failed", keepCount, keepAge)
+      "failedReason", reason, "failed")
     recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
     -- reached the ROOT of the flow (no grandparent): count one flow failure
     if not pmeta[1] then recordFlow(base, false, now, 0, retentionMs) end
@@ -299,6 +335,7 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
   end
 end
 """
+)
 
 # Add a job. With no custom id, generates one server-side (INCR) so concurrent
 # producers never collide. With a custom id, the add is IDEMPOTENT: if a job with
@@ -457,15 +494,15 @@ return 0
 # KEYS[5] prioritized  KEYS[6] marker  KEYS[7] stalled  KEYS[8] base  KEYS[9] pc
 # KEYS[10] events channel  KEYS[11] meta-paused  KEYS[12] limiter
 # ARGV[1] jobId  ARGV[2] returnvalue(json)  ARGV[3] now(ms)  ARGV[4] token
-# ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)  ARGV[7] keepCount  ARGV[8] keepAge(s)
-# ARGV[9] rlMax  ARGV[10] rlDuration(ms)  ARGV[11] metricsRetention(ms)
-# ARGV[12] globalConcurrency (0 = no cap)
+# ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)
+# ARGV[7] rlMax  ARGV[8] rlDuration(ms)  ARGV[9] metricsRetention(ms)
+# ARGV[10] globalConcurrency (0 = no cap)
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}.
 MOVE_TO_COMPLETED = (
     _LIB
     + """
 local cap = 0
-if ARGV[5] == "1" then cap = requireCap(ARGV[12]) end
+if ARGV[5] == "1" then cap = requireCap(ARGV[10]) end
 if redis.call("GET", KEYS[4]) ~= ARGV[4] then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
@@ -474,12 +511,11 @@ local now = tonumber(ARGV[3])
 local meta = redis.call("HMGET", KEYS[3],
   "processedOn", "name", "parentId", "children", "timestamp")
 local startedOn = tonumber(meta[1]) or now
-recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now,
-  "returnvalue", ARGV[2], "completed", tonumber(ARGV[7]), tonumber(ARGV[8]))
-recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[11]), meta[2])
+recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now, "returnvalue", ARGV[2], "completed")
+recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[9]), meta[2])
 -- a root flow completing: count the whole flow and its end-to-end wall clock
 if meta[4] and not meta[3] then
-  recordFlow(KEYS[8], true, now, now - (tonumber(meta[5]) or now), tonumber(ARGV[11]))
+  recordFlow(KEYS[8], true, now, now - (tonumber(meta[5]) or now), tonumber(ARGV[9]))
 end
 -- a flow child settles into its parent here, atomically with its own commit
 if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2]) end
@@ -492,7 +528,7 @@ redis.call("PUBLISH", KEYS[10], cjson.encode(completedMsg))
 if ARGV[5] == "1" then
   local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                           ARGV[4], tonumber(ARGV[6]), ARGV[3],
-                          KEYS[12], tonumber(ARGV[9]), tonumber(ARGV[10]), cap)
+                          KEYS[12], tonumber(ARGV[7]), tonumber(ARGV[8]), cap)
   if nxt then
     if nxt[1] == "__rl__" then
       redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
@@ -514,15 +550,15 @@ return {1}
 # KEYS[11] events channel  KEYS[12] meta-paused  KEYS[13] limiter
 # ARGV[1] jobId  ARGV[2] failedReason  ARGV[3] now(ms)  ARGV[4] attemptsMade
 # ARGV[5] maxAttempts  ARGV[6] backoff(ms)  ARGV[7] token  ARGV[8] fetch(1/0)
-# ARGV[9] lockDuration(ms)  ARGV[10] keepCount  ARGV[11] keepAge(s)
-# ARGV[12] rlMax  ARGV[13] rlDuration(ms)  ARGV[14] metricsRetention(ms)
-# ARGV[15] globalConcurrency (0 = no cap)
+# ARGV[9] lockDuration(ms)
+# ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
+# ARGV[13] globalConcurrency (0 = no cap)
 # Returns -2/-3, else {outcome} or {outcome, nextHash, nextId}; outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
     + """
 local cap = 0
-if ARGV[8] == "1" then cap = requireCap(ARGV[15]) end
+if ARGV[8] == "1" then cap = requireCap(ARGV[13]) end
 if redis.call("GET", KEYS[6]) ~= ARGV[7] then return -2 end
 redis.call("DEL", KEYS[6])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
@@ -546,25 +582,24 @@ else
   -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
   local meta = redis.call("HMGET", KEYS[5], "processedOn", "name", "parentId", "onFail", "children")
   local startedOn = tonumber(meta[1]) or now
-  recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now,
-    "failedReason", ARGV[2], "failed", tonumber(ARGV[10]), tonumber(ARGV[11]))
-  recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[14]), meta[2])
+  recordFinished(KEYS[4], KEYS[5], KEYS[9], ARGV[1], now, "failedReason", ARGV[2], "failed")
+  recordMetrics(KEYS[9], "failed", now, now - startedOn, tonumber(ARGV[12]), meta[2])
   redis.call("PUBLISH", KEYS[11],
     cjson.encode({jobId = ARGV[1], event = "failed", reason = ARGV[2]}))
   -- a root flow whose own processor failed (children all settled): count it.
   -- A child failing (meta[3] set) instead propagates through settleChildFailed,
   -- which counts the root it reaches - the two paths are disjoint, no double count
-  if meta[5] and not meta[3] then recordFlow(KEYS[9], false, now, 0, tonumber(ARGV[14])) end
+  if meta[5] and not meta[3] then recordFlow(KEYS[9], false, now, 0, tonumber(ARGV[12])) end
   -- a flow child settles into its parent per its on_fail policy, atomically
   if meta[3] then
-    settleChildFailed(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[14]))
+    settleChildFailed(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[12]))
   end
   outcome = 1
 end
 if ARGV[8] == "1" then
   local nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
                           ARGV[7], tonumber(ARGV[9]), ARGV[3],
-                          KEYS[13], tonumber(ARGV[12]), tonumber(ARGV[13]), cap)
+                          KEYS[13], tonumber(ARGV[10]), tonumber(ARGV[11]), cap)
   if nxt then
     if nxt[1] == "__rl__" then
       redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check
@@ -726,25 +761,23 @@ if #stalling > 0 then
       if redis.call("LREM", KEYS[2], 1, jobId) > 0 then
         local count = redis.call("HINCRBY", jobKey, "stalledCounter", 1)
         if count > maxStalled then
-          redis.call("ZADD", KEYS[4], tonumber(ARGV[2]), jobId)
-          redis.call("HSET", jobKey, "state", "failed",
-            "failedReason", "job stalled more than allowable limit",
-            "finishedOn", ARGV[2])
-          recordMetrics(KEYS[6], "failed", tonumber(ARGV[2]), 0, tonumber(ARGV[4]),
-                        redis.call("HGET", jobKey, "name"))
+          local now = tonumber(ARGV[2])
+          local reason = "job stalled more than allowable limit"
+          -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+          local meta = redis.call("HMGET", jobKey, "name", "parentId", "onFail", "children")
+          recordFinished(KEYS[4], jobKey, KEYS[6], jobId, now, "failedReason", reason, "failed")
+          recordMetrics(KEYS[6], "failed", now, 0, tonumber(ARGV[4]), meta[1])
           -- announce the terminal failure so result() waiters resolve instead
           -- of timing out (the sweeping worker's local events don't reach them)
-          redis.call("PUBLISH", KEYS[6] .. "events", cjson.encode({jobId = jobId,
-            event = "failed", reason = "job stalled more than allowable limit"}))
+          redis.call("PUBLISH", KEYS[6] .. "events",
+            cjson.encode({jobId = jobId, event = "failed", reason = reason}))
           -- the crash path settles flow parents too - a dead worker must not
           -- leave a parent parked forever
-          local pmeta = redis.call("HMGET", jobKey, "parentId", "onFail", "children")
-          if pmeta[1] then
-            settleChildFailed(KEYS[6], jobId, pmeta[1], pmeta[2],
-              "job stalled more than allowable limit", tonumber(ARGV[2]), tonumber(ARGV[4]))
-          elseif pmeta[3] then
+          if meta[2] then
+            settleChildFailed(KEYS[6], jobId, meta[2], meta[3], reason, now, tonumber(ARGV[4]))
+          elseif meta[4] then
             -- a released root flow parent that stalled out: count the flow failed
-            recordFlow(KEYS[6], false, tonumber(ARGV[2]), 0, tonumber(ARGV[4]))
+            recordFlow(KEYS[6], false, now, 0, tonumber(ARGV[4]))
           end
           table.insert(failed, jobId)
         else
@@ -834,3 +867,66 @@ for _, jid in ipairs(redis.call("LRANGE", KEYS[6], 0, -1)) do
 end
 return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), active}
 """
+
+
+# The ARGV of the two finish scripts, in the order their headers document. Built here
+# and nowhere else: a hand-rolled list keeps "working" when the layout changes, with
+# its values in the wrong slots.
+def completed_args(
+    *,
+    job_id: str,
+    returnvalue: str,
+    now: int,
+    token: str,
+    fetch: str,
+    lock_duration: int,
+    rl_max: int,
+    rl_duration: int,
+    global_concurrency: int,
+) -> list[str | int]:
+    """ARGV for MOVE_TO_COMPLETED."""
+    return [
+        job_id,
+        returnvalue,
+        now,
+        token,
+        fetch,
+        lock_duration,
+        rl_max,
+        rl_duration,
+        METRICS_RETENTION_MS,
+        global_concurrency,
+    ]
+
+
+def failed_args(
+    *,
+    job_id: str,
+    reason: str,
+    now: int,
+    attempts_made: int,
+    max_attempts: int,
+    backoff: int,
+    token: str,
+    fetch: str,
+    lock_duration: int,
+    rl_max: int,
+    rl_duration: int,
+    global_concurrency: int,
+) -> list[str | int]:
+    """ARGV for MOVE_TO_FAILED."""
+    return [
+        job_id,
+        reason,
+        now,
+        attempts_made,
+        max_attempts,
+        backoff,
+        token,
+        fetch,
+        lock_duration,
+        rl_max,
+        rl_duration,
+        METRICS_RETENTION_MS,
+        global_concurrency,
+    ]

@@ -1,9 +1,9 @@
-"""Unit: FlowChild - the declarative flow-tree node (pure validation, no I/O)."""
+"""Unit: FlowChild - the declarative flow-tree node - and FlowView's counts (no I/O)."""
 
 import pytest
 
-from toro import FlowChild
-from toro.flow import MAX_FLOW_NODES, count_nodes
+from toro import FlowChild, Job
+from toro.flow import MAX_FLOW_NODES, FlowView, count_nodes
 
 
 def test_defaults():
@@ -52,3 +52,27 @@ def test_count_nodes_counts_the_whole_tree():
     tree = FlowChild("mid", {}, children=[FlowChild("a", {}), FlowChild("b", {})])
     assert count_nodes(tree) == 3
     assert MAX_FLOW_NODES >= 1000
+
+
+def _view(children: dict[str, str], results: dict, failures: dict) -> FlowView:
+    root = Job("root", "report", {}, state="waiting-children", children_ids=["a", "b", "c", "d"])
+    nodes = [{"job": Job(i, "part", {}, state=st), "children": []} for i, st in children.items()]
+    return FlowView({"job": root, "children": nodes}, results, failures)
+
+
+def test_flow_view_counts_read_the_tree_and_the_parents_copies():
+    """The tree and the parent's copies are separate reads, and retention takes nodes
+    out of the tree: either can hold an outcome the other lacks, and one that both
+    hold is counted once."""
+    view = _view(
+        {"a": "completed", "b": "failed", "c": "active"},  # d's hash was trimmed
+        results={"d": 1},  # a finished after this was read
+        failures={"b": "boom"},  # tolerated, so it is in both
+    )
+    assert (view.total, view.done, view.failed) == (4, 2, 1)
+
+
+def test_flow_view_counts_a_fail_parent_failure_from_the_tree_alone():
+    # only tolerated failures are copied into the parent
+    view = _view({"a": "failed"}, results={}, failures={})
+    assert (view.done, view.failed) == (0, 1)
