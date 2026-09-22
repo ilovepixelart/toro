@@ -392,6 +392,10 @@ async def test_a_cleanup_that_raises_does_not_resurrect_a_cancelled_job(q, run_w
     assert await _state(q, job.id) == "cancelled"
     assert await _count(q, "failed") == 0
     assert await _count(q, "delayed") == 0
+    # Straight to cancelled, not through a failure: with the retry that a failure
+    # would trigger, the claim-time check would stop the job on its second claim and
+    # the end state would look the same. The attempt count is what tells them apart.
+    assert (await q.get_job(job.id)).attempts_made == 1
 
 
 async def test_the_lock_is_held_while_a_cancelled_job_cleans_up(q, run_worker, run_until):
