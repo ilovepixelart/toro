@@ -406,3 +406,24 @@ async def test_the_lock_is_held_while_a_cancelled_job_cleans_up(q, run_worker, r
         await asyncio.wait_for(cleaned.wait(), 5)
         # the commit still owns the lock, so it lands instead of being refused
         assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=5)
+
+
+async def test_a_job_claimed_with_a_cancellation_pending_never_runs(q, run_worker, run_until):
+    """CN-004: the claim hands the worker the whole job hash, cancel flag included. A
+    job re-queued by the stalled sweep after it was cancelled must not be run from the
+    top and killed at its first renewal: it was already told to stop."""
+    ran = []
+
+    async def proc(job):
+        ran.append(job.name)
+        return job.name
+
+    # cancelled while it waits, then put back in the queue as the stalled sweep would
+    job = await q.add("doomed", {})
+    await q.redis.hset(q.keys.job(job.id), "cancel", "1")
+
+    async with run_worker(q, proc, concurrency=2):
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=10)
+
+    assert ran == [], "a job with a cancellation pending was run"
+    assert await _count(q, "completed") == 0

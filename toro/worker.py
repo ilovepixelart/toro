@@ -422,6 +422,13 @@ class Worker:
     ) -> tuple[str, dict[str, str]] | None:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
+        if fields.get("cancel"):
+            # Claimed with a cancellation already pending: the stalled sweep re-queues
+            # a job whose worker died, flag and all. Running it from the top only to
+            # stop it at the first renewal repeats whatever the processor does before
+            # its first await. The claim hands us the whole hash, so we know here.
+            # No processor ran, so there is nothing in `_cancelling` to track.
+            return await self._finish_cancelled(job)
         # Give the handler the ability to report progress and append logs.
         job._ctx = JobContext(  # noqa: SLF001  - the worker injects the job's runtime context
             redis=self.redis,
