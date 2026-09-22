@@ -91,6 +91,13 @@ local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
   redis.call("ZADD", markerKey, 0, "0")
 end
+-- A cancellation names the CLAIM it is meant for, not just the job: an id is free
+-- again the moment its job is gone, so a bare id can land on the next job to wear it.
+-- `processedOn` is rewritten by every claim (see lockAndLoad), which is exactly the
+-- incarnation a worker is running.
+local function cancelMessage(base, jobId)
+  return jobId .. ":" .. (redis.call("HGET", base .. jobId, "processedOn") or "")
+end
 -- Jobs that share a concurrency key run one at a time, in the order they were added.
 -- The key is held from enqueue until the holder reaches a terminal state: `ck:<key>`
 -- names the holder and `held:<key>` is the queue behind it, scored as `prioritized`
@@ -232,10 +239,15 @@ local function wakeIfWaiting(prioritizedKey, markerKey)
     redis.call("ZADD", markerKey, 0, "0")
   end
 end
+-- A job is finished when it will not run again: no attempt left, retention applies.
+-- Every place that asks reads this, so a new terminal state joins them all at once.
+local function isFinished(state)
+  return state == "completed" or state == "failed" or state == "cancelled"
+end
 local function delKeys(base, id)
   redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
              base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail",
-             base .. id .. ":live")
+             base .. id .. ":ccancel", base .. id .. ":live")
   redis.call("ZREM", base .. "children", id)  -- prune the flow-child index (hygiene)
 end
 local function delJobs(ids, base)
@@ -248,7 +260,7 @@ local function delJobs(ids, base)
     -- mid-flight and strand the concurrency key it holds.
     for _, cid in ipairs(redis.call("ZRANGE", base .. id .. ":live", 0, -1)) do
       local cstate = redis.call("HGET", base .. cid, "state")
-      if cstate == "completed" or cstate == "failed" then
+      if isFinished(cstate) then
         redis.call("ZREM", base .. cstate, cid)
         delKeys(base, cid)
       end
@@ -354,7 +366,7 @@ local function runningRoot(base, parentId, rootId)
     end
   end
   local rstate = redis.call("HGET", base .. rootId, "state")
-  if not rstate or rstate == "completed" or rstate == "failed" then return nil end
+  if not rstate or isFinished(rstate) then return nil end
   return rootId
 end
 -- Whether a job's own option keeps every job in its set: the one thing a cascade
@@ -379,7 +391,7 @@ local function removeFinished(base, setKey, jobId)
   if meta[2] then
     for _, cid in ipairs(cjson.decode(meta[2])) do
       local cstate = redis.call("HGET", base .. cid, "state")
-      if (cstate == "completed" or cstate == "failed") and not keptForever(base, cid, cstate) then
+      if isFinished(cstate) and not keptForever(base, cid, cstate) then
         gone = gone + removeFinished(base, base .. cstate, cid)
       end
     end
@@ -393,7 +405,7 @@ local function settleLive(base, rootId, now)
   local key = base .. rootId .. ":live"
   for _, cid in ipairs(redis.call("ZRANGE", key, 0, -1)) do
     local cstate = redis.call("HGET", base .. cid, "state")
-    if cstate == "completed" or cstate == "failed" then
+    if isFinished(cstate) then
       redis.call("ZADD", base .. cstate, now + 1, cid)
     end
   end
@@ -406,7 +418,7 @@ local function reviveSubtree(base, rootId, jobId, now)
   if not children then return end
   for _, cid in ipairs(cjson.decode(children)) do
     local cstate = redis.call("HGET", base .. cid, "state")
-    if cstate == "completed" or cstate == "failed" then
+    if isFinished(cstate) then
       redis.call("ZADD", base .. cstate, LIVE + now, cid)
       redis.call("ZADD", base .. rootId .. ":live", now, cid)
     end
@@ -486,19 +498,27 @@ local function settleChildCompleted(base, jobId, parentId, returnvalue, now)
     releaseParent(base, parentId, now)
   end
 end
--- A terminally-failed child settles its parent per its `onFail` policy:
+-- A child that will never deliver settles its parent per its `onFail` policy:
 -- "continue" records the failure and releases the parent once nothing is
 -- pending; anything else fails the parent NOW - eagerly, no worker needed -
 -- walking up through ancestors that are themselves fail_parent children.
 -- There is no "park forever" outcome by design. Eager failure goes through
 -- recordFinished so remove_on_fail retention applies like any other failure.
-local function settleChildFailed(base, jobId, parentId, onFail, reason, now, retentionMs)
+-- `state` is how the child ended: an ancestor stopped by a CANCELLED child is
+-- cancelled, not failed. Counting a deliberate stop as a failure is the one thing
+-- the separate state exists to prevent, so it must not come back through the flow.
+-- Under `continue` the parent still runs either way, with the reason in its `:cfail`
+-- record: a cancelled child reads there as "cancelled".
+local function settleChildGone(base, jobId, parentId, onFail, reason, now, retentionMs, state)
   local cid = jobId
   local pid = parentId
   while pid do
     if onFail == "continue" then
       if redis.call("EXISTS", base .. pid) == 1 then
-        redis.call("HSET", base .. pid .. ":cfail", cid, reason)
+        -- its own record: the parent runs either way, but a stopped child is not a
+        -- failed one and its fan-in must not say otherwise
+        local record = state == "cancelled" and ":ccancel" or ":cfail"
+        redis.call("HSET", base .. pid .. record, cid, reason)
         redis.call("SREM", base .. pid .. ":deps", cid)
         if redis.call("SCARD", base .. pid .. ":deps") == 0 then
           releaseParent(base, pid, now)
@@ -506,18 +526,25 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
       end
       return
     end
-    -- already settled (a sibling failed it first, or it was removed): stop
+    -- already settled (a sibling settled it first, or it was removed): stop
     if redis.call("ZREM", base .. "waiting-children", pid) == 0 then return end
-    reason = "child " .. cid .. " failed: " .. reason
-    -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+    -- read BEFORE recordFinished (retention may DEL the hash)
     local pmeta = redis.call("HMGET", base .. pid, "parentId", "onFail", "name")
-    recordFinished(base .. "failed", base .. pid, base, pid, now,
-      "failedReason", reason, "failed")
-    recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
-    -- reached the ROOT of the flow (no grandparent): count one flow failure
-    if not pmeta[1] then recordFlow(base, false, now, 0, retentionMs) end
-    redis.call("PUBLISH", base .. "events",
-      cjson.encode({jobId = tostring(pid), event = "failed", reason = reason}))
+    if state == "cancelled" then
+      recordFinished(base .. "cancelled", base .. pid, base, pid, now,
+        "cancel", "1", "cancelled")
+      redis.call("PUBLISH", base .. "events",
+        cjson.encode({jobId = tostring(pid), event = "cancelled"}))
+    else
+      reason = "child " .. cid .. " failed: " .. reason
+      recordFinished(base .. "failed", base .. pid, base, pid, now,
+        "failedReason", reason, "failed")
+      recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
+      -- reached the ROOT of the flow (no grandparent): count one flow failure
+      if not pmeta[1] then recordFlow(base, false, now, 0, retentionMs) end
+      redis.call("PUBLISH", base .. "events",
+        cjson.encode({jobId = tostring(pid), event = "failed", reason = reason}))
+    end
     cid = pid
     pid = pmeta[1]
     onFail = pmeta[2]
@@ -685,16 +712,32 @@ return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7]
 """
 )
 
+# What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
+# and the script cannot drift over a bare 2.
+LOCK_CANCEL_REQUESTED = 2
+# ...and when the job it was renewing no longer exists: it was removed, so there is
+# nothing left to finish and the processor is running for nobody.
+LOCK_JOB_GONE = -1
+
 # Renew a lock we still own. Token-guarded: we can NEVER renew a lock another
 # worker has taken over. A successful renew also resets the stalled window.
-# KEYS[1] lock key  KEYS[2] stalled set
+# Returns 0 (the lock is gone), LOCK_JOB_GONE (the job itself is gone), 1 (renewed)
+# or LOCK_CANCEL_REQUESTED (renewed, and a cancellation has been asked for). The
+# renewal is the backstop for a cancel message that never arrived: a worker that
+# stops renewing has lost the job to the stalled sweep anyway, so this cannot be the
+# thing that is missed.
+# KEYS[1] lock  KEYS[2] stalled  KEYS[3] job hash
 # ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] jobId
 EXTEND_LOCK = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   redis.call("SET", KEYS[1], ARGV[1], "PX", tonumber(ARGV[2]))
   redis.call("SREM", KEYS[2], ARGV[3])
+  if redis.call("HGET", KEYS[3], "cancel") then return 2 end
   return 1
 end
+-- A removal takes the hash AND the lock, so a lost cancel message has no other way
+-- back: the renewal is the backstop for that too. A takeover leaves the hash alone.
+if redis.call("EXISTS", KEYS[3]) == 0 then return -1 end
 return 0
 """
 
@@ -797,12 +840,13 @@ else
   redis.call("PUBLISH", KEYS[11],
     cjson.encode({jobId = ARGV[1], event = "failed", reason = ARGV[2]}))
   -- a root flow whose own processor failed (children all settled): count it.
-  -- A child failing (meta[3] set) instead propagates through settleChildFailed,
+  -- A child failing (meta[3] set) instead propagates through settleChildGone,
   -- which counts the root it reaches - the two paths are disjoint, no double count
   if meta[5] and not meta[3] then recordFlow(KEYS[9], false, now, 0, tonumber(ARGV[12])) end
   -- a flow child settles into its parent per its on_fail policy, atomically
   if meta[3] then
-    settleChildFailed(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[12]))
+    settleChildGone(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[12]),
+      "failed")
   end
   outcome = 1
 end
@@ -879,7 +923,10 @@ RETRY_JOB = (
     _LIB
     + """
 if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
-redis.call("HDEL", KEYS[4], "failedReason", "finishedOn")
+-- A retry is a decision to run this job again, so a cancellation that was asked for
+-- but never acted on goes with the failure it outlived. Left behind, it would stop
+-- the job at its next claim and leave it unrunnable: retry refuses a cancelled job.
+redis.call("HDEL", KEYS[4], "failedReason", "finishedOn", "cancel", "cancelReason")
 local base = KEYS[6]
 -- A flow that runs again: its finished jobs are live until it settles once more. Only
 -- a ROOT revives the subtree. A descendant retried under a running root finds its flow
@@ -918,6 +965,7 @@ return 1
 # dependency (nothing left to wait for).
 # KEYS[1] prioritized  KEYS[2] active  KEYS[3] delayed  KEYS[4] completed
 # KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base  KEYS[8] held
+# KEYS[9] cancelled  KEYS[10] cancel channel
 # ARGV[1] jobId  ARGV[2] now(ms)
 REMOVE_JOB = (
     _LIB
@@ -936,6 +984,7 @@ local function removeFromState(jobId, state)
   elseif state == "delayed" then redis.call("ZREM", KEYS[3], jobId)
   elseif state == "completed" then redis.call("ZREM", KEYS[4], jobId)
   elseif state == "failed" then redis.call("ZREM", KEYS[5], jobId)
+  elseif state == "cancelled" then redis.call("ZREM", KEYS[9], jobId)
   elseif state == "waiting-children" then redis.call("ZREM", KEYS[6], jobId)
   elseif state == "held" then redis.call("ZREM", KEYS[8], jobId)
   else
@@ -946,11 +995,18 @@ local function removeFromState(jobId, state)
     redis.call("ZREM", KEYS[5], jobId)
     redis.call("ZREM", KEYS[6], jobId)
     redis.call("ZREM", KEYS[8], jobId)
+    redis.call("ZREM", KEYS[9], jobId)
   end
 end
 local function removeTree(jobId)
   local meta = redis.call("HMGET", base .. jobId, "children", "state", "ckey")
   removeFromState(jobId, meta[2])
+  if meta[2] == "active" then
+    -- Its processor is still running, and removal gives it nowhere to report. Tell
+    -- the worker, or the slot it holds (and any global-concurrency slot) stays taken
+    -- until the work happens to end. Its commit finds no lock and stands down.
+    redis.call("PUBLISH", KEYS[10], cancelMessage(base, jobId))
+  end
   unkey(base, jobId, meta[2], meta[3], now)
   delJobs({jobId}, base)
   if meta[1] then
@@ -970,6 +1026,129 @@ if parentId then
   end
 end
 return existed
+"""
+)
+
+# Commit a job its worker stopped. Token-guarded like every other finish: a worker
+# that lost its lock commits NOTHING, so a job taken over mid-cancellation is not
+# ended twice. No fetch-next: a cancellation is rare, and the loop takes the next job
+# the way an idle worker does.
+# KEYS[1] active  KEYS[2] cancelled  KEYS[3] job hash  KEYS[4] lock
+# KEYS[5] prioritized  KEYS[6] marker  KEYS[7] base  KEYS[8] events channel
+# ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] token  ARGV[4] metricsRetention(ms)
+# Returns -2 lock lost, -3 not active, 1 committed.
+MOVE_TO_CANCELLED = (
+    _LIB
+    + """
+local base = KEYS[7]
+if redis.call("GET", KEYS[4]) ~= ARGV[3] then return -2 end
+redis.call("DEL", KEYS[4])
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+local now = tonumber(ARGV[2])
+-- read BEFORE recordFinished (retention may DEL the hash)
+local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail", "cancelReason")
+recordFinished(KEYS[2], KEYS[3], base, ARGV[1], now, "cancel", "1", "cancelled")
+local msg = {jobId = ARGV[1], event = "cancelled"}
+if meta[3] then msg.reason = meta[3] end
+redis.call("PUBLISH", KEYS[8], cjson.encode(msg))
+if meta[1] then
+  settleChildGone(base, ARGV[1], meta[1], meta[2], meta[3] or "cancelled", now,
+    tonumber(ARGV[4]), "cancelled")
+end
+wakeIfWaiting(KEYS[5], KEYS[6])
+return 1
+"""
+)
+
+# Cancel a job: stop it wherever it is. A job that has not started is ended right
+# here, with no worker involved; a running one is asked to stop, and its worker acts
+# on the request (through the events channel, or EXTEND_LOCK as the backstop).
+# Cancellation commits through recordFinished, so it hands a concurrency key on,
+# settles a flow parent and applies retention exactly as any other finish does.
+# KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] held  KEYS[4] waiting-children
+# KEYS[5] cancelled  KEYS[6] key base  KEYS[7] events channel  KEYS[8] cancel channel
+# ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] metricsRetention(ms)
+# ARGV[4] reason ("" = none)
+# Returns 0 (nothing to cancel), 1 (cancelled here) or 2 (a running job was asked).
+CANCEL_JOB = (
+    _LIB
+    + """
+local base = KEYS[6]
+local now = tonumber(ARGV[2])
+local why = ARGV[4]
+-- The caller's reason belongs to every job this call stops, the subtree included:
+-- one cancellation, one explanation.
+local function saveReason(jobKey)
+  if why ~= "" then redis.call("HSET", jobKey, "cancelReason", why) end
+end
+local cancelledMsg = {jobId = "", event = "cancelled"}
+local function announceCancelled(jobId)
+  cancelledMsg.jobId = jobId
+  cancelledMsg.reason = nil
+  if why ~= "" then cancelledMsg.reason = why end
+  redis.call("PUBLISH", KEYS[7], cjson.encode(cancelledMsg))
+end
+-- Cancel one job and answer with its child list (read before recordFinished, which
+-- retention may follow with a DEL of the hash). A job already finished is left alone;
+-- a running one can only be stopped by the worker that owns its processor, so it is
+-- asked here and commits its own cancellation.
+local stopped = 0  -- how many jobs this call actually stopped
+local function cancelOne(jobId)
+  local jobKey = base .. jobId
+  local meta = redis.call("HMGET", jobKey, "state", "children", "ckey")
+  local state = meta[1]
+  if not state or isFinished(state) then return meta[2] end
+  stopped = stopped + 1
+  if state == "active" then
+    redis.call("HSET", jobKey, "cancel", "1")
+    saveReason(jobKey)
+    -- to the workers' own channel: `events` carries a message per job, and a worker
+    -- listening there would parse every one of them to catch this
+    redis.call("PUBLISH", KEYS[8], cancelMessage(base, jobId))
+    return meta[2]
+  end
+  if state == "wait" then redis.call("ZREM", KEYS[1], jobId)
+  elseif state == "delayed" then redis.call("ZREM", KEYS[2], jobId)
+  elseif state == "held" then redis.call("ZREM", KEYS[3], jobId)
+  elseif state == "waiting-children" then redis.call("ZREM", KEYS[4], jobId)
+  end
+  -- a job queued behind a key leaves that queue; a holder hands its key on inside
+  -- recordFinished, like any other job reaching a terminal state
+  unkey(base, jobId, state, meta[3], now)
+  saveReason(jobKey)
+  recordFinished(KEYS[5], jobKey, base, jobId, now, "cancel", "1", "cancelled")
+  announceCancelled(jobId)
+  return meta[2]
+end
+-- A flow is cancelled as a unit: a child left running would report into a parent
+-- that has already gone. Descendants do NOT settle into their parents on the way,
+-- because those parents are being cancelled too.
+local function cancelTree(jobId)
+  local children = cancelOne(jobId)
+  if children then
+    for _, cid in ipairs(cjson.decode(children)) do cancelTree(cid) end
+  end
+end
+local topState = redis.call("HGET", base .. ARGV[1], "state")
+if not topState then return 0 end
+-- read BEFORE the cancellation (retention may DEL the hash)
+local top = redis.call("HMGET", base .. ARGV[1], "parentId", "onFail")
+-- A settled root is still the handle on its flow: one child failing the parent
+-- eagerly leaves its siblings running, and walking the tree by hand is the only
+-- other way to reach them. So the walk goes ahead whatever the root's own state,
+-- and the answer is whether anything was actually stopped.
+cancelTree(ARGV[1])
+if stopped == 0 then return 0 end
+if isFinished(topState) then return 1 end  -- the root was already done; its subtree was not
+if topState == "active" then return 2 end   -- its worker settles it when it stops
+-- A cancelled child did not produce what its parent waits for, so the parent's own
+-- onFail policy decides, exactly as it does for a child that failed: there is one
+-- rule for "this child will never deliver", not two.
+if top[1] then
+  settleChildGone(base, ARGV[1], top[1], top[2], why ~= "" and why or "cancelled", now,
+    tonumber(ARGV[3]), "cancelled")
+end
+return 1
 """
 )
 
@@ -1014,7 +1193,8 @@ if #stalling > 0 then
           -- the crash path settles flow parents too - a dead worker must not
           -- leave a parent parked forever
           if meta[2] then
-            settleChildFailed(KEYS[6], jobId, meta[2], meta[3], reason, now, tonumber(ARGV[4]))
+            settleChildGone(KEYS[6], jobId, meta[2], meta[3], reason, now,
+              tonumber(ARGV[4]), "failed")
           elseif meta[4] then
             -- a released root flow parent that stalled out: count the flow failed
             recordFlow(KEYS[6], false, now, 0, tonumber(ARGV[4]))
@@ -1093,7 +1273,7 @@ return {total, ids}
 # counted by membership in the children index. One atomic round trip for all seven.
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] completed  KEYS[4] failed
 # KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] held
-# KEYS[8] children  KEYS[9] scratch
+# KEYS[8] children  KEYS[9] scratch  KEYS[10] cancelled
 ROOTS_COUNTS = """
 local ch = KEYS[8]
 local sc = KEYS[9]
@@ -1106,7 +1286,8 @@ local active = 0
 for _, jid in ipairs(redis.call("LRANGE", KEYS[6], 0, -1)) do
   if redis.call("ZSCORE", ch, jid) == false then active = active + 1 end
 end
-return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS[7]), active}
+return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS[7]),
+        rc(KEYS[10]), active}
 """
 
 

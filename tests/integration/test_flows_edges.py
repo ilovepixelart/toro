@@ -718,14 +718,14 @@ async def test_flow_progress_counts_settled_children(q, run_worker, run_until):
         assert await run_until(lambda: _flow_settled(q, parent.id, 1, 1))
 
     prog = await q.flow_progress([parent.id, "nope"])
-    assert prog[parent.id] == (1, 1)  # (completed, failed)
-    assert prog["nope"] == (0, 0)  # unknown id is empty, not an error
+    assert prog[parent.id] == (1, 1, 0)  # (completed, failed, cancelled)
+    assert prog["nope"] == (0, 0, 0)  # unknown id is empty, not an error
     assert await q.flow_progress([]) == {}
 
 
 async def _flow_settled(q, pid, done, failed):
     p = await q.flow_progress([pid])
-    return p[pid] == (done, failed)
+    return p[pid] == (done, failed, 0)
 
 
 # ---- bug-hunting probes: retry_flow / flow_progress corners ----------------------
@@ -820,7 +820,7 @@ async def test_retry_flow_count_is_exactly_the_failed_nodes(q, run_worker, run_u
 
 async def test_flow_progress_on_a_fresh_flow_is_zero(q):
     parent = await q.add_flow("report", {}, children=[c("a", {}), c("b", {})])
-    assert (await q.flow_progress([parent.id]))[parent.id] == (0, 0)
+    assert (await q.flow_progress([parent.id]))[parent.id] == (0, 0, 0)
 
 
 async def test_flow_progress_counts_direct_children_only(q, run_worker, run_until):
@@ -835,4 +835,4 @@ async def test_flow_progress_counts_direct_children_only(q, run_worker, run_unti
         assert await run_until(_count_is(q, "completed", 3))
 
     # root has ONE direct child (mid), which completed -> (1, 0), not 2
-    assert (await q.flow_progress([root.id]))[root.id] == (1, 0)
+    assert (await q.flow_progress([root.id]))[root.id] == (1, 0, 0)

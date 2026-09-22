@@ -12,7 +12,7 @@ from toro.keys import Keys
 
 KEYS = Keys("emails", "toro")
 NAMES = [n for n, v in vars(Keys).items() if isinstance(v, property)]
-PER_JOB = ["lock", "logs", "deps", "results", "cfail", "live"]
+PER_JOB = ["lock", "logs", "deps", "results", "cfail", "ccancel", "live"]
 NAMESPACED = [
     n
     for n, v in vars(Keys).items()

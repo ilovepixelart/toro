@@ -31,10 +31,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
+from redis.asyncio.client import PubSub
 
 from . import scripts
 from ._replies import _str_list
-from .connection import DEFAULT_BLOCK_TIMEOUT, connect, read_timeout
+from .connection import DEFAULT_BLOCK_TIMEOUT, confirm_subscribed, connect, read_timeout
 from .job import Backoff, Job, JobContext
 from .keys import Keys
 from .scheduler import next_run
@@ -183,7 +184,19 @@ class Worker:
         self.started_at = 0
         self._processed = 0
         self._failed = 0
+        self._cancelled = 0
         self._current: set[str] = set()
+        # The processor task of each running job, so a cancellation can reach it, and
+        # the jobs whose cancellation THIS worker asked for: a CancelledError that is
+        # not in here is the worker shutting down, which must not commit a cancel.
+        # job id -> (its processor's task, the claim it is running). The claim fences
+        # a cancellation against an id that has been reused since the request was made.
+        self._processors: dict[str, tuple[asyncio.Task[Any], str]] = {}
+        self._cancelling: set[str] = set()
+        # Held on the instance, not inside the listener: stop() cancels that task while
+        # it waits on a message, so a close in its own `finally` may never be reached,
+        # and a caller-owned pool is not disconnected for us. Same shape as Queue.
+        self._cancel_pubsub: PubSub | None = None
         # "running" until a graceful stop flips it to "stopping" - the dashboard shows
         # a live "draining" state, and a worker that then vanishes was mid-shutdown,
         # not a crash. (The only honest way to know graceful; absence can't say why.)
@@ -193,6 +206,7 @@ class Worker:
         self._extend_lock = self.redis.register_script(scripts.EXTEND_LOCK)
         self._move_to_completed = self.redis.register_script(scripts.MOVE_TO_COMPLETED)
         self._move_to_failed = self.redis.register_script(scripts.MOVE_TO_FAILED)
+        self._move_to_cancelled = self.redis.register_script(scripts.MOVE_TO_CANCELLED)
         self._move_stalled = self.redis.register_script(scripts.MOVE_STALLED)
         self._promote_delayed = self.redis.register_script(scripts.PROMOTE_DELAYED)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
@@ -217,10 +231,16 @@ class Worker:
         self._running = True
         self.started_at = _now_ms()
         await self._write_heartbeat()  # register at once so the worker shows up immediately
+        # Subscribed BEFORE the first claim: a job this worker is running has to be one
+        # it can hear a cancellation for, or the request waits out a lock renewal.
+        cancels = await self._subscribe_cancels()
         self._process_tasks = [
             asyncio.create_task(self._process_loop()) for _ in range(self.concurrency)
         ]
-        bg = [asyncio.create_task(self._promote_loop())]
+        bg = [
+            asyncio.create_task(self._promote_loop()),
+            asyncio.create_task(self._cancel_listener(cancels)),
+        ]
         if self.stalled_interval > 0:
             bg.append(asyncio.create_task(self._stalled_loop()))
         if self.heartbeat_interval > 0:
@@ -255,6 +275,7 @@ class Worker:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._close_cancel_pubsub()
         with contextlib.suppress(Exception):
             await self._deregister()  # drop our presence record so we vanish at once
         await self.redis.aclose(close_connection_pool=self._owns_connection)
@@ -284,6 +305,7 @@ class Worker:
                 "heartbeat": now,
                 "processed": self._processed,
                 "failed": self._failed,
+                "cancelled": self._cancelled,
                 "current": json.dumps(sorted(self._current)),
                 "state": self._state,
             },
@@ -313,6 +335,7 @@ class Worker:
                 "concurrency": self.concurrency,
                 "processed": self._processed,
                 "failed": self._failed,
+                "cancelled": self._cancelled,
                 "started": self.started_at,
                 "last_seen": now,
                 "current": sorted(self._current),  # what it was running at the end
@@ -408,6 +431,13 @@ class Worker:
     ) -> tuple[str, dict[str, str]] | None:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
+        if fields.get("cancel"):
+            # Claimed with a cancellation already pending: the stalled sweep re-queues
+            # a job whose worker died, flag and all. Running it from the top only to
+            # stop it at the first renewal repeats whatever the processor does before
+            # its first await. The claim hands us the whole hash, so we know here.
+            # No processor ran, so there is nothing in `_cancelling` to track.
+            return await self._finish_cancelled(job)
         # Give the handler the ability to report progress and append logs.
         job._ctx = JobContext(  # noqa: SLF001  - the worker injects the job's runtime context
             redis=self.redis,
@@ -417,6 +447,7 @@ class Worker:
             job_id=job_id,
             results_key=self.keys.results(job_id),
             cfail_key=self.keys.cfail(job_id),
+            ccancel_key=self.keys.ccancel(job_id),
         )
         # A scheduler job mints its successor on first pickup, so the schedule
         # stays on time regardless of how long (or whether) this run succeeds.
@@ -424,20 +455,116 @@ class Worker:
             await self._schedule_next(fields["schedulerId"])
         renewer = asyncio.create_task(self._renew_loop(job_id)) if self.renew_locks else None
         self._current.add(job_id)  # so the heartbeat reports what we're running
+
+        # In its own task so a cancellation has something to land on: awaited inline,
+        # there is nothing to stop but the process loop itself. Wrapped because a
+        # processor is any awaitable, and only a coroutine can become a task.
+        async def run_processor() -> Any:
+            return await self.processor(job)
+
+        task = asyncio.create_task(run_processor())
+        self._processors[job_id] = (task, str(fields.get("processedOn", "")))
         try:
-            result = await self.processor(job)
-        except Exception as exc:
-            await self.redis.hset(self.keys.job(job_id), "stacktrace", traceback.format_exc())
-            self._failed += 1
-            nxt = await self._finish_failed(job, exc)
-        else:
-            self._processed += 1
-            nxt = await self._finish_completed(job, result)
+            nxt = await self._outcome(job, task)
         finally:
             self._current.discard(job_id)
+            self._processors.pop(job_id, None)
+            self._cancelling.discard(job_id)
             if renewer is not None:
                 renewer.cancel()
         return nxt
+
+    async def _outcome(
+        self, job: Job, task: asyncio.Task[Any]
+    ) -> tuple[str, dict[str, str]] | None:
+        """Commit whatever the processor's task came back with.
+
+        A job this worker asked to stop ends `cancelled` however its processor
+        unwound. A cleanup that raises on the way out is not a failure to retry, and a
+        processor that caught the cancellation and returned did not complete the work:
+        its lock is still held and it is still in `active`, so either commit would
+        otherwise succeed and stand.
+        """
+        try:
+            result = await task
+        except asyncio.CancelledError:  # NOSONAR
+            # Absorbing this one IS the feature: a cancellation that killed the process
+            # loop would take the worker's slot with it, so the usual "always re-raise"
+            # rule cannot hold here. It IS re-raised in every case that is not ours.
+            #
+            # Ours only when the PROCESSOR is what was stopped. The same error arrives
+            # when this WORKER is being stopped, and absorbing that one commits a job
+            # and carries on through a shutdown. Cancelling the awaiting task cancels
+            # the awaited one too, so the inner task cannot tell them apart; the
+            # outer task's own pending-cancellation count can (3.11+, with the
+            # shutdown flag as the fallback).
+            outer = asyncio.current_task()
+            asked = getattr(outer, "cancelling", None)
+            stopping = asked() > 0 if asked is not None else not self._running
+            if stopping or job.id not in self._cancelling:
+                raise
+            return await self._finish_cancelled(job)
+        except Exception as exc:
+            if job.id in self._cancelling:
+                return await self._finish_cancelled(job)
+            await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
+            self._failed += 1
+            return await self._finish_failed(job, exc)
+        if job.id in self._cancelling:
+            return await self._finish_cancelled(job)
+        self._processed += 1
+        return await self._finish_completed(job, result)
+
+    def _request_cancel(self, job_id: str, claim: str | None = None) -> None:
+        """Stop a job this worker is running, once.
+
+        `claim` names the run the request was meant for. Without it the caller already
+        knows (a lock renewal answered for the job in hand); with it, a request for an
+        earlier run of a reused id is ignored rather than killing its successor.
+
+        Nothing to do if the job is not ours, or if it already asked to stop: the
+        `cancel` field stays set while the job is active, so the lock keeps reporting
+        it and the request can arrive again and again. A second `cancel()` would land
+        inside the processor's cleanup and abort the unwinding the first one promised.
+
+        Nothing to do either if the task is finished, though a cancellation that lands
+        between the processor returning and the task being marked done still wins:
+        CPython discards the result and the job commits `cancelled`.
+        """
+        if job_id in self._cancelling:
+            return
+        running = self._processors.get(job_id)
+        if running is None:
+            return
+        task, mine = running
+        if task.done() or (claim is not None and claim != mine):
+            return
+        self._cancelling.add(job_id)
+        task.cancel()
+
+    async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
+        res = await self._move_to_cancelled(
+            keys=[
+                self.keys.active,
+                self.keys.cancelled,
+                self.keys.job(job.id),
+                self.keys.lock(job.id),
+                self.keys.prioritized,
+                self.keys.marker,
+                self.keys.base,
+                self.keys.events,
+            ],
+            args=[job.id, _now_ms(), self.token, scripts.METRICS_RETENTION_MS],
+        )
+        if int(res) < 0:
+            # its lock is gone, so nothing was committed: a removal took the job, or
+            # another worker did. Counting it would report a cancellation the queue
+            # has no record of.
+            await self._finish_lost(job.id)
+            return None
+        self._cancelled += 1
+        self._emit("cancelled", job)
+        return None
 
     async def _finish_lost(self, job_id: str) -> None:
         """Our finish committed nothing: the job was taken over or removed while we
@@ -560,22 +687,90 @@ class Worker:
 
     # ---- locks & recovery -------------------------------------------------
 
+    async def _subscribe_cancels(self) -> PubSub | None:
+        """Subscribe to the cancel channel, confirmed. Returns None if Redis would not
+        confirm: the lock renewal is the backstop, so a worker starts either way.
+        """
+        pubsub = self.redis.pubsub()
+        try:
+            await pubsub.subscribe(self.keys.cancel)
+            await confirm_subscribed(pubsub)
+        except Exception:  # pragma: no cover - the listener retries in the background
+            logger.debug("cancel subscription not ready; the lock renewal backstops it")
+            with contextlib.suppress(Exception):
+                await pubsub.aclose()
+            return None
+        self._cancel_pubsub = pubsub
+        return pubsub
+
+    async def _cancel_listener(self, pubsub: PubSub | None) -> None:
+        """Hear cancellations as they are asked for, rather than at the next renewal.
+
+        One subscription per worker, not per job: every worker hears every request and
+        acts only on jobs it is running. The lock renewal is the backstop, so a stream
+        that dies here costs latency, never a cancellation.
+        """
+        while self._running:
+            if pubsub is None:
+                await asyncio.sleep(1)
+                pubsub = await self._subscribe_cancels()
+                continue
+            try:
+                while self._running:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=self.block_timeout
+                    )
+                    if msg is None:
+                        continue
+                    # "<jobId>:<claim>". Split from the RIGHT: a scheduler occurrence
+                    # id carries colons of its own.
+                    jid, _, claim = str(msg["data"]).rpartition(":")
+                    if jid:
+                        self._request_cancel(jid, claim)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - reconnect; the lock still backstops
+                logger.debug("cancel listener lost its subscription; retrying")
+                await self._close_cancel_pubsub()
+                pubsub = None
+
+    async def _close_cancel_pubsub(self) -> None:
+        """Give the subscription's connection back. On a pool the caller owns, nothing
+        else will: `aclose()` there leaves it checked out and still subscribed.
+        """
+        pubsub, self._cancel_pubsub = self._cancel_pubsub, None
+        if pubsub is not None:
+            with contextlib.suppress(Exception):
+                await pubsub.aclose()
+
     async def _renew_loop(self, job_id: str) -> None:
         interval = self.lock_renew_time / 1000
         while True:
             await asyncio.sleep(interval)
             try:
                 ok = await self._extend_lock(
-                    keys=[self.keys.lock(job_id), self.keys.stalled],
+                    keys=[self.keys.lock(job_id), self.keys.stalled, self.keys.job(job_id)],
                     args=[self.token, self.lock_duration, job_id],
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover
                 ok = 0
+            if int(ok) == scripts.LOCK_JOB_GONE:
+                # removed while we ran it: there is nothing left to finish, and the
+                # message that would have said so never arrived
+                self._request_cancel(job_id)
+                self._emit("lock-lost", job_id)
+                return
             if not ok:
                 self._emit("lock-lost", job_id)
                 return
+            if int(ok) == scripts.LOCK_CANCEL_REQUESTED:
+                # The message never reached us, or there was none: this is the backstop.
+                # Keep renewing afterwards, because the processor is now unwinding and
+                # a cleanup that outlives the lock would be re-run by the stalled sweep
+                # on another worker. Asking twice is a no-op (see _request_cancel).
+                self._request_cancel(job_id)
 
     async def _promote_loop(self) -> None:
         while self._running:

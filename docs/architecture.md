@@ -93,8 +93,9 @@ due jobs into the prioritized set.
   skipped when that claim filled the last slot, and a script that omits the cap
   errors before its first write: the limit cannot fail open.
 - **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
-  `completed`, `failed`); `Queue.result()` awaits the terminal event and
-  `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
+  `completed`, `failed`, `cancelled`); `Queue.result()` awaits the terminal event and
+  `Worker.on(event, fn)` exposes in-process hooks. A second `cancel` channel carries
+  cancellation requests to workers and nothing else. See [Concepts](concepts.md).
 - **Retention** - `remove_on_complete` / `remove_on_fail` (bool / count /
   `{count, age}`, bounded when unset) enforced inside the finish script, not by a
   separate sweeper, at most 1000 deletions per finish plus the rest of one flow.
@@ -122,7 +123,8 @@ The scripts share a small library of routines:
 | `requireCap` | Reads the cap argument, raising when it is missing. Called before a script's first write. |
 | `wakeIfWaiting` | Arms the marker when jobs are waiting: a slot was freed without a claim. |
 | `tryRateLimit` | Token bucket: ms until a token frees, or 0 to proceed. |
-| `recordFinished` | Records a terminal job in `completed`/`failed` and applies the job's own retention. Every way a job finishes comes through it, and it is the only writer to those sets. A child of a running flow is scored `LIVE + now`; a settling root places its subtree. |
+| `isFinished` | Whether a state means the job will not run again (`completed`, `failed`, `cancelled`). The one place that question is asked. |
+| `recordFinished` | Records a terminal job in `completed`/`failed`/`cancelled` and applies the job's own retention. Every way a job finishes comes through it, and it is the only writer to those sets. A child of a running flow is scored `LIVE + now`; a settling root places its subtree. |
 | `settleLive` / `reviveSubtree` | A settling root drains its `:live` index, scoring each entry one above its finish time; a retried root walks its children and scores every finished descendant live again. |
 | `removeFinished` | The trims' one remover: a job and, with it, the finished subtree of a flow it roots, returning how many went for the budget. |
 | `settleChildCompleted` / `settleChildFailed` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent - or fails it eagerly, per `on_fail`. |
@@ -137,7 +139,9 @@ And the scripts themselves:
 | `MOVE_TO_ACTIVE` | worker wakeup | Claim the next job: `ZPOPMIN prioritized` → `active` → lock + load. |
 | `MOVE_TO_COMPLETED` | worker finish | Commit the result (settling a flow child into its parent) and fetch-next in one round trip. |
 | `MOVE_TO_FAILED` | worker finish | Retry (to `wait`/`delayed`) or terminally fail (applying a flow child's `on_fail`), and fetch-next. |
-| `EXTEND_LOCK` | renewer | Token-guarded lock renewal; clears the job from `stalled`. |
+| `EXTEND_LOCK` | renewer | Token-guarded lock renewal; clears the job from `stalled`. Answers `LOCK_CANCEL_REQUESTED` (2) when the job carries a cancellation, which is the backstop for a request whose message never arrived. |
+| `CANCEL_JOB` | producer/dashboard | Stop a job wherever it is: one that has not started ends here (its subtree with it), a running one is flagged and its worker told over the cancel channel. |
+| `MOVE_TO_CANCELLED` | worker finish | Commit a job the worker stopped, token-guarded like the other finishes. |
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
 | `PROMOTE_DELAYED` | promote loop | Move up to `PROMOTE_BATCH` (1000) due delayed jobs to `prioritized`. |
 | `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |

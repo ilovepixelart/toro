@@ -15,11 +15,11 @@ from redis.asyncio.client import PubSub
 
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
-from .connection import connect
-from .errors import JobFailedError
+from .connection import confirm_subscribed, connect
+from .errors import JobCancelledError, JobFailedError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
-from .job import Deduplication, Job, JobOptions, JobState, decode_results
+from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
 from .scheduler import next_run, valid_cron
 
@@ -98,29 +98,6 @@ def _percentile(buckets: list[int], q: float) -> int:
 # ZSET bound, exclusive.
 SETTLED = f"({scripts.LIVE_SCORE}"
 
-# How long Redis gets to confirm the events subscription before a waiter gives up.
-SUBSCRIBE_TIMEOUT = 5.0
-
-
-async def _confirm_subscribed(pubsub: PubSub) -> None:
-    """Wait until Redis has confirmed the subscription.
-
-    `subscribe()` returns once the command is WRITTEN, not once it has taken effect: a
-    dispatcher that reported itself ready in between would miss every event published
-    in that window, and `result()` on a job its own finish removed has nothing else to
-    read the outcome from.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + SUBSCRIBE_TIMEOUT
-    while True:
-        left = deadline - loop.time()
-        if left <= 0:
-            msg = "Redis did not confirm the events subscription"
-            raise TimeoutError(msg)
-        reply = await pubsub.get_message(timeout=left)
-        if reply is not None and reply["type"] == "subscribe":
-            return
-
 
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
@@ -149,6 +126,7 @@ class Queue:
         self._add_flow_script = self.redis.register_script(scripts.ADD_FLOW)
         self._retry_job = self.redis.register_script(scripts.RETRY_JOB)
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
+        self._cancel_job = self.redis.register_script(scripts.CANCEL_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
         self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
@@ -374,11 +352,13 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)
         pipe.hgetall(self.keys.results(job_id))
         pipe.hgetall(self.keys.cfail(job_id))
-        raw_results, raw_cfail = await pipe.execute()
+        pipe.hgetall(self.keys.ccancel(job_id))
+        raw_results, raw_cfail, raw_ccancel = await pipe.execute()
         return FlowView(
             tree=tree,
             results=decode_results(_str_dict(raw_results)),
             failures=_str_dict(raw_cfail),
+            cancellations=_str_dict(raw_ccancel),
         )
 
     async def children_results(self, job_id: str) -> dict[str, Any]:
@@ -392,11 +372,11 @@ class Queue:
         """Read child id -> failure reason recorded under ``on_fail="continue"``."""
         return _str_dict(await self.redis.hgetall(self.keys.cfail(job_id)))
 
-    async def flow_progress(self, parent_ids: list[str]) -> dict[str, tuple[int, int]]:
-        """For each flow parent id, ``(completed_children, failed_children)`` -
-        cheap pipelined HLEN reads of the ``:results`` / ``:cfail`` hashes (just
-        the counts, no values). Lets a dashboard show fan-in progress for a page
-        of parked parents without hydrating each tree.
+    async def flow_progress(self, parent_ids: list[str]) -> dict[str, tuple[int, int, int]]:
+        """For each flow parent id, ``(completed, failed, cancelled)`` children -
+        cheap pipelined HLEN reads of the ``:results`` / ``:cfail`` / ``:ccancel``
+        hashes (just the counts, no values). Lets a dashboard show fan-in progress
+        for a page of parked parents without hydrating each tree.
         """
         if not parent_ids:
             return {}
@@ -404,8 +384,12 @@ class Queue:
         for pid in parent_ids:
             pipe.hlen(self.keys.results(pid))
             pipe.hlen(self.keys.cfail(pid))
+            pipe.hlen(self.keys.ccancel(pid))
         res = await pipe.execute()
-        return {pid: (int(res[2 * i]), int(res[2 * i + 1])) for i, pid in enumerate(parent_ids)}
+        return {
+            pid: (int(res[3 * i]), int(res[3 * i + 1]), int(res[3 * i + 2]))
+            for i, pid in enumerate(parent_ids)
+        }
 
     async def result(self, job_id: str, *, timeout: float = 30.0) -> Any:
         """Wait for a job to finish; return its return value, or raise JobFailedError.
@@ -425,6 +409,8 @@ class Queue:
                 return job.returnvalue
             if job is not None and job.state == "failed":
                 raise JobFailedError(job.failed_reason)
+            if job is not None and job.state == "cancelled":
+                raise JobCancelledError(job_id, job.cancel_reason)
             try:
                 return await asyncio.wait_for(fut, timeout)
             except (TimeoutError, asyncio.TimeoutError):
@@ -450,7 +436,7 @@ class Queue:
             pubsub = self.redis.pubsub()
             try:
                 await pubsub.subscribe(self.keys.events)
-                await _confirm_subscribed(pubsub)
+                await confirm_subscribed(pubsub)
             except BaseException:
                 with contextlib.suppress(Exception):
                     await pubsub.aclose()  # it owns a connection by now
@@ -483,13 +469,16 @@ class Queue:
         except ValueError:
             return
         event = data.get("event")
-        if event not in ("completed", "failed"):
+        if event not in ("completed", "failed", "cancelled"):
             return  # non-terminal (e.g. "added", "progress")
-        for fut in self._result_waiters.get(str(data.get("jobId")), []):
+        job_id = str(data.get("jobId"))
+        for fut in self._result_waiters.get(job_id, []):
             if fut.done():
                 continue
             if event == "completed":
                 fut.set_result(data.get("result"))
+            elif event == "cancelled":
+                fut.set_exception(JobCancelledError(job_id, data.get("reason")))
             else:
                 fut.set_exception(JobFailedError(data.get("reason")))
 
@@ -647,7 +636,17 @@ class Queue:
         pipe.zcard(self.keys.failed)
         pipe.zcard(self.keys.waiting_children)
         pipe.zcard(self.keys.held)
-        wait, active, delayed, completed, failed, waiting_children, held = await pipe.execute()
+        pipe.zcard(self.keys.cancelled)
+        (
+            wait,
+            active,
+            delayed,
+            completed,
+            failed,
+            waiting_children,
+            held,
+            cancelled,
+        ) = await pipe.execute()
         return {
             "wait": wait,
             "active": active,
@@ -656,6 +655,7 @@ class Queue:
             "failed": failed,
             "waiting-children": waiting_children,
             "held": held,
+            "cancelled": cancelled,
         }
 
     async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
@@ -814,6 +814,7 @@ class Queue:
                     "heartbeat": heartbeat,
                     "processed": int(h.get("processed", 0)),
                     "failed": int(h.get("failed", 0)),
+                    "cancelled": int(h.get("cancelled", 0)),
                     "current": json.loads(h.get("current", "[]")),
                     "state": h.get("state", "running"),
                 }
@@ -874,7 +875,7 @@ class Queue:
         """
         if state == "active":
             ids = await self.redis.lrange(self.keys.active, start, end)
-        elif state in ("completed", "failed"):
+        elif state in FINISHED_STATES:
             count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
             ids = await self._newest_finished(self._finished_zset(state), start, count)
         else:
@@ -912,7 +913,7 @@ class Queue:
         """Map a ZSET-backed state to (key, newest_first) for the roots diff.
         `active` is a LIST and is handled separately by the caller.
         """
-        if state in ("completed", "failed"):  # finished states read newest-first
+        if state in FINISHED_STATES:  # finished states read newest-first
             return self._finished_zset(state), True
         return self._state_zset(state), False
 
@@ -958,9 +959,12 @@ class Queue:
                 self.keys.held,
                 self.keys.children,
                 self.keys.roots_scratch,
+                self.keys.cancelled,
             ],
         )
-        wait, delayed, completed, failed, waiting_children, held, active = (int(x) for x in res)
+        (wait, delayed, completed, failed, waiting_children, held, cancelled, active) = (
+            int(x) for x in res
+        )
         return {
             "wait": wait,
             "active": active,
@@ -969,6 +973,7 @@ class Queue:
             "failed": failed,
             "waiting-children": waiting_children,
             "held": held,
+            "cancelled": cancelled,
         }
 
     def _retry_job_keys(self, job_id: str) -> list[str]:
@@ -1022,6 +1027,8 @@ class Queue:
             self.keys.waiting_children,
             self.keys.base,
             self.keys.held,
+            self.keys.cancelled,
+            self.keys.cancel,
         ]
 
     async def remove_job(self, job_id: str) -> bool:
@@ -1032,6 +1039,34 @@ class Queue:
         nothing else is left to wait for.
         """
         res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id, _now_ms()])
+        return bool(res)
+
+    async def cancel_job(self, job_id: str, *, reason: str | None = None) -> bool:
+        """Stop a job wherever it is. True when there was something to stop.
+
+        `reason` is recorded on every job the call stops, the subtree included, and
+        reaches whoever is waiting on `result()`. "Who stopped this and why" is the
+        first question asked of a cancelled job.
+
+        A job that has not started ends here and now. A RUNNING job is asked to stop:
+        its worker owns the processor, so only the worker can cancel it, which it does
+        as soon as it hears (over the events channel, or at its next lock renewal).
+        Either way the job ends in `cancelled`, which is not a failure and is not
+        retried. A job that has already finished, or that is gone, returns False.
+        """
+        res = await self._cancel_job(
+            keys=[
+                self.keys.prioritized,
+                self.keys.delayed,
+                self.keys.held,
+                self.keys.waiting_children,
+                self.keys.cancelled,
+                self.keys.base,
+                self.keys.events,
+                self.keys.cancel,
+            ],
+            args=[str(job_id), _now_ms(), scripts.METRICS_RETENTION_MS, reason or ""],
+        )
         return bool(res)
 
     async def promote_job(self, job_id: str) -> bool:
@@ -1055,7 +1090,7 @@ class Queue:
         """
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
-        if state in ("completed", "failed"):
+        if state in FINISHED_STATES:
             zset = self._finished_zset(state)
             if newest:
                 return await self._newest_finished(zset, 0, limit)
@@ -1065,8 +1100,10 @@ class Queue:
         return _str_list(await self.redis.zrange(self._state_zset(state), 0, limit - 1))
 
     def _finished_zset(self, state: JobState) -> str:
-        """Name the ZSET a finished state lists from. The pair reads newest-first."""
-        return self.keys.completed if state == "completed" else self.keys.failed
+        """Name the ZSET a finished state lists from; all of them read newest-first."""
+        if state == "completed":
+            return self.keys.completed
+        return self.keys.failed if state == "failed" else self.keys.cancelled
 
     def _state_zset(self, state: JobState) -> str:
         """Name the ZSET a non-active, non-finished state lists from.

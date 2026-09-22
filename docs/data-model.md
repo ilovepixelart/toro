@@ -31,10 +31,12 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `failed` | ZSET | Terminally-failed ids, scored the same way. |
 | `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |
 | `held` | ZSET | Jobs waiting on a concurrency key, scored by enqueue time (the listing). |
+| `cancelled` | ZSET | Jobs stopped on purpose, scored like the other finished sets. |
 | `ck:<key>` | STRING | The job that holds a concurrency key. Exists only while a job holds it. |
 | `held:<key>` | ZSET | The jobs queued behind one key, scored as `prioritized` would score them. |
 | `meta-paused` | string (flag) | Exists only while the queue is paused; workers stop claiming new jobs. |
-| `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed`; drives `result()` and live dashboards. |
+| `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed` / `cancelled`; drives `result()` and live dashboards. |
+| `cancel` | pub/sub channel | Carries bare job ids: a cancellation asked of whichever worker is running that job. Separate from `events` because that one carries a message per job, and a worker listening there would parse the whole firehose to catch something rare. |
 | `limiter` | HASH | The queue-wide rate-limit token bucket (`{tokens, ts}`), shared by every worker. |
 | `stalled` | SET | Candidate ids for the mark-and-sweep recovery pass. |
 | `stalled-check` | string (PX) | Throttle key so the stalled sweep runs about once per interval cluster-wide. |
@@ -65,8 +67,8 @@ Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a
 ## How the pieces connect
 
 - A job moves between `prioritized` / `active` / `delayed` / `held` /
-  `waiting-children` / `completed` / `failed` as its state changes; the move and the
-  hash update happen in one Lua script. See [Architecture](architecture.md).
+  `waiting-children` / `completed` / `failed` / `cancelled` as its state changes; the
+  move and the hash update happen in one Lua script. See [Architecture](architecture.md).
 - `:deps` + `:results` + `:cfail` are the flow fan-in machinery - children settle
   into them as they finish. See [Flows](flows.md).
 - The `lock` + `stalled` keys are the at-least-once machinery. See

@@ -153,6 +153,46 @@ record expires a day after its last heartbeat, and any live worker's heartbeat
 drops index entries older than that. A worker that died more than a day before
 the first read is gone without a `lost` departure.
 
+## Cancellation
+
+`queue.cancel_job(job_id)` stops a job that is already running. The worker running
+it cancels the task its processor is on, so `CancelledError` is raised where the
+processor awaits: `finally` blocks and `async with` exits run, and the job lands in
+`cancelled`.
+
+```python
+async def process(job):
+    handle = await open_upload(job.data["path"])
+    try:
+        await handle.stream()          # cancellation lands here
+    finally:
+        await handle.abort()           # and this still runs
+```
+
+- **Nothing is raised into a processor that never awaits.** Cancellation is
+  delivered at an await point, so a tight CPU loop runs to completion. Yield if you
+  want to be interruptible.
+- **Work that must not be interrupted** belongs in the unwinding, not behind
+  `asyncio.shield`. A shield does not hold the cancellation back: the processor is
+  cancelled at the shield straight away while the shielded task carries on orphaned,
+  which is the very outcome the next point warns about. Catch the cancellation, finish
+  what has to finish, then re-raise.
+
+  ```python
+  try:
+      await long_running()
+  except asyncio.CancelledError:
+      await commit_what_we_have()   # runs to completion
+      raise                         # and the job still ends cancelled
+  ```
+- **Do not swallow `CancelledError`.** A processor that catches it and returns
+  normally does not complete the job: the worker knows it asked this one to stop, so
+  the job still ends `cancelled` and the return value is thrown away. The same holds
+  for a cleanup that raises on the way out, which is not a failure to retry.
+- Workers hear a cancellation over a channel of their own and act at once. A worker
+  that missed the message finds it at its next lock renewal instead, so the delay is
+  bounded by `lock_renew_time`, never lost.
+
 ## Shutdown
 
 ```python

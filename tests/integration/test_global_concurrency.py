@@ -394,11 +394,10 @@ async def test_finish_with_a_missing_cap_commits_nothing(q):
     await w.redis.aclose()
 
 
-async def test_slot_of_a_removed_job_is_reused_once_its_processor_ends(q):
-    """Removing an active job frees its slot in `active` but deliberately wakes no
-    one: the processor may still be running. When it ends, its finish comes back
-    lock-lost, and at that moment the worker KNOWS the slot is really free. It must
-    say so, or the waiting job sits out a full idle re-poll."""
+async def test_removing_a_running_job_frees_its_cap_slot_at_once(q):
+    """Removing an active job stops its processor, so the slot it held under the cap
+    is genuinely free the moment the removal lands. It used to stay occupied until the
+    work happened to end, because the processor carried on with nowhere to report."""
     release = asyncio.Event()
     started: dict[str, asyncio.Event] = {"held": asyncio.Event(), "waiting": asyncio.Event()}
 
@@ -422,14 +421,13 @@ async def test_slot_of_a_removed_job_is_reused_once_its_processor_ends(q):
     try:
         await asyncio.wait_for(started["held"].wait(), timeout=2.0)
         await asyncio.sleep(0.2)  # the spare loop is parked: the cap is full
-        assert await q.remove_job(held.id)
-        await asyncio.sleep(0.2)
-        assert not started["waiting"].is_set()  # no eager wake: `held` is still running
+        assert not started["waiting"].is_set()
 
-        release.set()  # the processor ends; its finish returns lock-lost
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(started["waiting"].wait(), timeout=1.0)
-        assert started["waiting"].is_set(), "the freed slot sat idle until the re-poll"
+        assert await q.remove_job(held.id)
+
+        # the processor is stopped with it, so the slot is free now rather than
+        # whenever the removed job's work would have finished
+        await asyncio.wait_for(started["waiting"].wait(), timeout=2.0)
     finally:
         release.set()
         await w.stop(grace_period=1)

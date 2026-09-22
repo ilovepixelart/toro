@@ -161,3 +161,91 @@ async def test_concurrent_delayed_promotion_promotes_each_once(q):
 async def _server_now_ms(q: Queue) -> int:
     secs, micros = await q.redis.time()
     return int(secs) * 1000 + int(micros) // 1000
+
+
+# ---- cancellation survives the same faults -----------------------------------------
+
+
+async def _state(q: Queue, job_id: str) -> str | None:
+    return await q.redis.hget(q.keys.job(job_id), "state")
+
+
+def _in_state(q: Queue, job_id: str, state: str):
+    async def check():
+        return await _state(q, job_id) == state
+
+    return check
+
+
+async def test_dropped_cancel_commit_recovers_and_cancels_once(q, run_worker, run_until):
+    """A cancellation whose commit never lands must not leave the job active for good.
+    The lock lapses, the sweep puts the job back, and the claim finds the request still
+    on the hash: it ends cancelled without running the processor a second time."""
+    runs: list[str] = []
+    started = asyncio.Event()
+
+    async def proc(job):
+        runs.append(job.id)
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(
+        q, proc, concurrency=1, stalled_interval=0, lock_duration=150, block_timeout=0.2
+    ) as w:
+        orig = w._finish_cancelled
+        hits = {"n": 0}
+
+        async def flaky(job):
+            hits["n"] += 1
+            if hits["n"] == 1:
+                raise ConnectionError("redis dropped mid-cancel-commit")
+            return await orig(job)
+
+        w._finish_cancelled = flaky
+
+        job = await q.add("j", {})
+        await asyncio.wait_for(started.wait(), 10)
+        assert await q.cancel_job(job.id) is True
+        assert await run_until(lambda: hits["n"] >= 1, timeout=10), "commit never attempted"
+        await asyncio.sleep(0.3)  # > lock_duration: the lock is now dead
+        await w.check_stalled(throttle_ms=0)  # pass 1: mark
+        await w.check_stalled(throttle_ms=0)  # pass 2: recover
+        assert await run_until(_in_state(q, job.id, "cancelled"), timeout=10), "never recovered"
+
+    assert (await q.counts())["cancelled"] == 1  # exactly one terminal state
+    assert (await q.counts())["failed"] == 0
+    assert runs == [job.id], "the processor ran again after it had been told to stop"
+
+
+async def test_a_cancellation_during_the_claim_is_not_lost(q, run_worker, run_until):
+    """The request can land while the job is being claimed, before the worker has a
+    processor to stop. The flag rides on the hash the claim reads, so it is acted on
+    at once rather than waiting out a lock renewal."""
+    runs: list[str] = []
+
+    async def proc(job):
+        runs.append(job.id)
+
+    job = await q.add("j", {})
+    await q.redis.hset(q.keys.job(job.id), "cancel", "1")  # as CANCEL_JOB would
+
+    async with run_worker(q, proc, concurrency=2, lock_duration=30_000, lock_renew_time=15_000):
+        assert await run_until(_in_state(q, job.id, "cancelled"), timeout=5)
+
+    assert runs == [], "a job already told to stop was run anyway"
+
+
+async def test_a_cancellation_after_the_job_settled_changes_nothing(q, run_worker, run_until):
+    """A request that arrives once the job is terminal has nothing to stop. It must
+    not resurrect it, re-commit it, or disturb the worker."""
+    async with run_worker(q, _noop, concurrency=2) as w:
+        job = await q.add("j", {})
+        assert await run_until(_completed(q, 1), timeout=10)
+
+        assert await q.cancel_job(job.id) is False  # nothing left to stop
+        await q.redis.publish(q.keys.cancel, job.id)  # and a late message on the wire
+        await asyncio.sleep(0.3)
+
+        assert await _state(q, job.id) == "completed"
+        assert (await q.counts())["cancelled"] == 0
+        assert w._cancelled == 0

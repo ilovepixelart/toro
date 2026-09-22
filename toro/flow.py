@@ -8,16 +8,16 @@ full design (and the landscape research behind it) is docs/flows-design.md.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import scripts
-from .job import JobOptions
+from .job import FINISHED_STATES, JobOptions
 
 OnFail = Literal["fail_parent", "continue"]
 
 # A flow node is terminal once it has settled; anything else is still moving.
-_TERMINAL = ("completed", "failed")
+_TERMINAL = FINISHED_STATES
 
 # Whole-tree cap: ADD_FLOW inserts the tree in one atomic script, so its size
 # bounds how long that script can hold Redis (same idea as PROMOTE_BATCH).
@@ -128,8 +128,9 @@ class FlowView:
     """A whole flow projected for a dashboard in one read.
 
     `tree` is the `{job, children}` shape `get_flow` returns; `results` and
-    `failures` are the parent's collected child return values and its tolerated
-    (`on_fail="continue"`) failures. The counts are derived over the root's
+    `failures` and `cancellations` are the parent's collected child return values and
+    its tolerated (`on_fail="continue"`) failures and cancellations, kept apart
+    because a job stopped on purpose did not fail. The counts are derived over the root's
     direct children - completions only, so a failed flow never reads as done -
     and `live` is true while ANY node in the subtree is still non-terminal.
     Retention can take a finished child's hash, and with it the child's node in
@@ -141,6 +142,7 @@ class FlowView:
     tree: dict[str, Any]
     results: dict[str, Any]
     failures: dict[str, str]
+    cancellations: dict[str, str] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -154,6 +156,10 @@ class FlowView:
     @property
     def failed(self) -> int:
         return len(self._children_in("failed") | self.failures.keys())
+
+    @property
+    def cancelled(self) -> int:
+        return len(self._children_in("cancelled") | self.cancellations.keys())
 
     def _children_in(self, state: str) -> set[str]:
         return {n["job"].id for n in self.tree["children"] if n["job"].state == state}

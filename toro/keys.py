@@ -88,6 +88,18 @@ class Keys:
         return f"{self.base}limiter"
 
     @property
+    def cancel(self) -> str:
+        # Pub/sub channel carrying ONLY cancellation requests. Separate from `events`
+        # on purpose: that one carries a message per job, and a worker subscribed to it
+        # would parse the whole firehose to catch something that happens rarely.
+        return f"{self.base}cancel"
+
+    @property
+    def cancelled(self) -> str:
+        # ZSET of jobs stopped on purpose, scored like the other finished sets.
+        return f"{self.base}cancelled"
+
+    @property
     def held(self) -> str:
         # ZSET of every job waiting on a concurrency key, scored by enqueue time.
         return f"{self.base}held"
@@ -147,7 +159,7 @@ class Keys:
     # Where a custom job id could land on a key that is not its own: the namespaces
     # built under the base (`de:` only in Lua) and the suffixes of a job's aux keys.
     _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:", "ck:", "held:")
-    _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail", ":live")
+    _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail", ":ccancel", ":live")
 
     def job_id_conflict(self, job_id: str) -> str | None:
         """Name what a custom job id would collide with, or return None when it is free.
@@ -184,6 +196,12 @@ class Keys:
     def results(self, job_id: str | int) -> str:
         # HASH child id -> returnvalue JSON, written as each child completes.
         return f"{self.base}{job_id}:results"
+
+    def ccancel(self, job_id: str | int) -> str:
+        # HASH of child id -> why it was stopped, for children cancelled under
+        # `on_fail="continue"`. Separate from `:cfail` because a cancellation is not a
+        # failure, and a parent's fan-in must not read one as the other.
+        return f"{self.base}{job_id}:ccancel"
 
     def cfail(self, job_id: str | int) -> str:
         # HASH child id -> failed reason, for children failed under on_fail="continue".

@@ -452,7 +452,7 @@ class _Subscription:
 async def test_an_unconfirmed_subscription_gives_up_and_closes(q, monkeypatch):
     """Redis never answers the SUBSCRIBE: the wait says so rather than hanging, and the
     half-made subscription is closed instead of holding a pool connection."""
-    monkeypatch.setattr("toro.queue.SUBSCRIBE_TIMEOUT", 0.05)
+    monkeypatch.setattr("toro.connection.SUBSCRIBE_TIMEOUT", 0.05)
     mute = _Subscription()
     monkeypatch.setattr(q.redis, "pubsub", lambda *a, **kw: mute)
 

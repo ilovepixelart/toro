@@ -2,6 +2,28 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 0.9.0
+
+### Upgrade every worker before you cancel anything
+
+A running job is stopped by the worker that owns its processor, and that worker has
+to be on 0.9.0 to hear the request. Ask an older one and `cancel_job()` still answers
+`True`, but nothing stops: it holds the lock throughout, so it finishes the work and
+commits a normal `completed` (or `failed`), return value and all. The caller is told
+the job was stopped and gets a job that ran to the end. Roll the fleet first, then
+start cancelling. Nothing changes for a queue that never calls `cancel_job()`.
+
+`remove_job()` on a RUNNING job now stops its processor, where it used to leave the
+work running with nowhere to report until it ended on its own. A processor that must
+not be interrupted should not be removed mid-flight; wait for it, or let the job
+finish. The slot it holds, including under a global concurrency cap, frees at once.
+
+`cancelled` is a new `JobState`, so anything enumerating states sees an eighth. It
+is NOT a failure: it is counted, listed and retained separately, `retry_job()`
+refuses it, and `result()` raises `JobCancelledError` rather than `JobFailedError`.
+Code that retries on `JobFailedError` therefore will not retry cancelled work, which
+is the point.
+
 ## 0.8.0
 
 ### Upgrade every worker before you use a concurrency key

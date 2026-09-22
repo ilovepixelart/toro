@@ -96,13 +96,14 @@ first, and `clean` removes settled history only.
 
 ## When a child fails
 
-Each child's `on_fail` says what its *terminal* failure (after its own
-retries) does to the parent:
+Each child's `on_fail` says what its never delivering does to the parent. That is
+one rule, not two: a child that fails terminally (after its own retries) and one that
+is cancelled both leave the parent without what it was waiting for.
 
 | `on_fail` | behavior |
 |---|---|
-| `"fail_parent"` (default) | The parent fails **immediately** - in the same atomic step, no worker needed - and the failure walks up through ancestors that also default. |
-| `"continue"` | The failure is recorded; the parent still runs once every child has settled and inspects `failed_children()`. |
+| `"fail_parent"` (default) | The parent settles **immediately** - in the same atomic step, no worker needed - and it walks up through ancestors that also default. A failed child fails them; a cancelled child cancels them, because a deliberate stop is not a failure. |
+| `"continue"` | It is recorded and the parent still runs once every child has settled, inspecting `failed_children()` for failures and `cancelled_children()` for stops. |
 
 There is deliberately no "wait forever" option: a flow always settles. The
 crash path counts too - a child whose worker died and that exhausts the
@@ -199,6 +200,8 @@ every terminally-failed child increments the per-job `failed` counter
 increments it again - so one leaf failure in a deep `fail_parent` chain
 produces several `failed` increments and events. That counter is about *jobs*.
 
+A cancelled flow is counted in neither: a deliberate stop is not a completion and
+not a failure, and the queue's per-minute metrics record outcomes, not intentions.
 Whole flows are counted in their own right, one unit per **root** flow as it
 settles (nested sub-flows don't double count):
 

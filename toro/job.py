@@ -13,7 +13,13 @@ from ._replies import _str_dict
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
 # `waiting-children` is the flow-parent park: enqueued, but runnable only once
 # every child has settled. `held` waits on a concurrency key, not on a worker.
-JobState = Literal["wait", "active", "delayed", "held", "completed", "failed", "waiting-children"]
+# `cancelled` was stopped on purpose, which is not a failure and is not counted as one.
+JobState = Literal[
+    "wait", "active", "delayed", "held", "completed", "failed", "cancelled", "waiting-children"
+]
+# The states a job is finished in: no further attempt, and retention applies. The one
+# such list - Lua asks the same question through `isFinished` in scripts.py.
+FINISHED_STATES: tuple[JobState, ...] = ("completed", "failed", "cancelled")
 
 
 class BackoffOpts(TypedDict, total=False):
@@ -130,6 +136,7 @@ class JobContext:
     job_id: str
     results_key: str  # the flow aux keys, derived via Keys by the worker so
     cfail_key: str  # the layout stays defined in exactly one place (keys.py)
+    ccancel_key: str
 
 
 @dataclass
@@ -144,6 +151,7 @@ class Job:
     timestamp: int | None = None
     returnvalue: Any = None
     failed_reason: str | None = None
+    cancel_reason: str | None = None  # why it was stopped, when the caller said
     state: JobState | None = None
     processed_on: int | None = None
     finished_on: int | None = None
@@ -200,6 +208,15 @@ class Job:
             raise RuntimeError("failed_children() is only available inside a worker processor")
         return _str_dict(await self._ctx.redis.hgetall(self._ctx.cfail_key))
 
+    async def cancelled_children(self) -> dict[str, str]:
+        """Pull child id -> why it was stopped, for children cancelled under
+        ``on_fail="continue"``. Separate from `failed_children()`: a job somebody
+        stopped did not fail, and a parent deciding what to do wants to know which.
+        """
+        if self._ctx is None:
+            raise RuntimeError("cancelled_children() is only available inside a worker processor")
+        return _str_dict(await self._ctx.redis.hgetall(self._ctx.ccancel_key))
+
     @classmethod
     def from_hash(cls, job_id: str, h: dict[str, str]) -> Job:
         """Build a Job from a decoded Redis hash (str keys/values)."""
@@ -212,6 +229,7 @@ class Job:
             timestamp=int(h["timestamp"]) if h.get("timestamp") else None,
             returnvalue=json.loads(h["returnvalue"]) if h.get("returnvalue") else None,
             failed_reason=h.get("failedReason"),
+            cancel_reason=h.get("cancelReason"),
             state=cast("JobState | None", h.get("state")),  # Redis stores it untyped
             processed_on=int(h["processedOn"]) if h.get("processedOn") else None,
             finished_on=int(h["finishedOn"]) if h.get("finishedOn") else None,
