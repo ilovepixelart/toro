@@ -36,6 +36,7 @@ type, `JobState`:
 |---|---|
 | `wait` | Ready to run, waiting for a free worker. (Stored in the priority-ordered set, so "wait" and "prioritized" are the same place.) |
 | `delayed` | Scheduled for the future; not yet runnable. Promoted to `wait` when due. |
+| `held` | Waiting on a `concurrency_key` another job holds. It waits on that job, not on a worker, so it occupies no slot and no place in the queue. |
 | `active` | Claimed by a worker and currently running. |
 | `waiting-children` | A flow parent, parked until every child settles; released to `wait` by its last child. |
 | `completed` | Finished successfully; `returnvalue` holds the result. |
