@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from toro import JobFailedError, Queue, Worker
+from toro import JobFailedError, Queue, Worker, scripts
 
 PREFIX = "torotest"
 QUEUE = "reliability"
@@ -141,7 +141,17 @@ async def test_fetch_next_in_finish(q):
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[cur.id, "{}", _now_ms(), w.token, "1", 30000, -1, -1, 0, 0, 60_000, 0],
+        args=scripts.completed_args(
+            job_id=cur.id,
+            returnvalue="{}",
+            now=_now_ms(),
+            token=w.token,
+            fetch="1",
+            lock_duration=30000,
+            rl_max=0,
+            rl_duration=0,
+            global_concurrency=0,
+        ),
     )
     assert isinstance(res, list) and res[0] == 1
     assert len(res) == 3 and res[2] == nxt.id  # next handed back
@@ -371,6 +381,37 @@ async def test_rate_limit_throttles_throughput(q):
     assert len(done) < 12
     # The rest stay queued (rate limiting never fails or drops a job).
     assert (await q.counts())["wait"] == 12 - len(done)
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_finish_that_fetches_the_next_job_pays_the_limiter(q, outcome):
+    """Each finish script fetches the next job under the same limiter, reading the
+    limit from its own argument slots. A slot off by one is a limiter silently off, or
+    silently wrong, on that path alone. The bucket in Redis tells: the next fetch
+    spends one token of a bucket sized exactly `max`, and refills at `max/duration`."""
+    for i in range(3):
+        await q.add("job", {"i": i})
+
+    async def proc(job):
+        if outcome == "failed":
+            raise RuntimeError("boom")
+
+    w = Worker(
+        QUEUE, proc, prefix=PREFIX, rate_limit={"max": 7, "duration": 60_000}, stalled_interval=0
+    )
+    w.on("failed", lambda *a, **k: None)
+    task = asyncio.create_task(w.run())
+    try:
+        await asyncio.sleep(0.5)  # three claims: the first pop, then two finish-fetches
+    finally:
+        await w.stop()
+        task.cancel()
+
+    bucket = await q.redis.hgetall(q.keys.limiter)
+    assert (await q.counts())[outcome] == 3
+    # 7 tokens, one per claim, refilled by at most 0.5 s at 7 per minute
+    assert 4.0 <= float(bucket["tokens"]) < 4.1, bucket
+    assert 60_000 < await q.redis.pttl(q.keys.limiter) <= 61_000  # duration + 1 s
 
 
 async def test_rate_limit_disabled_runs_everything(q):

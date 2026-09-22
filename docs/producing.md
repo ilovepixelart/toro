@@ -26,17 +26,56 @@ JSON-serializable payload.
 | `delay` | 0 | ms before the job becomes runnable; it sits in `delayed` until due. |
 | `attempts` | 1 | Total tries before the job is terminally failed. |
 | `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms}`. Exponential doubles per attempt. |
-| `remove_on_complete` | `None` | Auto-removal for successes: `None`/`False` keep all, `True` remove at once, `N` keep the newest N, `{"count": N, "age": seconds}` bound both. |
-| `remove_on_fail` | `None` | Same, for terminal failures. |
+| `remove_on_complete` | unset | Which successes to keep: unset keeps the newest 1000, `False` keeps all, `True` removes at once, `N` keeps the newest N, `{"count": N, "age": seconds}` bounds both. |
+| `remove_on_fail` | unset | Same, for terminal failures; unset keeps the newest 5000. |
 
 Per-queue defaults go on the constructor and merge under per-call options:
 
 ```python
-queue = Queue("emails", default_job_options={"remove_on_complete": 1000, "attempts": 3})
+queue = Queue("emails", default_job_options={"remove_on_complete": 100, "attempts": 3})
 ```
 
-Auto-removal is enforced inside the finish script itself - there is no separate
-cleanup process to run or forget.
+## Retention
+
+A queue on its defaults holds a bounded history: the newest 1000 completed jobs
+and the newest 5000 failed ones (failures are what gets debugged). The bound is a
+count, so it caps memory whatever the throughput. The numbers are
+`DEFAULT_KEEP_COMPLETED` and `DEFAULT_KEEP_FAILED` in `toro/job.py`.
+
+To keep every finished job, say so for the queue, on every producer:
+
+```python
+queue = Queue(
+    "emails",
+    default_job_options={"remove_on_complete": False, "remove_on_fail": False},
+)
+```
+
+Retention is enforced inside the finish script itself - there is no separate
+cleanup process to run or forget. It follows that:
+
+- **Retention belongs to the set, not to the job.** A trim runs when a job
+  finishes, under *that job's* option, and trims the whole `completed` (or
+  `failed`) set. A job added with `remove_on_complete=False` is not protected
+  from a later job that finishes under a bound, which is why keep-everything is
+  a per-queue setting above.
+- **The worker applies it.** The option is stored with the job and read as the job
+  finishes, so the default in force is that of the worker's toro version.
+- **A trim is bounded.** One finish deletes at most 1000 jobs, oldest first,
+  whichever bounds apply and however many flow ancestors fail with it. A bound
+  that meets a deep backlog drains it over the following finishes instead of
+  blocking Redis in one pass.
+- **A scheduler stores its options when it is registered**, the queue's defaults
+  included, because workers mint each occurrence from the stored template. Call
+  `add_scheduler()` again to change them.
+
+A trimmed job is gone: its hash, logs and flow bookkeeping are deleted,
+`get_job()` returns `None`, and `result()` called after the trim times out. A
+trimmed flow child leaves its flow's tree (see [Flows](flows.md)).
+Awaiting `result()` while the job runs is unaffected, and so are the metrics,
+which are separate counters. Retention covers every way a job can finish: a
+worker's finish, a flow parent failed by the script, and a job the stalled sweep
+fails after its worker died.
 
 ## Custom ids and deduplication
 
@@ -44,7 +83,9 @@ Two distinct tools, usable independently:
 
 - **`job_id="order-123"`** - id-based dedup. Adding a job whose id already
   exists is idempotent: nothing is enqueued and the existing job's id comes
-  back. The id frees up when the job is removed (including by auto-removal).
+  back. The id frees up when the job is removed, [retention](#retention)
+  included: on defaults, once 1000 newer jobs have completed. A queue that
+  relies on an id for longer keeps more history.
   Must be a non-empty, non-all-digits string - all-digit ids would collide with
   auto-generated ones.
 - **`deduplication={"id": "sync-user-42", "ttl": 60_000}`** - a throttle window.
