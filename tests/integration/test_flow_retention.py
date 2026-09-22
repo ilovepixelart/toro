@@ -11,7 +11,7 @@ import time
 import pytest
 
 from toro import FlowChild as c  # noqa: N813 - `c("part", ...)` keeps trees readable
-from toro import Queue, Worker
+from toro import JobFailedError, Queue, Worker
 from toro.job import DEFAULT_KEEP_COMPLETED
 from toro.scripts import LIVE_SCORE
 
@@ -324,10 +324,13 @@ async def test_a_nested_flow_keeps_its_grandchildren(q, run_worker, run_until):
         assert await root.result(timeout=10) == ["mid", "slow"]
 
 
-async def test_a_sibling_running_past_a_trimmed_root_is_left_alone(q, run_worker, run_until):
-    """FR-006: the root failed with one child while another still ran, and was trimmed
-    before that child finished. The child is not removed with the root, and when it
-    finishes it belongs to no flow: scored at its own time, trimmed like any job."""
+@pytest.mark.parametrize("sibling", ["active", "delayed"])
+async def test_a_sibling_outliving_a_trimmed_root_is_left_alone(q, run_worker, run_until, sibling):
+    """FR-006: the root failed with one child while another was still running, or
+    still waiting on a delay, and was trimmed before that child finished. The child is
+    not removed with the root, the finish that trimmed the root lands as any finish,
+    and the child, when it finishes, belongs to no flow: scored at its own time and
+    trimmed like any job."""
     gate = asyncio.Event()
 
     async def proc(job):
@@ -337,17 +340,24 @@ async def test_a_sibling_running_past_a_trimmed_root_is_left_alone(q, run_worker
             await gate.wait()
         return job.name
 
-    async with run_worker(q, proc, concurrency=4):
-        root = await q.add_flow("report", {}, children=[c("bad", {}), c("slow", {})])
+    async with run_worker(q, proc, concurrency=4) as w:
+        failures: list[str] = []
+        w.on("failed", lambda job, exc: failures.append(job.id))
+        slow_opts = {"delay": 1500} if sibling == "delayed" else {}
+        root = await q.add_flow("report", {}, children=[c("bad", {}), c("slow", {}, **slow_opts)])
         assert await run_until(lambda: _in_state(q, root.id, "failed"), timeout=10)
         children = await _tree_ids(q, root.id)
         states = [await q.redis.hget(q.keys.job(cid), "state") for cid in children]
-        slow = children[states.index("active")]
+        slow = children[states.index(sibling)]
 
         # a failure under a bound of one: the root, older, is the victim; its subtree goes
-        await q.add("bad", {}, remove_on_fail=1)
-        assert await run_until(lambda: _gone(q, root.id), timeout=10)
-        assert await _present(q, [slow]) == 1, "a running child was removed with its root"
+        trimmer = await q.add("bad", {}, remove_on_fail=1)
+        with pytest.raises(JobFailedError):
+            await trimmer.result(timeout=10)
+        # the finish that trimmed the root ran to its end: the worker's hook fired
+        assert await run_until(lambda: trimmer.id in failures, timeout=5), failures
+        assert await _gone(q, root.id)
+        assert await _present(q, [slow]) == 1, "a child still to finish was removed with its root"
 
         gate.set()
         assert await run_until(lambda: _count_state(q, "completed", 1), timeout=10)
