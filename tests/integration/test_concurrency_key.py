@@ -274,3 +274,43 @@ async def test_a_scheduled_occurrence_waits_for_the_key(q, run_worker, run_until
     # the key is free, so the occurrence goes back to waiting out its schedule
     await _until(lambda: _count_is(q, "delayed", 1)())
     assert await _count(q, "held") == 0
+
+
+async def test_held_is_a_state(q, run_worker, run_until):
+    """CK-008: a held job is listed, counted, searchable and removable like any other,
+    and the operations that make no sense for it say so rather than half-working."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        held = await q.add("held", {"tag": "needle"}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+
+        assert [j.id for j in await q.get_jobs("held", 0, -1)] == [held.id]
+        assert (await q.get_job(held.id)).state == "held"
+        assert [j.id for j in await q.search("held", "needle")] == [held.id]
+        assert await q.retry_job(held.id) is False  # it never failed
+        assert await q.promote_job(held.id) is False  # it waits on a key, not a clock
+
+        assert await q.clean("held") == 1
+        assert await _count(q, "held") == 0
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 1), timeout=10)
+
+    assert await q.redis.keys(q.keys.base + "ck:*") == []
+
+
+async def test_a_held_leaf_keeps_its_parent_parked(q, run_worker, run_until):
+    """CK-006: a held child has not settled, so its flow waits for it as for any child."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=8):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        root = await q.add_flow("report", {}, children=[FlowChild("leaf", {}, concurrency_key="k")])
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+
+        assert await _in_state(q, root.id, "waiting-children")
+        gate.set()
+        assert await root.result(timeout=10) == "report"
