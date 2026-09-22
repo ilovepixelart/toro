@@ -58,6 +58,18 @@ ran its scheduled jobs with one attempt. They now merge under the scheduler's ow
 options, as they do for `add()`. Pass the option to `add_scheduler()` to keep a
 scheduler on a different value.
 
+### Some custom job ids are refused
+
+`add()` raises `ValueError` for a `job_id` that would land on another key of the
+queue: a queue key's name (`completed`, `marker`, ...), a queue namespace or its
+bare name (`repeat:`, `worker:`, `metrics:`, `de:`), or another job's aux key
+(`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`). Such an id made the job's
+hash and that key one Redis key: `completed` broke the queue with `WRONGTYPE`,
+`prioritized` made `add()` return as if the job existed and enqueue nothing. A
+job already stored under one of these ids keeps working; only `add()` refuses
+it, including a repeat `add()` of that job. Colons are otherwise allowed. See
+[Custom ids](producing.md#custom-ids-and-deduplication).
+
 ### `JobOptions.keep_args` is removed
 
 It mapped a remove option to two arguments of the finish scripts. The scripts now
