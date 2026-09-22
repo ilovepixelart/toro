@@ -381,3 +381,28 @@ async def test_a_cleanup_that_raises_does_not_resurrect_a_cancelled_job(q, run_w
     assert await _state(q, job.id) == "cancelled"
     assert await _count(q, "failed") == 0
     assert await _count(q, "delayed") == 0
+
+
+async def test_the_lock_is_held_while_a_cancelled_job_cleans_up(q, run_worker, run_until):
+    """CN-002: the renewal that delivered a cancellation has to keep renewing. Stop,
+    and the lock lapses under a long cleanup: the commit is then refused as a lost
+    lock and the stalled sweep re-runs the whole job on another worker."""
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            await asyncio.sleep(0.8)  # outlives lock_duration if nobody renews it
+            cleaned.set()
+
+    # nothing is published, so the lock is what delivers: the path that used to stop
+    async with run_worker(q, proc, concurrency=2, lock_duration=300, lock_renew_time=100):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+        await q.redis.hset(q.keys.job(job.id), "cancel", "1")  # no PUBLISH
+
+        await asyncio.wait_for(cleaned.wait(), 5)
+        # the commit still owns the lock, so it lands instead of being refused
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=5)

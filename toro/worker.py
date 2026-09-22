@@ -711,9 +711,11 @@ class Worker:
                 self._emit("lock-lost", job_id)
                 return
             if int(ok) == scripts.LOCK_CANCEL_REQUESTED:
-                # the message never reached us (or there was none): this is the backstop
+                # The message never reached us, or there was none: this is the backstop.
+                # Keep renewing afterwards, because the processor is now unwinding and
+                # a cleanup that outlives the lock would be re-run by the stalled sweep
+                # on another worker. Asking twice is a no-op (see _request_cancel).
                 self._request_cancel(job_id)
-                return
 
     async def _promote_loop(self) -> None:
         while self._running:
