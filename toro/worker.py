@@ -742,6 +742,12 @@ class Worker:
                 raise
             except Exception:  # pragma: no cover
                 ok = 0
+            if int(ok) == scripts.LOCK_JOB_GONE:
+                # removed while we ran it: there is nothing left to finish, and the
+                # message that would have said so never arrived
+                self._request_cancel(job_id)
+                self._emit("lock-lost", job_id)
+                return
             if not ok:
                 self._emit("lock-lost", job_id)
                 return

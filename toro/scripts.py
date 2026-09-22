@@ -715,13 +715,17 @@ return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7]
 # What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
 # and the script cannot drift over a bare 2.
 LOCK_CANCEL_REQUESTED = 2
+# ...and when the job it was renewing no longer exists: it was removed, so there is
+# nothing left to finish and the processor is running for nobody.
+LOCK_JOB_GONE = -1
 
 # Renew a lock we still own. Token-guarded: we can NEVER renew a lock another
 # worker has taken over. A successful renew also resets the stalled window.
-# Returns 0 (the lock is gone), 1 (renewed) or LOCK_CANCEL_REQUESTED (renewed, and a
-# cancellation has been asked for). The renewal is the backstop for a cancel message
-# that never arrived: a worker that stops renewing has lost the job to the stalled
-# sweep anyway, so this cannot be the thing that is missed.
+# Returns 0 (the lock is gone), LOCK_JOB_GONE (the job itself is gone), 1 (renewed)
+# or LOCK_CANCEL_REQUESTED (renewed, and a cancellation has been asked for). The
+# renewal is the backstop for a cancel message that never arrived: a worker that
+# stops renewing has lost the job to the stalled sweep anyway, so this cannot be the
+# thing that is missed.
 # KEYS[1] lock  KEYS[2] stalled  KEYS[3] job hash
 # ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] jobId
 EXTEND_LOCK = """
@@ -731,6 +735,9 @@ if redis.call("GET", KEYS[1]) == ARGV[1] then
   if redis.call("HGET", KEYS[3], "cancel") then return 2 end
   return 1
 end
+-- A removal takes the hash AND the lock, so a lost cancel message has no other way
+-- back: the renewal is the backstop for that too. A takeover leaves the hash alone.
+if redis.call("EXISTS", KEYS[3]) == 0 then return -1 end
 return 0
 """
 

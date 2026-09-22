@@ -703,3 +703,30 @@ async def test_a_worker_counts_only_the_cancellations_it_committed(q, run_worker
 
         assert (await q.counts())["cancelled"] == 0  # the queue recorded nothing
         assert w._cancelled == 0, "a worker counted a cancellation it never committed"
+
+
+async def test_a_removal_whose_message_is_lost_still_stops_the_processor(q, run_worker):
+    """Removal stops a running job by telling its worker, and a message can be missed.
+    A cancellation has the lock renewal as its backstop, but a removal deletes the
+    lock, so the renewal only reported it lost. The job it was running is gone, which
+    is reason enough to stop."""
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cleaned.set()
+
+    async with run_worker(q, proc, concurrency=2, lock_duration=5000, lock_renew_time=100) as w:
+        # drop what the listener delivers (it carries the claim), keep what the lock
+        # renewal asks (it does not): exactly a message that never arrived
+        delivered = w._request_cancel
+        w._request_cancel = lambda jid, claim=None: None if claim else delivered(jid)
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.remove_job(job.id) is True
+
+        await asyncio.wait_for(cleaned.wait(), 5)  # the renewal noticed instead
