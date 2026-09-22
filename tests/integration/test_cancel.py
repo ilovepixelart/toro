@@ -588,3 +588,45 @@ async def test_a_cancelled_child_is_not_recorded_as_a_failure(q):
     assert await q.redis.hget(q.keys.cfail(root.id), stopped) is None
     _done, failed, cancelled = (await q.flow_progress([root.id]))[root.id]
     assert (failed, cancelled) == (1, 1), "the cancelled child was counted as a failure"
+
+
+async def test_cancelling_a_flow_whose_root_already_failed_still_stops_it(q, run_worker, run_until):
+    """CN-007: a root can settle while its siblings run, when one child fails the
+    parent eagerly. The root is then the only handle an operator has on the rest of
+    the flow, and it has to keep working: otherwise the leftovers run on with nobody
+    to report to, and only a walk of the tree can reach them."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "breaks":
+            raise RuntimeError("boom")
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=4) as w:
+        w.on("failed", lambda *a, **k: None)
+        root = await q.add_flow(
+            "report", {}, children=[FlowChild("breaks", {}), FlowChild("runs-on", {})]
+        )
+        await asyncio.wait_for(started.wait(), 10)
+        assert await run_until(lambda: _in_state(q, root.id, "failed"), timeout=10)
+
+        assert await q.cancel_job(root.id) is True, "the root stopped being a handle"
+
+        assert await run_until(_count_is(q, "active", 0), timeout=10)
+
+    assert (await q.counts())["active"] == 0
+
+
+async def test_cancelling_a_job_with_nothing_left_to_stop_is_false(q, run_worker, run_until):
+    """CN-009: the flip side. A settled job with no live subtree has nothing to stop,
+    and saying True would claim otherwise."""
+
+    async def proc(job):
+        return job.name
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("j", {})
+        assert await run_until(lambda: _in_state(q, job.id, "completed"), timeout=10)
+
+    assert await q.cancel_job(job.id) is False

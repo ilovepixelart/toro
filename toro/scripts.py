@@ -1075,11 +1075,13 @@ end
 -- retention may follow with a DEL of the hash). A job already finished is left alone;
 -- a running one can only be stopped by the worker that owns its processor, so it is
 -- asked here and commits its own cancellation.
+local stopped = 0  -- how many jobs this call actually stopped
 local function cancelOne(jobId)
   local jobKey = base .. jobId
   local meta = redis.call("HMGET", jobKey, "state", "children", "ckey")
   local state = meta[1]
   if not state or isFinished(state) then return meta[2] end
+  stopped = stopped + 1
   if state == "active" then
     redis.call("HSET", jobKey, "cancel", "1")
     saveReason(jobKey)
@@ -1111,10 +1113,16 @@ local function cancelTree(jobId)
   end
 end
 local topState = redis.call("HGET", base .. ARGV[1], "state")
-if not topState or isFinished(topState) then return 0 end
+if not topState then return 0 end
 -- read BEFORE the cancellation (retention may DEL the hash)
 local top = redis.call("HMGET", base .. ARGV[1], "parentId", "onFail")
+-- A settled root is still the handle on its flow: one child failing the parent
+-- eagerly leaves its siblings running, and walking the tree by hand is the only
+-- other way to reach them. So the walk goes ahead whatever the root's own state,
+-- and the answer is whether anything was actually stopped.
 cancelTree(ARGV[1])
+if stopped == 0 then return 0 end
+if isFinished(topState) then return 1 end  -- the root was already done; its subtree was not
 if topState == "active" then return 2 end   -- its worker settles it when it stops
 -- A cancelled child did not produce what its parent waits for, so the parent's own
 -- onFail policy decides, exactly as it does for a child that failed: there is one
