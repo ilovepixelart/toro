@@ -402,6 +402,37 @@ async def test_deduplication_throttles_within_ttl(q):
     assert (await q.counts())["wait"] == 2
 
 
+async def test_the_events_dispatcher_is_live_before_a_result_waits(q):
+    """`result()` reads a job's outcome from its terminal event, and a job whose own
+    finish removed it has nothing else to read. redis-py's `subscribe()` returns once
+    the command is WRITTEN, not once Redis has acted on it: a dispatcher that reported
+    itself ready in between would miss every event published in that window."""
+    for _ in range(20):
+        waiter = Queue(q.name, prefix=PREFIX)
+        try:
+            await waiter._ensure_dispatcher()
+            assert int((await q.redis.pubsub_numsub(q.keys.events))[0][1]) == 1
+        finally:
+            await waiter.close()
+
+
+async def test_result_reads_a_job_that_removed_itself(q, run_worker):
+    """`remove_on_complete=True` deletes the job inside the finish script, so its value
+    can only come from the event. Repeated: the window is a race with Redis."""
+
+    async def proc(job):
+        return job.data["i"]
+
+    async with run_worker(q, proc):
+        for i in range(10):
+            waiter = Queue(q.name, prefix=PREFIX)
+            try:
+                job = await waiter.add("gone", {"i": i}, remove_on_complete=True)
+                assert await job.result(timeout=5) == i
+            finally:
+                await waiter.close()
+
+
 async def test_rate_limit_throttles_throughput(q):
     """A queue-wide limiter caps throughput across the worker; jobs aren't dropped."""
     for i in range(12):
