@@ -488,8 +488,17 @@ class Worker:
         try:
             result = await task
         except asyncio.CancelledError:
-            if job.id not in self._cancelling:
-                raise  # the worker is going down, not a cancellation: let it through
+            # Ours only when the PROCESSOR is what was stopped. The same error arrives
+            # when this WORKER is being stopped, and absorbing that one commits a job
+            # and carries on through a shutdown. Cancelling the awaiting task cancels
+            # the awaited one too, so the inner task cannot tell them apart; the
+            # outer task's own pending-cancellation count can (3.11+, with the
+            # shutdown flag as the fallback).
+            outer = asyncio.current_task()
+            asked = getattr(outer, "cancelling", None)
+            stopping = asked() > 0 if asked is not None else not self._running
+            if stopping or job.id not in self._cancelling:
+                raise
             return await self._finish_cancelled(job)
         except Exception as exc:
             if job.id in self._cancelling:

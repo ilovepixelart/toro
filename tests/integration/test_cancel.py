@@ -9,7 +9,8 @@ import asyncio
 
 import pytest
 
-from toro import FlowChild, JobCancelledError, Queue, scripts
+from toro import FlowChild, JobCancelledError, Queue, Worker, scripts
+from toro.job import Job
 
 PREFIX = "torotest"
 
@@ -865,3 +866,28 @@ async def test_removing_a_cancelled_job_does_not_scan_the_active_list(q):
 async def _lrem_calls(q: Queue) -> int:
     stats = await q.redis.info("commandstats")
     return int(stats.get("cmdstat_lrem", {}).get("calls", 0))
+
+
+async def test_a_worker_shutting_down_does_not_swallow_its_own_cancellation(q):
+    """A cancellation arriving while the worker asked for one of its own is ambiguous:
+    the processor's task may have been stopped, or this worker may be the thing being
+    stopped. Only the first is ours to absorb. Absorbing the second makes a worker
+    commit a job and carry on when it was told to shut down."""
+    worker = Worker(q.name, _noop_proc, prefix=PREFIX, connection=q.redis)
+    job = Job(id="1", name="j", data={})
+    # the processor is still running: nothing has cancelled IT
+    inner: asyncio.Task = asyncio.create_task(asyncio.sleep(60))
+    worker._processors[job.id] = (inner, "")
+    worker._cancelling.add(job.id)
+
+    settling = asyncio.create_task(worker._outcome(job, inner))
+    await asyncio.sleep(0.1)
+    settling.cancel()  # the worker is going down
+
+    with pytest.raises(asyncio.CancelledError):
+        await settling
+    inner.cancel()
+
+
+async def _noop_proc(job):
+    return None
