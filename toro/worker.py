@@ -529,7 +529,6 @@ class Worker:
         task.cancel()
 
     async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
-        self._cancelled += 1
         res = await self._move_to_cancelled(
             keys=[
                 self.keys.active,
@@ -544,8 +543,12 @@ class Worker:
             args=[job.id, _now_ms(), self.token, scripts.METRICS_RETENTION_MS],
         )
         if int(res) < 0:
+            # its lock is gone, so nothing was committed: a removal took the job, or
+            # another worker did. Counting it would report a cancellation the queue
+            # has no record of.
             await self._finish_lost(job.id)
             return None
+        self._cancelled += 1
         self._emit("cancelled", job)
         return None
 

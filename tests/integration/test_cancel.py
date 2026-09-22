@@ -682,3 +682,24 @@ async def test_retrying_a_job_clears_an_unacted_cancellation(q, run_worker, run_
 
     assert runs == [job.id, job.id]  # it really ran again
     assert (await q.get_job(job.id)).cancel_reason is None
+
+
+async def test_a_worker_counts_only_the_cancellations_it_committed(q, run_worker, run_until):
+    """Removing a running job stops its processor, but the commit that follows owns no
+    lock and lands nothing. Counting it would show a worker that cancelled a job the
+    queue has no record of."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2) as w:
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.remove_job(job.id) is True
+        await asyncio.sleep(0.4)
+
+        assert (await q.counts())["cancelled"] == 0  # the queue recorded nothing
+        assert w._cancelled == 0, "a worker counted a cancellation it never committed"
