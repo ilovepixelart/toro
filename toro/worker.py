@@ -662,7 +662,7 @@ class Worker:
     # ---- locks & recovery -------------------------------------------------
 
     async def _subscribe_cancels(self) -> PubSub | None:
-        """Subscribe to the events channel, confirmed. Returns None if Redis would not
+        """Subscribe to the cancel channel, confirmed. Returns None if Redis would not
         confirm: the lock renewal is the backstop, so a worker starts either way.
         """
         pubsub = self.redis.pubsub()

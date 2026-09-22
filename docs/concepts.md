@@ -87,18 +87,20 @@ processors `await`-y.
 
 toro publishes events to a Redis pub/sub channel: `added` when a job is enqueued
 (published by the add script, atomically with the enqueue), `progress` from a running processor
-(`job.update_progress`), and `completed` / `failed`, which the finish Lua scripts
-publish atomically with the state change. `failed` fires only on terminal failure,
-not on a retry. Two things consume the channel:
+(`job.update_progress`), and `completed` / `failed` / `cancelled`, which the finish Lua
+scripts publish atomically with the state change. `failed` fires only on terminal failure,
+not on a retry. A second channel carries cancellation requests to workers and nothing
+else, so a worker is not woken by every job in the queue. Two things consume the
+events channel:
 
 - **`await job.result()`** (or `queue.result(job_id)`) on the producer side
   subscribes and waits for the terminal event, returning the value or raising
-  `JobFailedError`.
+  `JobFailedError`, or `JobCancelledError` if the job was cancelled.
 - **A dashboard** (such as [matador](https://github.com/ilovepixelart/matador))
   subscribes to refresh live as state changes.
 
 `Worker.on(event, fn)` lets a worker react to its own lifecycle with in-process
-callbacks (`completed`, `failed`, `retrying`, `stalled`, `lock-lost`,
+callbacks (`completed`, `failed`, `cancelled`, `retrying`, `stalled`, `lock-lost`,
 `rate-limited`) - separate from the pub/sub channel above. See
 [Processing jobs](processing.md).
 

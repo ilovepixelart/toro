@@ -178,7 +178,7 @@ async def test_cancelling_a_running_job_stops_its_processor(q, run_worker, run_u
 
 
 async def test_a_cancel_arrives_promptly(q, run_worker, run_until):
-    """CN-003: the events channel is what makes a cancellation prompt. With the lock
+    """CN-003: the cancel channel is what makes a cancellation prompt. With the lock
     backstop half a minute away, only the message can land it in time."""
     started = asyncio.Event()
 

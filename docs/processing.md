@@ -172,8 +172,19 @@ async def process(job):
 - **Nothing is raised into a processor that never awaits.** Cancellation is
   delivered at an await point, so a tight CPU loop runs to completion. Yield if you
   want to be interruptible.
-- **Work that must not be interrupted** can `await asyncio.shield(...)`, which
-  finishes it before the cancellation takes effect.
+- **Work that must not be interrupted** belongs in the unwinding, not behind
+  `asyncio.shield`. A shield does not hold the cancellation back: the processor is
+  cancelled at the shield straight away while the shielded task carries on orphaned,
+  which is the very outcome the next point warns about. Catch the cancellation, finish
+  what has to finish, then re-raise.
+
+  ```python
+  try:
+      await long_running()
+  except asyncio.CancelledError:
+      await commit_what_we_have()   # runs to completion
+      raise                         # and the job still ends cancelled
+  ```
 - **Do not swallow `CancelledError`.** A processor that catches it and returns
   normally does not complete the job: the worker knows it asked this one to stop, so
   the job still ends `cancelled` and the return value is thrown away. The same holds

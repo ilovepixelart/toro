@@ -464,7 +464,7 @@ class Queue:
             return
         event = data.get("event")
         if event not in ("completed", "failed", "cancelled"):
-            return  # non-terminal (e.g. "added", "progress", "cancel-requested")
+            return  # non-terminal (e.g. "added", "progress")
         job_id = str(data.get("jobId"))
         for fut in self._result_waiters.get(job_id, []):
             if fut.done():
