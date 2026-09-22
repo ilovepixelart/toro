@@ -61,12 +61,15 @@ so a child removed from `completed` by routine history cleanup
 (`clean("completed")`, `remove_job()`) costs the parent nothing: the parent's
 copy survives, and `flow_view()`'s `done` and `failed` still count it.
 
-[Retention](producing.md#retention) treats a flow as one unit. While the flow
-runs, its finished children are kept whatever the queue's bound does meanwhile:
-they are scored above every finish time in `completed` and `failed`, out of the
-trims' reach, and they neither count against the bound nor age out. Each is
-indexed under its root (`<root>:live`), so nothing that happens to a node in
-between can strand them. When the root settles, on any path, or is removed at
+[Retention](producing.md#retention) treats a flow as one unit. What keeps a
+finished job is its ROOT still running, not its parent: a parent can settle
+mid-flow (it failed under `on_fail="continue"`, say) while the root carries on.
+While the flow runs, its finished jobs are kept whatever the queue's bound does
+meanwhile: they are scored above every finish time in `completed` and `failed`,
+out of the trims' reach, and they neither count against the bound nor age out.
+Each is indexed under its root (`<root>:live`), so a node that disappears in
+between cannot strand the ones below it, and removing the flow takes them with
+it. When the root settles, on any path, or is removed at
 once by its own option, they are re-scored one above the root's finish time, so
 the root is the oldest of its flow: a trim reaches it first and removes the
 whole subtree in the same script. A child of a root that already settled

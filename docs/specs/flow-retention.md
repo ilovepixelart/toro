@@ -28,6 +28,9 @@ with it.
   (`ZCOUNT -inf LIVE` replaces `ZCARD`, same cost class), so live children are
   neither counted against the bound nor candidates for it. The trim path gains
   no per-candidate work.
+- **What keeps a finished job is its root, not its parent.** A parent can settle
+  mid-flow while the root carries on, and its children finishing afterwards still
+  belong to a running flow.
 - **Every live node is indexed under its root.** A finished child scored live
   is added to `<root>:live` (every flow node stores its `rootId` at enqueue).
   When the root settles (every terminal path goes through `recordFinished`) or
@@ -35,7 +38,8 @@ with it.
   re-scores each entry one above the root's finish time, so the root is the
   oldest of its flow and reaches the trim first. The index, not a walk over
   hashes, is what places them: a mid-level parent that disappears in between
-  (trimmed by an older worker, removed at once) cannot strand its leaves. When
+  (trimmed by an older worker, removed at once) cannot strand its leaves, and
+  deleting a job drains its index, so removing a flow takes its live jobs too. When
   a failed root is retried, `reviveSubtree` walks its children and scores every
   finished descendant `LIVE + now`, indexed again. An orphan (a child finishing
   after its root settled) is scored one above its own time, so a tie in the

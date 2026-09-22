@@ -840,21 +840,23 @@ class Queue:
         elif state == "waiting-children":
             ids = await self.redis.zrange(self.keys.waiting_children, start, end)
         elif state in ("completed", "failed"):
-            ids = await self._newest_finished(getattr(self.keys, state), start, end - start + 1)
+            count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
+            ids = await self._newest_finished(getattr(self.keys, state), start, count)
         else:
             raise ValueError(f"unknown state: {state}")
         return await self._hydrate_ids(_str_list(ids))
 
     async def _newest_finished(self, key: str, start: int, count: int) -> list[str]:
         """Page a finished set newest first: what has settled, then a running flow's
-        finished children, which score above SETTLED and are not "recent".
+        finished children, which score above SETTLED and are not "recent". A negative
+        `count` means to the end, which is how Redis reads it too.
         """
         settled = _str_list(await self.redis.zrevrangebyscore(key, SETTLED, "-inf", start, count))
-        if len(settled) == count:
+        if 0 <= count == len(settled):
             return settled
         skip = max(0, start - int(await self.redis.zcount(key, "-inf", SETTLED)))
         live = self.redis.zrevrangebyscore(
-            key, "+inf", scripts.LIVE_SCORE, skip, count - len(settled)
+            key, "+inf", scripts.LIVE_SCORE, skip, -1 if count < 0 else count - len(settled)
         )
         return settled + _str_list(await live)
 

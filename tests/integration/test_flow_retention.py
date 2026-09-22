@@ -18,6 +18,17 @@ from toro.scripts import LIVE_SCORE
 PREFIX = "torotest"
 
 
+async def _until(predicate, *, timeout: float = 10.0) -> None:
+    """Poll until true, or fail: an unbounded poll turns a broken product into a test
+    that runs to the CI runner's wall clock."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never held")
+
+
 async def _seed_history(q: Queue, n: int, *, newer_than_now: bool = False) -> list[str]:
     """`n` finished jobs, with hashes: older than anything live, or newer than it."""
     base = int(time.time() * 1000) + (60_000 if newer_than_now else -86_400_000)
@@ -150,8 +161,7 @@ async def test_settled_flow_rides_with_its_root(q, run_worker, run_until, path):
     async def proc(job):
         if job.name == "leaf1":
             # so the eager failure finds leaf2 AND side already settled
-            while (await q.counts())["completed"] < 2:  # noqa: ASYNC110 - a poll, in a test
-                await asyncio.sleep(0.01)
+            await _until(lambda: _count_state(q, "completed", 2))
             if path == "failed with a leaf":
                 raise RuntimeError("boom")
         if job.name == "report" and path == "failed by its worker":
@@ -555,16 +565,14 @@ async def test_readers_of_the_finished_sets_see_settled_jobs(q, run_worker, run_
     async with run_worker(q, _holding(gate, "slow"), concurrency=16):
         parts = [c("part", {"i": i}) for i in range(600)] + [c("slow", {})]
         root = await q.add_flow("report", {}, children=parts)
-        assert await run_until(lambda: q.redis.zcard(q.keys.completed), timeout=30)
-        while await q.redis.zcard(q.keys.completed) < 600:  # noqa: ASYNC110
-            await asyncio.sleep(0.02)
+        await _until(lambda: _at_least(q, q.keys.completed, 600), timeout=30)
         needle = await q.add("needle", {"tag": "needle"})
         await needle.result(timeout=10)
 
         assert (await q.counts())["completed"] == 601  # every completed job counts
         page = [j.id for j in await q.get_jobs("completed", 0, 4)]
         assert page[0] == needle.id and len(page) == 5  # then the flow's children
-        assert [j.id for j in await q.get_jobs("completed", 1, 2)] != [needle.id]  # paged past it
+        assert needle.id not in [j.id for j in await q.get_jobs("completed", 1, 2)]
         assert [j.id for j in await q.search("completed", "needle", 500)] == [needle.id]
         assert await q.clean("completed") == 1  # the needle; the flow's children stay
         assert await q.redis.zcard(q.keys.completed) == 600
@@ -631,8 +639,7 @@ async def test_retrying_a_child_under_a_settled_root_strands_nothing(q, run_work
 
     async def proc(job):
         if job.name == "leaf1":
-            while (await q.counts())["completed"] < 2:  # noqa: ASYNC110 - a poll, in a test
-                await asyncio.sleep(0.01)
+            await _until(lambda: _count_state(q, "completed", 2))
             raise RuntimeError("boom")
         return job.name
 
@@ -656,3 +663,126 @@ async def test_removing_a_running_flow_leaves_no_live_index(q, run_worker, run_u
 
     assert await q.redis.exists(q.keys.live(root.id)) == 0
     assert await _count_state(q, "completed", 0)
+
+
+# ---- what a second review found -----------------------------------------------------
+
+
+async def test_a_child_of_a_settled_parent_under_a_running_root_is_live(q, run_worker, run_until):
+    """FR-001: what keeps a job is its ROOT still running, not its parent. A parent can
+    settle mid-flow (it failed with `on_fail="continue"`, so the root carries on), and
+    its children finishing afterwards still belong to a running flow."""
+    slow_gate, held_gate = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        if job.name == "slow":
+            await slow_gate.wait()
+        if job.name == "held":
+            await held_gate.wait()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        mid = c("mid", {}, on_fail="continue", children=[c("bad", {}), c("slow", {})])
+        await q.add_flow("report", {}, children=[mid, c("held", {})])
+        assert await run_until(lambda: _count_state(q, "failed", 2), timeout=10)  # bad, mid
+
+        slow_gate.set()  # the root is still parked on `held`: the flow runs
+        assert await run_until(lambda: _count_state(q, "completed", 1), timeout=10)
+        slow = (await q.redis.zrange(q.keys.completed, 0, -1))[0]
+        assert (await _scores(q, [slow]))[slow] > LIVE_SCORE, "a running flow's job settled"
+
+        await _seed_history(q, DEFAULT_KEEP_COMPLETED, newer_than_now=True)
+        await (await q.add("unrelated", {})).result(timeout=10)
+        assert await _present(q, [slow]) == 1, "a running flow's job was trimmed"
+        held_gate.set()
+
+
+async def test_removing_a_flow_takes_its_live_jobs(q, run_worker, run_until):
+    """FR-004: a node between the root and its finished jobs can be gone (it removed
+    itself at once). Removing the flow must still take them: above every bound, nothing
+    else would ever reclaim them."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "held":
+            await gate.wait()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        mid = c("mid", {}, remove_on_complete=True, children=[c("leaf1", {}), c("leaf2", {})])
+        root = await q.add_flow("report", {}, children=[mid, c("held", {})])
+        assert await run_until(lambda: _count_state(q, "completed", 2), timeout=10)
+
+        assert await q.remove_job(root.id) is True
+        gate.set()
+
+    assert await _count_state(q, "completed", 0), "live jobs outlived their flow"
+    assert await q.redis.keys(q.keys.base + "*live") == []
+
+
+async def test_retrying_a_whole_flow_is_linear(q, run_worker, run_until):
+    """A retried root already revives its whole subtree; every descendant retried after
+    it must not revive that subtree again. `retry_flow` retries root first, so the work
+    would square with the size of the flow."""
+    depth = 40
+    tree = c("step", {"lvl": 0})
+    for lvl in range(1, depth):
+        tree = c("step", {"lvl": lvl}, children=[tree])
+
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, proc, concurrency=4) as w:
+        w.on("failed", lambda *a, **k: None)
+        root = await q.add_flow("chain-root", {}, children=[tree])
+        assert await run_until(lambda: _in_state(q, root.id, "failed"), timeout=30)
+
+    before = int((await q.redis.info("stats"))["total_commands_processed"])
+    assert await q.retry_flow(root.id) == depth + 1
+    spent = int((await q.redis.info("stats"))["total_commands_processed"]) - before
+
+    assert spent < 20 * (depth + 1), f"{spent} commands to retry {depth + 1} jobs"
+
+
+async def test_get_jobs_reads_a_finished_set_to_the_end(q, run_worker, run_until):
+    """`end < 0` means "to the end", as it does for every other state."""
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=4):
+        for i in range(3):
+            await (await q.add("job", {"i": i})).result(timeout=10)
+
+    assert len(await q.get_jobs("completed", 0, -1)) == 3
+    assert len(await q.get_jobs("completed", 1, -1)) == 2
+    assert len(await q.get_jobs("completed", 0, 1)) == 2  # an inclusive range, as before
+
+
+async def test_a_flow_from_before_this_version_is_not_stranded(q, run_worker, run_until):
+    """Flows enqueued by an older version have no `rootId`. Retrying a node of one must
+    not index its finished jobs under itself, where nothing would ever drain them."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "leaf1":
+            raise RuntimeError("boom")
+        if job.name == "held":
+            await gate.wait()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        mid = c("mid", {}, on_fail="continue", children=[c("leaf1", {}), c("leaf2", {})])
+        root = await q.add_flow("report", {}, children=[mid, c("held", {})])
+        for jid in [root.id, *(await _tree_ids(q, root.id))]:  # as an older version left it
+            await q.redis.hdel(q.keys.job(jid), "rootId")
+        assert await run_until(lambda: _count_state(q, "failed", 2), timeout=10)
+        tree = await q.get_flow(root.id)
+        assert tree is not None
+        mid_id = next(n["job"].id for n in tree["children"] if n["job"].name == "mid")
+
+        assert await q.retry_job(mid_id) is True
+        assert await q.redis.exists(q.keys.live(mid_id)) == 0
+        gate.set()
+
+
+async def _at_least(q: Queue, key: str, n: int) -> bool:
+    return await q.redis.zcard(key) >= n
