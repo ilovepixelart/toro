@@ -206,3 +206,23 @@ async def test_a_queue_leaves_a_connection_it_was_given_alone(q):
 
 async def _noop(job: Job) -> None:
     return None
+
+
+async def test_a_stopped_worker_gives_back_its_cancel_subscription(q):
+    """A worker subscribes for cancellations for as long as it runs. On a connection
+    the caller owns, `stop()` cannot disconnect the pool, so a subscription it fails
+    to close keeps a connection checked out and still subscribed: enough start/stop
+    cycles and every command blocks waiting for a free one."""
+    for _ in range(3):
+        worker = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis, stalled_interval=0)
+        task = asyncio.create_task(worker.run())
+        for _ in range(100):  # wait for the subscription to land
+            if await q.redis.pubsub_channels(q.keys.cancel):
+                break
+            await asyncio.sleep(0.02)
+        await worker.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert await q.redis.pubsub_channels(q.keys.cancel) == []

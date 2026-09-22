@@ -191,6 +191,10 @@ class Worker:
         # not in here is the worker shutting down, which must not commit a cancel.
         self._processors: dict[str, asyncio.Task[Any]] = {}
         self._cancelling: set[str] = set()
+        # Held on the instance, not inside the listener: stop() cancels that task while
+        # it waits on a message, so a close in its own `finally` may never be reached,
+        # and a caller-owned pool is not disconnected for us. Same shape as Queue.
+        self._cancel_pubsub: PubSub | None = None
         # "running" until a graceful stop flips it to "stopping" - the dashboard shows
         # a live "draining" state, and a worker that then vanishes was mid-shutdown,
         # not a crash. (The only honest way to know graceful; absence can't say why.)
@@ -269,6 +273,7 @@ class Worker:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._close_cancel_pubsub()
         with contextlib.suppress(Exception):
             await self._deregister()  # drop our presence record so we vanish at once
         await self.redis.aclose(close_connection_pool=self._owns_connection)
@@ -667,6 +672,7 @@ class Worker:
             with contextlib.suppress(Exception):
                 await pubsub.aclose()
             return None
+        self._cancel_pubsub = pubsub
         return pubsub
 
     async def _cancel_listener(self, pubsub: PubSub | None) -> None:
@@ -695,11 +701,17 @@ class Worker:
                 raise
             except Exception:  # pragma: no cover - reconnect; the lock still backstops
                 logger.debug("cancel listener lost its subscription; retrying")
-                with contextlib.suppress(Exception):
-                    await pubsub.aclose()
+                await self._close_cancel_pubsub()
                 pubsub = None
-        with contextlib.suppress(Exception):
-            await pubsub.aclose() if pubsub is not None else None
+
+    async def _close_cancel_pubsub(self) -> None:
+        """Give the subscription's connection back. On a pool the caller owns, nothing
+        else will: `aclose()` there leaves it checked out and still subscribed.
+        """
+        pubsub, self._cancel_pubsub = self._cancel_pubsub, None
+        if pubsub is not None:
+            with contextlib.suppress(Exception):
+                await pubsub.aclose()
 
     async def _renew_loop(self, job_id: str) -> None:
         interval = self.lock_renew_time / 1000
