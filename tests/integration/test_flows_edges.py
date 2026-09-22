@@ -230,12 +230,14 @@ async def test_clean_completed_preserves_pending_parent_results(q, run_worker, r
         parent = await q.add_flow("report", {}, children=[c("fast", {}), c("slow", {})])
         assert await run_until(_count_is(q, "completed", 1))  # fast child done, slow running
 
-        # routine history cleanup while the flow is still in flight must not
-        # destroy the parent's already-collected results
-        assert await q.clean("completed") == 1
-        assert await run_until(_count_is(q, "completed", 2))  # slow child + parent
+        # routine history cleanup while the flow is in flight leaves the flow alone:
+        # its finished child is not history yet
+        assert await q.clean("completed") == 0
+        assert await run_until(_count_is(q, "completed", 3))  # both children + parent
 
     assert (await q.get_job(parent.id)).returnvalue == ["fast-done", "slow-done"]
+    assert await q.clean("completed") == 3  # settled now: the flow is history, whole
+    assert await _count(q, "completed") == 0
 
 
 async def test_retried_continue_child_rejoins_the_barrier(q, run_worker, run_until):

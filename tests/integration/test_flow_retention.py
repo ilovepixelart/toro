@@ -11,7 +11,7 @@ import time
 import pytest
 
 from toro import FlowChild as c  # noqa: N813 - `c("part", ...)` keeps trees readable
-from toro import JobFailedError, Queue, Worker
+from toro import JobFailedError, Queue, Worker, scripts
 from toro.job import DEFAULT_KEEP_COMPLETED
 from toro.scripts import LIVE_SCORE
 
@@ -129,10 +129,12 @@ async def _nested(q: Queue) -> tuple[str, dict[str, str]]:
 
 
 def _placed(scores: dict[str, float], names: dict[str, str], root_score: float) -> None:
-    depth = {"report": 0, "mid": 1, "side": 1, "leaf1": 2, "leaf2": 2}
-    for name, d in depth.items():
-        assert scores[names[name]] == root_score + d, (name, scores[names[name]], root_score)
+    """The root at its finish time, every descendant one above it: the root is the
+    oldest of its flow, and a trim reaches it first."""
     assert root_score < LIVE_SCORE
+    assert scores[names["report"]] == root_score
+    for name in ("mid", "side", "leaf1", "leaf2"):
+        assert scores[names[name]] == root_score + 1, (name, scores[names[name]], root_score)
 
 
 async def _settled(q: Queue, root_id: str) -> bool:
@@ -144,13 +146,12 @@ async def test_settled_flow_rides_with_its_root(q, run_worker, run_until, path):
     """FR-003: whichever way the root settles, every finished descendant is re-scored
     to the root's finish time plus its depth: the root is the oldest of its flow, so
     the trim reaches it first and takes the subtree with it."""
-    leaf2_done = asyncio.Event()
 
     async def proc(job):
-        if job.name == "leaf2":
-            leaf2_done.set()
         if job.name == "leaf1":
-            await leaf2_done.wait()  # so the eager failure finds leaf2 already settled
+            # so the eager failure finds leaf2 AND side already settled
+            while (await q.counts())["completed"] < 2:  # noqa: ASYNC110 - a poll, in a test
+                await asyncio.sleep(0.01)
             if path == "failed with a leaf":
                 raise RuntimeError("boom")
         if job.name == "report" and path == "failed by its worker":
@@ -452,3 +453,143 @@ async def _hashes(q: Queue, ids: list[str]) -> dict[str, dict]:
     for jid in ids:
         pipe.hgetall(q.keys.job(jid))
     return dict(zip(ids, await pipe.execute(), strict=True))
+
+
+# ---- the holes a review found -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_root_removed_at_once_leaves_settled_children(q, run_worker, run_until, outcome):
+    """A root with `remove_on_complete=True` (or a failing one with `remove_on_fail=True`)
+    is deleted the moment it settles. Its children were scored live; with the root
+    gone nothing would ever place them, and they would sit above every bound forever.
+    They are placed as the root goes, and trimmed like any settled job afterwards."""
+
+    async def proc(job):
+        if job.name == "report" and outcome == "failed":
+            raise RuntimeError("boom")
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        root = await q.add_flow(
+            "report",
+            {},
+            children=[c("a", {}), c("b", {})],
+            remove_on_complete=True,
+            remove_on_fail=True,
+        )
+        assert await run_until(lambda: _gone(q, root.id), timeout=10)
+        done = await q.redis.zrange(q.keys.completed, 0, -1)
+        assert sorted(done) != [] and all(
+            s < LIVE_SCORE for s in (await _scores(q, done)).values()
+        ), "children left live with no root to place them"
+
+        await (await q.add("unrelated", {}, remove_on_complete=1)).result(timeout=10)
+
+    assert await _present(q, done) == 0  # trimmed by rank, as any settled job
+    assert await _count_state(q, "completed", 1)
+
+
+async def test_a_mid_gone_while_its_leaves_are_live_does_not_strand_them(q, run_worker, run_until):
+    """An older worker in a mixed fleet trims a live mid by rank, hash and all. Its
+    leaves are still live; when the root settles they must be placed all the same."""
+    gate = asyncio.Event()
+    async with run_worker(q, _holding(gate, "slow"), concurrency=4):
+        mid = c("mid", {}, children=[c("leaf1", {}), c("leaf2", {})])
+        root = await q.add_flow("report", {}, children=[mid, c("slow", {})])
+        assert await run_until(lambda: _count_state(q, "completed", 3), timeout=10)
+        tree = await q.get_flow(root.id)
+        assert tree is not None
+        mid_node = next(n for n in tree["children"] if n["job"].name == "mid")
+        mid_id = mid_node["job"].id
+        leaves = [n["job"].id for n in mid_node["children"]]
+        # what an old worker's rank trim does to the mid: hash and entry, no cascade
+        await q.redis.delete(q.keys.job(mid_id))
+        await q.redis.zrem(q.keys.completed, mid_id)
+        gate.set()
+        assert await root.result(timeout=10) == ["mid", "slow"]
+
+    scores = await _scores(q, leaves)
+    assert len(scores) == 2 and all(s < LIVE_SCORE for s in scores.values()), scores
+
+
+async def test_the_cascade_keeps_what_is_kept_forever(q, run_worker, run_until):
+    """A tolerated failure under a queue that keeps every failed job: the root's trim
+    takes the flow, but not a job whose own option says keep everything."""
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return job.name
+
+    producer = Queue(q.name, prefix=PREFIX, default_job_options={"remove_on_fail": False})
+    try:
+        async with run_worker(q, proc, concurrency=4):
+            root = await producer.add_flow(
+                "report", {}, children=[c("bad", {}, on_fail="continue"), c("a", {})]
+            )
+            assert await run_until(lambda: _settled(q, root.id), timeout=10)
+            bad = (await q.redis.zrange(q.keys.failed, 0, -1))[0]
+
+            await (await producer.add("unrelated", {}, remove_on_complete=1)).result(timeout=10)
+    finally:
+        await producer.close()
+
+    assert await _gone(q, root.id)
+    assert await _present(q, [bad]) == 1, "a job kept forever went with its root"
+    assert (await _scores(q, [bad]))[bad] < LIVE_SCORE
+
+
+async def test_the_live_boundary_is_exact(q):
+    """Lua formats a number it concatenates with %.14g: `"(" .. LIVE` would read as
+    LIVE + 4. The boundary the trims send to Redis is the exact integer."""
+    bound = await q.redis.eval(scripts._LIB + "return LIVE_BOUND", 0)
+    assert bound == f"({LIVE_SCORE}"
+
+
+async def test_readers_of_the_finished_sets_see_settled_jobs(q, run_worker, run_until):
+    """Newest-first readers (`get_jobs`, `search`, `retry_all_failed`) put what has
+    settled first: a running flow's finished children score above every timestamp
+    and are not "recent". `clean` removes settled history only."""
+    gate = asyncio.Event()
+    async with run_worker(q, _holding(gate, "slow"), concurrency=16):
+        parts = [c("part", {"i": i}) for i in range(600)] + [c("slow", {})]
+        root = await q.add_flow("report", {}, children=parts)
+        assert await run_until(lambda: q.redis.zcard(q.keys.completed), timeout=30)
+        while await q.redis.zcard(q.keys.completed) < 600:  # noqa: ASYNC110
+            await asyncio.sleep(0.02)
+        needle = await q.add("needle", {"tag": "needle"})
+        await needle.result(timeout=10)
+
+        assert (await q.counts())["completed"] == 601  # every completed job counts
+        page = [j.id for j in await q.get_jobs("completed", 0, 4)]
+        assert page[0] == needle.id and len(page) == 5  # then the flow's children
+        assert [j.id for j in await q.get_jobs("completed", 1, 2)] != [needle.id]  # paged past it
+        assert [j.id for j in await q.search("completed", "needle", 500)] == [needle.id]
+        assert await q.clean("completed") == 1  # the needle; the flow's children stay
+        assert await q.redis.zcard(q.keys.completed) == 600
+        gate.set()
+        assert len(await root.result(timeout=30)) == 601
+
+
+async def test_an_orphan_is_never_older_than_its_root(q):
+    """Two stalled siblings swept in one script: the first fails the root, the second
+    finishes an orphan in the same millisecond. Ranked before its root by a tie, it
+    would be trimmed first and leave the tree partial."""
+    for _ in range(8):  # so the root is "9" and its children "10", "11": "11" < "9"
+        await q.add("filler", {})
+    root = await q.add_flow("report", {}, children=[c("a", {}), c("b", {})])
+    tree = await q.get_flow(root.id)
+    assert tree is not None
+    kids = [n["job"].id for n in tree["children"]]
+    assert root.id == "9" and kids == ["10", "11"]
+    for cid in kids:  # both claimed, both workers dead
+        await q.redis.zrem(q.keys.prioritized, cid)
+        await q.redis.rpush(q.keys.active, cid)
+    w = Worker(q.name, lambda j: None, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+    await w.check_stalled(throttle_ms=0)
+    failed, _ = await w.check_stalled(throttle_ms=0)
+    assert sorted(failed) == sorted(kids)
+
+    ranked = await q.redis.zrange(q.keys.failed, 0, -1)
+    assert ranked[0] == root.id, ranked

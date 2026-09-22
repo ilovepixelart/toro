@@ -69,6 +69,8 @@ _CONSTANTS = (
     f"local DEFAULT_KEEP_COMPLETED = {DEFAULT_KEEP_COMPLETED}\n"
     f"local DEFAULT_KEEP_FAILED = {DEFAULT_KEEP_FAILED}\n"
     f"local LIVE = {LIVE_SCORE}\n"
+    # as a string: Lua formats a number it concatenates with %.14g, four short of LIVE
+    f'local LIVE_BOUND = "({LIVE_SCORE}"\n'
 )
 
 # Shared routines, prepended to every script that enqueues or acquires a job.
@@ -168,7 +170,8 @@ end
 local function delJobs(ids, base)
   for _, id in ipairs(ids) do
     redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
-               base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail")
+               base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail",
+               base .. id .. ":live")
     redis.call("ZREM", base .. "children", id)  -- prune the flow-child index (hygiene)
   end
 end
@@ -262,10 +265,17 @@ local function inRunningFlow(base, jobKey)
   local pstate = redis.call("HGET", base .. parentId, "state")
   return pstate and pstate ~= "completed" and pstate ~= "failed"
 end
+-- Whether a job's own option keeps every job in its set: the one thing a cascade
+-- may not remove, whatever happens to the root.
+local function keptForever(base, jobId, state)
+  local keepCount, keepAge = keepFor(redis.call("HGET", base .. jobId, "opts"), state)
+  return keepCount < 0 and keepAge < 0
+end
 -- Remove a finished job and, with it, the finished subtree of a flow it roots: the
 -- trim reaches a root first (it is the oldest of its flow) and a partial flow is
 -- worth nothing. Returns how many jobs went, which the trim budget pays for. A
 -- descendant still running is left; it settles as an orphan and is trimmed alone.
+-- A descendant kept forever by its own option stays, as an orphan.
 local function removeFinished(base, jobId)
   local meta = redis.call("HMGET", base .. jobId, "state", "children")
   if meta[1] ~= "completed" and meta[1] ~= "failed" then return 0 end
@@ -273,37 +283,77 @@ local function removeFinished(base, jobId)
   delJobs({jobId}, base)
   local gone = 1
   if meta[2] then
-    for _, cid in ipairs(cjson.decode(meta[2])) do gone = gone + removeFinished(base, cid) end
+    for _, cid in ipairs(cjson.decode(meta[2])) do
+      local cstate = redis.call("HGET", base .. cid, "state")
+      if (cstate == "completed" or cstate == "failed") and not keptForever(base, cid, cstate) then
+        gone = gone + removeFinished(base, cid)
+      end
+    end
   end
   return gone
 end
--- Re-score every finished descendant of a job to `score + depth`, in whichever
--- finished set holds it. Two callers: a root that settles (score = its finish time,
--- so it is the oldest of its flow and the trim reaches it first, taking the subtree
--- with it) and a failed root that is retried (score = LIVE + now: the flow runs
--- again). A descendant still running places its own subtree when it settles.
-local function placeSubtree(base, jobId, score, depth)
+-- The live index of a flow: `<root>:live`, every finished descendant scored
+-- LIVE while the flow runs. Indexed under the ROOT, not the parent, so a mid-level
+-- parent that disappears (trimmed by an older worker) cannot strand its leaves.
+local function liveIndex(base, jobKey)
+  local rootId = redis.call("HGET", jobKey, "rootId")
+  if not rootId then  -- a flow from before rootId was stored: walk up
+    local pid = redis.call("HGET", jobKey, "parentId")
+    while pid do
+      rootId = pid
+      pid = redis.call("HGET", base .. pid, "parentId")
+    end
+  end
+  return base .. rootId .. ":live"
+end
+-- A root has settled (or is being removed at once): its live descendants become
+-- settled jobs, scored just above the root so the root is the oldest of its flow
+-- and a trim reaches it first, taking the subtree with it.
+local function settleLive(base, rootId, now)
+  local key = base .. rootId .. ":live"
+  for _, cid in ipairs(redis.call("ZRANGE", key, 0, -1)) do
+    local cstate = redis.call("HGET", base .. cid, "state")
+    if cstate == "completed" or cstate == "failed" then
+      redis.call("ZADD", base .. cstate, now + 1, cid)
+    end
+  end
+  redis.call("DEL", key)
+end
+-- A settled root runs again (a retry): its finished descendants are live again,
+-- scored LIVE and indexed, until the flow settles once more.
+local function reviveSubtree(base, rootId, jobId, now)
   local children = redis.call("HGET", base .. jobId, "children")
   if not children then return end
   for _, cid in ipairs(cjson.decode(children)) do
-    local state = redis.call("HGET", base .. cid, "state")
-    if state == "completed" or state == "failed" then
-      redis.call("ZADD", base .. state, score + depth, cid)
-      placeSubtree(base, cid, score, depth + 1)
+    local cstate = redis.call("HGET", base .. cid, "state")
+    if cstate == "completed" or cstate == "failed" then
+      redis.call("ZADD", base .. cstate, LIVE + now, cid)
+      redis.call("ZADD", base .. rootId .. ":live", now, cid)
     end
+    reviveSubtree(base, rootId, cid, now)
   end
 end
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state)
   local keepCount, keepAge = keepFor(redis.call("HGET", jobKey, "opts"), state)
+  local live = inRunningFlow(base, jobKey)
+  local score = now
+  if live then
+    score = LIVE + now
+  elseif redis.call("HEXISTS", jobKey, "parentId") == 1 then
+    score = now + 1  -- an orphan is never older than its root, whatever the tie
+  end
   if keepCount == 0 and keepAge < 0 then
+    settleLive(base, jobId, now)  -- removed at once: nothing else would place them
     delJobs({jobId}, base)
     return
   end
-  local score = now
-  if inRunningFlow(base, jobKey) then score = LIVE + now end
   redis.call("ZADD", setKey, score, jobId)
   redis.call("HSET", jobKey, prop, val, "finishedOn", now, "state", state)
-  if score == now then placeSubtree(base, jobId, now, 1) end
+  if live then
+    redis.call("ZADD", liveIndex(base, jobKey), now, jobId)
+  else
+    settleLive(base, jobId, now)
+  end
   if keepAge >= 0 and trimBudget > 0 then
     local cutoff = now - keepAge * 1000
     local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
@@ -316,7 +366,7 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
   -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
   if keepCount > 0 and trimBudget > 0 then
     -- the bound counts what has settled: a running flow's children sit above LIVE
-    local excess = redis.call("ZCOUNT", setKey, "-inf", "(" .. LIVE) - keepCount
+    local excess = redis.call("ZCOUNT", setKey, "-inf", LIVE_BOUND) - keepCount
     if excess > 0 then
       local victims = redis.call("ZRANGE", setKey, 0, math.min(excess, trimBudget) - 1)
       for _, id in ipairs(victims) do
@@ -463,7 +513,7 @@ local base = KEYS[2]
 local now = tonumber(ARGV[1])
 local retention = tonumber(ARGV[3])
 local total = 0
-local function createNode(node, parentId)
+local function createNode(node, parentId, rootId)
   local jobId = tostring(redis.call("INCR", KEYS[1]))
   local jobKey = base .. jobId
   total = total + 1
@@ -471,13 +521,14 @@ local function createNode(node, parentId)
     "id", jobId, "name", node.name, "data", node.data, "opts", node.opts,
     "timestamp", now, "attemptsMade", 0, "priority", node.priority)
   if parentId then
-    redis.call("HSET", jobKey, "parentId", parentId, "onFail", node.onFail)
+    -- rootId: where a finished node is indexed while its flow runs (see recordFinished)
+    redis.call("HSET", jobKey, "parentId", parentId, "onFail", node.onFail, "rootId", rootId)
     redis.call("ZADD", base .. "children", now, jobId)  -- index as a flow child (ROOTS listing)
   end
   if node.children and #node.children > 0 then
     local cids = {}
     for i, child in ipairs(node.children) do
-      cids[i] = createNode(child, jobId)
+      cids[i] = createNode(child, jobId, rootId or jobId)
     end
     redis.call("SADD", jobKey .. ":deps", unpack(cids))
     redis.call("HSET", jobKey, "children", cjson.encode(cids),
@@ -496,7 +547,7 @@ local function createNode(node, parentId)
   end
   return jobId
 end
-local rootId = createNode(cjson.decode(ARGV[2]), false)
+local rootId = createNode(cjson.decode(ARGV[2]), false, false)
 -- one metrics increment and one announce for the whole tree: per-node events
 -- have no result() waiter, and every pub/sub subscriber would pay for them
 recordMetrics(base, "added", now, 0, retention, nil, total)
@@ -711,7 +762,14 @@ RETRY_JOB = (
 if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
 redis.call("HDEL", KEYS[4], "failedReason", "finishedOn")
 local base = KEYS[6]
-placeSubtree(base, ARGV[1], LIVE + tonumber(ARGV[2]), 1)  -- the flow runs again
+-- the flow runs again: its finished descendants are live until it settles once more.
+-- A retried CHILD revives nothing unless its root is running: under a settled root
+-- the leaves would be indexed where nothing drains them.
+local rootId = redis.call("HGET", KEYS[4], "rootId") or ARGV[1]
+local rstate = redis.call("HGET", base .. rootId, "state")
+if rootId == ARGV[1] or (rstate and rstate ~= "completed" and rstate ~= "failed") then
+  reviveSubtree(base, rootId, ARGV[1], tonumber(ARGV[2]))
+end
 local parentId = redis.call("HGET", KEYS[4], "parentId")
 if parentId then
   redis.call("HDEL", base .. parentId .. ":cfail", ARGV[1])
