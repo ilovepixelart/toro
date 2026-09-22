@@ -416,6 +416,36 @@ async def test_the_events_dispatcher_is_live_before_a_result_waits(q):
             await waiter.close()
 
 
+class _MuteSubscription:
+    """A subscription Redis never confirms."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def subscribe(self, *_channels: str) -> None:
+        return None
+
+    async def get_message(self, timeout: float) -> None:
+        await asyncio.sleep(timeout)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_an_unconfirmed_subscription_gives_up_and_closes(q, monkeypatch):
+    """Redis never answers the SUBSCRIBE: the wait says so rather than hanging, and the
+    half-made subscription is closed instead of holding a pool connection."""
+    monkeypatch.setattr("toro.queue.SUBSCRIBE_TIMEOUT", 0.05)
+    mute = _MuteSubscription()
+    monkeypatch.setattr(q.redis, "pubsub", lambda *a, **kw: mute)
+
+    with pytest.raises(TimeoutError, match="did not confirm"):
+        await q.result("1", timeout=5)
+
+    assert mute.closed
+    assert q._events_task is None
+
+
 async def test_result_reads_a_job_that_removed_itself(q, run_worker):
     """`remove_on_complete=True` deletes the job inside the finish script, so its value
     can only come from the event. Repeated: the window is a race with Redis."""

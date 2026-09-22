@@ -96,7 +96,7 @@ def _percentile(buckets: list[int], q: float) -> int:
 SUBSCRIBE_TIMEOUT = 5.0
 
 
-async def _confirm_subscribed(pubsub: PubSub, timeout: float = SUBSCRIBE_TIMEOUT) -> None:
+async def _confirm_subscribed(pubsub: PubSub) -> None:
     """Wait until Redis has confirmed the subscription.
 
     `subscribe()` returns once the command is WRITTEN, not once it has taken effect: a
@@ -105,7 +105,7 @@ async def _confirm_subscribed(pubsub: PubSub, timeout: float = SUBSCRIBE_TIMEOUT
     read the outcome from.
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+    deadline = loop.time() + SUBSCRIBE_TIMEOUT
     while True:
         left = deadline - loop.time()
         if left <= 0:
