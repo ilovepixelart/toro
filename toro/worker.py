@@ -626,7 +626,7 @@ class Worker:
         """
         pubsub = self.redis.pubsub()
         try:
-            await pubsub.subscribe(self.keys.events)
+            await pubsub.subscribe(self.keys.cancel)
             await confirm_subscribed(pubsub)
         except Exception:  # pragma: no cover - the listener retries in the background
             logger.debug("cancel subscription not ready; the lock renewal backstops it")
@@ -654,10 +654,9 @@ class Worker:
                     )
                     if msg is None:
                         continue
-                    with contextlib.suppress(ValueError, TypeError, KeyError):
-                        payload = json.loads(msg["data"])
-                        if payload.get("event") == "cancel-requested":
-                            self._request_cancel(str(payload["jobId"]))
+                    # the channel carries nothing but job ids, so there is nothing to
+                    # parse and nothing to filter: everything here is a cancellation
+                    self._request_cancel(str(msg["data"]))
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - reconnect; the lock still backstops

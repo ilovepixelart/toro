@@ -88,6 +88,13 @@ class Keys:
         return f"{self.base}limiter"
 
     @property
+    def cancel(self) -> str:
+        # Pub/sub channel carrying ONLY cancellation requests. Separate from `events`
+        # on purpose: that one carries a message per job, and a worker subscribed to it
+        # would parse the whole firehose to catch something that happens rarely.
+        return f"{self.base}cancel"
+
+    @property
     def cancelled(self) -> str:
         # ZSET of jobs stopped on purpose, scored like the other finished sets.
         return f"{self.base}cancelled"

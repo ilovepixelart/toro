@@ -1051,6 +1051,7 @@ class Queue:
                 self.keys.cancelled,
                 self.keys.base,
                 self.keys.events,
+                self.keys.cancel,
             ],
             args=[str(job_id), _now_ms(), scripts.METRICS_RETENTION_MS],
         )

@@ -1029,7 +1029,7 @@ return 1
 # Cancellation commits through recordFinished, so it hands a concurrency key on,
 # settles a flow parent and applies retention exactly as any other finish does.
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] held  KEYS[4] waiting-children
-# KEYS[5] cancelled  KEYS[6] key base  KEYS[7] events channel
+# KEYS[5] cancelled  KEYS[6] key base  KEYS[7] events channel  KEYS[8] cancel channel
 # ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] metricsRetention(ms)
 # Returns 0 (nothing to cancel), 1 (cancelled here) or 2 (a running job was asked).
 CANCEL_JOB = (
@@ -1048,8 +1048,9 @@ local function cancelOne(jobId)
   if not state or isFinished(state) then return meta[2] end
   if state == "active" then
     redis.call("HSET", jobKey, "cancel", "1")
-    redis.call("PUBLISH", KEYS[7],
-      cjson.encode({jobId = jobId, event = "cancel-requested"}))
+    -- to the workers' own channel: `events` carries a message per job, and a worker
+    -- listening there would parse every one of them to catch this
+    redis.call("PUBLISH", KEYS[8], jobId)
     return meta[2]
   end
   if state == "wait" then redis.call("ZREM", KEYS[1], jobId)

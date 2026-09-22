@@ -28,8 +28,11 @@ told so rather than left waiting.
   way for a job to end.
 - **No retry.** A cancelled job has been told not to run. `attempts` does not apply,
   and `retry_job()` on one returns False, as it does for a job that never failed.
-- **Two deliveries, one meaning.** Promptness comes from a message on the events
-  channel; correctness comes from `EXTEND_LOCK`, which every running job already
+- **Two deliveries, one meaning.** Promptness comes from a message on `<base>cancel`,
+  a channel carrying nothing but cancellations: `events` carries one message per job,
+  and a worker listening there parses the whole firehose to catch something rare.
+  The terminal `cancelled` event still goes to `events`, where `result()` and the
+  dashboards read it: the split is by audience. Correctness comes from `EXTEND_LOCK`, which every running job already
   calls every `lock_renew_time` and which already returns a signal the worker acts
   on. It gains a "cancel requested" answer. A dropped message therefore costs
   latency, never the cancellation: the backstop cannot be missed, because a worker
@@ -53,14 +56,14 @@ told so rather than left waiting.
 |---|---|---|
 | CN-001 | `cancel_job()` on a job that has not started ends it at once, with no worker running: it is `cancelled`, in no other collection, and never runs. Covers `wait`, `delayed` and `held`. | `tests/integration/test_cancel.py::test_a_job_that_has_not_started_is_cancelled_at_once` (parametrized) |
 | CN-002 | `cancel_job()` on an ACTIVE job stops its processor where it awaits, and the processor's `finally` runs. The job lands in `cancelled`. | `::test_cancelling_a_running_job_stops_its_processor` |
-| CN-003 | The cancellation reaches the worker over the events channel within a fraction of the lock-renew interval, and reaches it through `EXTEND_LOCK` even when the message never arrives. | `::test_a_cancel_arrives_promptly`, `::test_a_cancel_with_no_message_still_lands` |
+| CN-003 | The cancellation reaches the worker over `<base>cancel` within a fraction of the lock-renew interval, and reaches it through `EXTEND_LOCK` even when the message never arrives. | `::test_a_cancel_arrives_promptly`, `::test_a_cancel_with_no_message_still_lands` |
 | CN-004 | A cancelled job is terminal: it does not retry however many `attempts` remain, `retry_job()` returns False, and no further attempt is recorded. | `::test_a_cancelled_job_does_not_retry` |
 | CN-005 | `cancelled` is a state everywhere: `counts()`, `roots_counts()`, `get_jobs`, `get_jobs_roots`, `search`, `remove_job`, `clean`. Retention applies to it under `remove_on_fail`. | `::test_cancelled_is_a_state` |
-| CN-006 | Cancelling frees what the job held: a concurrency-key holder hands the key on, a held job leaves its key's queue, a flow parent settles its children, a global-concurrency slot is released. | `::test_cancelling_frees_what_the_job_held` (parametrized) |
+| CN-006 | Cancelling frees what the job held: a concurrency-key holder hands the key on, a held job leaves its key's queue, and a cancelled child settles its parent by the parent's own `on_fail` policy. | `::test_cancelling_a_held_job_leaves_its_keys_queue`, `::test_cancelling_a_key_holder_hands_the_key_on`, `::test_a_cancelled_child_settles_its_parent_by_policy` |
 | CN-007 | Cancelling a flow parent cancels its whole subtree, running children included. | `::test_cancelling_a_flow_takes_its_subtree` |
 | CN-008 | `result()` on a cancelled job raises `JobCancelledError`, whether it was waiting when the cancel landed or asked afterwards. | `::test_result_reports_a_cancellation` |
 | CN-009 | `cancel_job()` on a job that is already terminal, or absent, returns False and changes nothing. | `::test_cancelling_what_cannot_be_cancelled` |
-| CN-010 | A worker with no cancellations pays nothing measurable: the claim and finish paths are unchanged, and the subscription is one per worker, not one per job. | measured, as in `concurrency-key.md` |
+| CN-010 | A worker with no cancellations pays nothing measurable: the claim and finish paths are unchanged, and the subscription is one per worker, on a channel carrying nothing but cancellations. | measured against main, interleaved runs of 5,000 jobs at concurrency 20: 9,600 against 9,170 jobs/s. Subscribed to the general `events` channel instead, the same measurement read 8,560: a worker parsed one message per job to catch a rare one. Pinned by `::test_a_worker_does_not_listen_to_the_job_firehose` |
 
 ## Out of scope
 
@@ -77,6 +80,10 @@ told so rather than left waiting.
   completion for a job the queue has already cancelled. The commit is token-guarded
   and the job is no longer active, so it commits nothing, and the worker reports it
   as a lost lock. Documented on the consuming page.
+- **A worker subscribes before its first claim**, so a job it is running is always
+  one it can hear about. Subscribed afterwards, the claim path (which wakes on the
+  marker) starts a processor before the subscribe round trip lands, and every
+  cancellation of a just-started job waits out a lock renewal.
 - **The worker gains a subscription**, so it gains a connection and a reconnect path.
   It follows the shape `Queue._ensure_dispatcher` already uses, confirmation of the
   subscribe included, and a stream that dies falls back to the lock backstop rather

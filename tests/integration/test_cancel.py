@@ -278,3 +278,25 @@ async def test_result_reports_a_cancellation(q):
         await waiting
     with pytest.raises(JobCancelledError):  # and asking after the fact
         await q.result(job.id, timeout=5)
+
+
+async def test_a_worker_does_not_listen_to_the_job_firehose(q, run_worker, run_until):
+    """CN-010: `events` carries a message per job. A worker subscribed there parses
+    every one of them to catch a cancellation, which measured as a 7% throughput cost
+    before cancellations got a channel of their own."""
+
+    async def proc(job):
+        return job.name
+
+    async with run_worker(q, proc, concurrency=2):
+        assert await run_until(lambda: _subscribed(q, q.keys.cancel), timeout=5), (
+            "the worker never subscribed for cancellations"
+        )
+
+        listening = await q.redis.pubsub_channels(q.keys.base + "*")
+
+    assert q.keys.events not in listening
+
+
+async def _subscribed(q: Queue, channel: str) -> bool:
+    return channel in await q.redis.pubsub_channels(channel)
