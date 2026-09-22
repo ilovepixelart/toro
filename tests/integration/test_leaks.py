@@ -149,3 +149,63 @@ async def test_stopped_worker_leaks_no_tasks(q, run_until):
     # every background loop (stalled / heartbeat / promote) is done, none lingering
     assert all(t.done() for t in worker._tasks), [t for t in worker._tasks if not t.done()]
     await worker.stop()  # idempotent: a second stop must not raise
+
+
+async def _connected(watcher: Queue) -> int:
+    return int((await watcher.redis.info("clients"))["connected_clients"])
+
+
+async def test_closing_a_queue_gives_its_sockets_back(q):
+    """`close()` has to release the connections it opened, not just the one the client
+    holds: the rest stay open until the garbage collector reaches them, which on a
+    closed event loop is a traceback at exit."""
+    watcher = Queue(q.name, prefix=PREFIX)
+    try:
+        base = await _connected(watcher)
+        other = Queue(q.name, prefix=PREFIX)
+        await asyncio.gather(*(other.counts() for _ in range(5)))  # open a few
+        assert await _connected(watcher) > base
+
+        await other.close()
+
+        assert await _connected(watcher) == base
+    finally:
+        await watcher.close()
+
+
+async def test_stopping_a_worker_gives_its_sockets_back(q):
+    """The same for a worker, which parks one connection per process loop."""
+    watcher = Queue(q.name, prefix=PREFIX)
+    try:
+        base = await _connected(watcher)
+        w = Worker(q.name, _noop, prefix=PREFIX, concurrency=4, stalled_interval=0)
+        task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.3)
+        assert await _connected(watcher) > base
+
+        await w.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert await _connected(watcher) == base
+    finally:
+        await watcher.close()
+
+
+async def test_a_queue_leaves_a_connection_it_was_given_alone(q):
+    """A caller-provided connection belongs to the caller: closing a queue that shares
+    it must not disconnect it under the others."""
+    shared = Queue(q.name, prefix=PREFIX)
+    try:
+        one = Queue(q.name, prefix=PREFIX, connection=shared.redis)
+        two = Queue(q.name, prefix=PREFIX, connection=shared.redis)
+        await one.close()
+
+        assert await two.counts() is not None  # still usable
+    finally:
+        await shared.close()
+
+
+async def _noop(job: Job) -> None:
+    return None

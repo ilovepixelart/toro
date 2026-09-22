@@ -141,6 +141,9 @@ class Queue:
         # NB: created with decode_responses=True, so every command returns str -
         # redis-py's async client isn't generic over that, hence the casts below.
         self.redis = connection or connect(url)
+        # A connection we opened is ours to give back on close(); one handed to us
+        # belongs to the caller, who may still be using it elsewhere.
+        self._owns_connection = connection is None
         self._add_job = self.redis.register_script(scripts.ADD_JOB)
         self._add_flow_script = self.redis.register_script(scripts.ADD_FLOW)
         self._retry_job = self.redis.register_script(scripts.RETRY_JOB)
@@ -1201,4 +1204,4 @@ class Queue:
             for fut in waiters:
                 if not fut.done():
                     fut.set_exception(RuntimeError("queue closed while waiting for a result"))
-        await self.redis.aclose()
+        await self.redis.aclose(close_connection_pool=self._owns_connection)
