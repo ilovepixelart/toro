@@ -945,7 +945,7 @@ return 1
 # dependency (nothing left to wait for).
 # KEYS[1] prioritized  KEYS[2] active  KEYS[3] delayed  KEYS[4] completed
 # KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base  KEYS[8] held
-# KEYS[9] cancelled
+# KEYS[9] cancelled  KEYS[10] cancel channel
 # ARGV[1] jobId  ARGV[2] now(ms)
 REMOVE_JOB = (
     _LIB
@@ -981,6 +981,12 @@ end
 local function removeTree(jobId)
   local meta = redis.call("HMGET", base .. jobId, "children", "state", "ckey")
   removeFromState(jobId, meta[2])
+  if meta[2] == "active" then
+    -- Its processor is still running, and removal gives it nowhere to report. Tell
+    -- the worker, or the slot it holds (and any global-concurrency slot) stays taken
+    -- until the work happens to end. Its commit finds no lock and stands down.
+    redis.call("PUBLISH", KEYS[10], jobId)
+  end
   unkey(base, jobId, meta[2], meta[3], now)
   delJobs({jobId}, base)
   if meta[1] then

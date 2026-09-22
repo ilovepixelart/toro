@@ -460,3 +460,28 @@ async def test_a_cancellation_cascades_upward_as_a_cancellation(q):
 
     minute = (await q.metrics(minutes=5))[-1]
     assert minute["failed"] == 0, "a cancellation was counted as a failure"
+
+
+async def test_removing_a_running_job_stops_its_processor(q, run_worker):
+    """Removing an active job took it out of the queue and left its processor running
+    with nowhere to report: the worker slot, and any global-concurrency slot, stayed
+    occupied until the work happened to end on its own."""
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cleaned.set()
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.remove_job(job.id) is True
+
+        await asyncio.wait_for(cleaned.wait(), 5)  # the processor was stopped too
+
+    assert await q.redis.exists(q.keys.job(job.id)) == 0  # removed, not cancelled
+    assert await _count(q, "cancelled") == 0

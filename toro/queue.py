@@ -1021,6 +1021,7 @@ class Queue:
             self.keys.base,
             self.keys.held,
             self.keys.cancelled,
+            self.keys.cancel,
         ]
 
     async def remove_job(self, job_id: str) -> bool:
