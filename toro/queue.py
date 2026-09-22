@@ -92,6 +92,30 @@ def _percentile(buckets: list[int], q: float) -> int:
     return bucket_estimate_ms(len(buckets) - 1)  # pragma: no cover - cum reaches total above
 
 
+# How long Redis gets to confirm the events subscription before a waiter gives up.
+SUBSCRIBE_TIMEOUT = 5.0
+
+
+async def _confirm_subscribed(pubsub: PubSub) -> None:
+    """Wait until Redis has confirmed the subscription.
+
+    `subscribe()` returns once the command is WRITTEN, not once it has taken effect: a
+    dispatcher that reported itself ready in between would miss every event published
+    in that window, and `result()` on a job its own finish removed has nothing else to
+    read the outcome from.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SUBSCRIBE_TIMEOUT
+    while True:
+        left = deadline - loop.time()
+        if left <= 0:
+            msg = "Redis did not confirm the events subscription"
+            raise TimeoutError(msg)
+        reply = await pubsub.get_message(timeout=left)
+        if reply is not None and reply["type"] == "subscribe":
+            return
+
+
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -412,7 +436,13 @@ class Queue:
                 with contextlib.suppress(Exception):
                     await self._events_pubsub.aclose()
             pubsub = self.redis.pubsub()
-            await pubsub.subscribe(self.keys.events)
+            try:
+                await pubsub.subscribe(self.keys.events)
+                await _confirm_subscribed(pubsub)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await pubsub.aclose()  # it owns a connection by now
+                raise
             self._events_pubsub = pubsub
             self._events_task = asyncio.create_task(self._dispatch_events(pubsub))
 
