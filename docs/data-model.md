@@ -27,8 +27,8 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `pc` | string (counter) | Priority sequence counter, so same-priority jobs stay FIFO. |
 | `active` | LIST | Ids currently claimed by a worker and running. |
 | `delayed` | ZSET | Ids scored by their process-at timestamp (ms); promoted to `prioritized` when due. |
-| `completed` | ZSET | Successfully-finished ids, scored by finish time (for auto-removal + listing). |
-| `failed` | ZSET | Terminally-failed ids, scored by finish time. |
+| `completed` | ZSET | Successfully-finished ids, scored by retention position: finish time, except a running flow's children (above every timestamp) and a settled flow's children (just above their root). |
+| `failed` | ZSET | Terminally-failed ids, scored the same way. |
 | `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |
 | `meta-paused` | string (flag) | Exists only while the queue is paused; workers stop claiming new jobs. |
 | `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed`; drives `result()` and live dashboards. |

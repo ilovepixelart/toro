@@ -61,17 +61,21 @@ cleanup process to run or forget. It follows that:
   a per-queue setting above.
 - **The worker applies it.** The option is stored with the job and read as the job
   finishes, so the default in force is that of the worker's toro version.
+- **A flow is one unit.** While a flow runs, nothing of it is trimmed: its
+  finished children sit outside every bound until the root settles. Then the
+  whole flow is as old as its root, so a trim reaches the root first and takes
+  the subtree with it. No retained flow is ever partial. See [Flows](flows.md).
 - **A trim is bounded.** One finish deletes at most 1000 jobs, oldest first,
-  whichever bounds apply and however many flow ancestors fail with it. A bound
-  that meets a deep backlog drains it over the following finishes instead of
-  blocking Redis in one pass.
+  whichever bounds apply and however many flow ancestors fail with it, plus the
+  rest of a flow it started to remove. A bound that meets a deep backlog drains
+  it over the following finishes instead of blocking Redis in one pass.
 - **A scheduler stores its options when it is registered**, the queue's defaults
   included, because workers mint each occurrence from the stored template. Call
   `add_scheduler()` again to change them.
 
 A trimmed job is gone: its hash, logs and flow bookkeeping are deleted,
 `get_job()` returns `None`, and `result()` called after the trim times out. A
-trimmed flow child leaves its flow's tree (see [Flows](flows.md)).
+trimmed flow root takes its finished subtree with it.
 Awaiting `result()` while the job runs is unaffected, and so are the metrics,
 which are separate counters. Retention covers every way a job can finish: a
 worker's finish, a flow parent failed by the script, and a job the stalled sweep

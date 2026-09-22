@@ -57,12 +57,22 @@ async def process(job):
 ```
 
 A child's result is copied into the parent at the moment the child completes,
-so a child trimmed from `completed` - by the default retention, its own
-`remove_on_complete`, or routine history cleanup (`clean("completed")`) - costs
-the parent nothing: the parent's copy survives. Children are jobs like any other
-to [retention](producing.md#retention), so on a busy queue a finished child can be
-trimmed while its flow is still running. It then leaves the tree `get_flow()`
-returns; `flow_view()`'s `done` and `failed` still count it, from the parent's copy.
+so a child removed from `completed` by routine history cleanup
+(`clean("completed")`, `remove_job()`) costs the parent nothing: the parent's
+copy survives, and `flow_view()`'s `done` and `failed` still count it.
+
+[Retention](producing.md#retention) treats a flow as one unit. While the flow
+runs, its finished children are kept whatever the queue's bound does meanwhile:
+they are scored above every finish time in `completed` and `failed`, out of the
+trims' reach, and they neither count against the bound nor age out. When the
+root settles, on any path, they are re-scored to the root's finish time plus
+their depth, so the root is the oldest of its flow: a trim reaches it first and
+removes the whole subtree in the same script. A child of a root that already
+settled (failed with a sibling, say) is an ordinary job, scored and trimmed at
+its own finish time. Retrying a failed root puts its finished children back out
+of reach until the flow settles again. The score of a flow child is therefore a
+retention position; its finish time is `finishedOn` in the job's hash. A raw
+`get_jobs("completed")` lists a running flow's children first.
 
 ## When a child fails
 

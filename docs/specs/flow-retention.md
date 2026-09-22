@@ -65,7 +65,7 @@ with it.
 | FR-005 | A finished flow is never shown partial: across a long run of flows past the bound, every root that still exists has all of its children. | `::test_no_retained_flow_is_partial` |
 | FR-006 | A child that finishes after its parent was failed eagerly or removed is recorded and trimmed as a job with no parent; nothing leaks. | `::test_orphans_are_ordinary_jobs` |
 | FR-008 | Retrying a failed root puts its finished children back out of the trim's reach until the flow settles again. | `::test_a_retried_flow_is_running_again` |
-| FR-007 | The steady-state cost of a finish is unchanged for queues without flows, and within 5% for an all-flows workload. | measured, as in `bounded-retention.md` |
+| FR-007 | The steady-state cost of a finish is unchanged for queues without flows, and within 5% for an all-flows workload. | measured against main, median of 5 interleaved runs of 20,000 jobs at concurrency 20: plain 9,594 against 9,608 jobs/s, flows of four 9,131 against 9,195 |
 
 ## Out of scope
 
@@ -82,7 +82,7 @@ with it.
   definition of a running flow, and `remove()` or `clean("waiting-children")`
   ends it.
 
-## Decisions to confirm
+## Decisions
 
 1. **This design** (live score, settle walk, cascade) over the two alternatives:
    a second chance at the trim (re-score protected children when the trim meets
