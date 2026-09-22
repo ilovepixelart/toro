@@ -487,7 +487,11 @@ class Worker:
         """
         try:
             result = await task
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # NOSONAR
+            # Absorbing this one IS the feature: a cancellation that killed the process
+            # loop would take the worker's slot with it, so the usual "always re-raise"
+            # rule cannot hold here. It IS re-raised in every case that is not ours.
+            #
             # Ours only when the PROCESSOR is what was stopped. The same error arrives
             # when this WORKER is being stopped, and absorbing that one commits a job
             # and carries on through a shutdown. Cancelling the awaiting task cancels
