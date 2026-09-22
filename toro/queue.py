@@ -16,7 +16,7 @@ from redis.asyncio.client import PubSub
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
 from .connection import confirm_subscribed, connect
-from .errors import JobFailedError
+from .errors import JobCancelledError, JobFailedError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
@@ -403,6 +403,8 @@ class Queue:
                 return job.returnvalue
             if job is not None and job.state == "failed":
                 raise JobFailedError(job.failed_reason)
+            if job is not None and job.state == "cancelled":
+                raise JobCancelledError(job_id)
             try:
                 return await asyncio.wait_for(fut, timeout)
             except (TimeoutError, asyncio.TimeoutError):
@@ -461,13 +463,16 @@ class Queue:
         except ValueError:
             return
         event = data.get("event")
-        if event not in ("completed", "failed"):
-            return  # non-terminal (e.g. "added", "progress")
-        for fut in self._result_waiters.get(str(data.get("jobId")), []):
+        if event not in ("completed", "failed", "cancelled"):
+            return  # non-terminal (e.g. "added", "progress", "cancel-requested")
+        job_id = str(data.get("jobId"))
+        for fut in self._result_waiters.get(job_id, []):
             if fut.done():
                 continue
             if event == "completed":
                 fut.set_result(data.get("result"))
+            elif event == "cancelled":
+                fut.set_exception(JobCancelledError(job_id))
             else:
                 fut.set_exception(JobFailedError(data.get("reason")))
 

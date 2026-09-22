@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from toro import FlowChild, Queue
+from toro import FlowChild, JobCancelledError, Queue
 
 PREFIX = "torotest"
 
@@ -46,6 +46,15 @@ async def _in_state(q: Queue, job_id: str, state: str) -> bool:
     return await _state(q, job_id) == state
 
 
+def _count_is(q: Queue, state: str, n: int):
+    """A run_until predicate: an async closure, so the comparison happens on the value."""
+
+    async def check() -> bool:
+        return await _count(q, state) == n
+
+    return check
+
+
 @pytest.mark.parametrize("where", ["wait", "delayed", "held", "waiting-children"])
 async def test_a_job_that_has_not_started_is_cancelled_at_once(q, run_worker, run_until, where):
     """CN-001: no worker is involved, so there is nothing to ask and nothing to wait
@@ -64,7 +73,8 @@ async def test_a_job_that_has_not_started_is_cancelled_at_once(q, run_worker, ru
     assert await q.cancel_job(job.id) is True
 
     assert await _state(q, job.id) == "cancelled"
-    assert await _count(q, "cancelled") == 1
+    # a flow parent takes its subtree with it, so its leaf is cancelled too (CN-007)
+    assert await _count(q, "cancelled") == (2 if where == "waiting-children" else 1)
     assert await _count(q, where) == 0
     # it is in no other collection: nothing can hand it to a worker
     assert job.id not in await q.redis.zrange(q.keys.prioritized, 0, -1)
@@ -200,3 +210,71 @@ async def test_a_cancel_with_no_message_still_lands(q, run_worker, run_until):
         await q.redis.hset(q.keys.job(job.id), "cancel", "1")  # no PUBLISH
 
         assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=10)
+
+
+async def test_a_cancelled_job_does_not_retry(q, run_worker, run_until):
+    """CN-004: a job told to stop has been told not to run. Attempts left are not a
+    reason to run it again, and neither is an operator's retry."""
+    runs = []
+    started = asyncio.Event()
+
+    async def proc(job):
+        runs.append(job.name)
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("long", {}, attempts=5, backoff=10)
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=10)
+        await asyncio.sleep(0.3)  # a backoff retry would have landed by now
+
+    assert runs == ["long"]  # it ran once and was not tried again
+    assert await _count(q, "delayed") == 0
+    assert await q.retry_job(job.id) is False
+    assert await _state(q, job.id) == "cancelled"
+
+
+async def test_cancelling_a_flow_takes_its_subtree(q, run_worker, run_until):
+    """CN-007: a flow is cancelled as a unit. A child left running would report into a
+    parent that is already gone."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=4):
+        root = await q.add_flow(
+            "report",
+            {},
+            children=[FlowChild("running", {}), FlowChild("queued", {}, delay=60_000)],
+        )
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(root.id) is True
+
+        # the root, the running child and the queued one
+        assert await run_until(lambda: _count_is(q, "cancelled", 3), timeout=10)
+
+    assert await _count(q, "active") == 0
+    assert await _count(q, "delayed") == 0
+    assert await _count(q, "waiting-children") == 0
+    assert await _count(q, "failed") == 0  # cancelling a flow does not fail it
+
+
+async def test_result_reports_a_cancellation(q):
+    """CN-008: a caller waiting on a cancelled job must be told, not left to wait out
+    its timeout for a job that will never finish."""
+    job = await q.add("doomed", {})
+    waiting = asyncio.create_task(job.result(timeout=10))
+    await asyncio.sleep(0.2)  # it is registered and waiting
+
+    assert await q.cancel_job(job.id) is True
+
+    with pytest.raises(JobCancelledError):
+        await waiting
+    with pytest.raises(JobCancelledError):  # and asking after the fact
+        await q.result(job.id, timeout=5)

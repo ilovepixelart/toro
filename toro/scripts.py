@@ -1036,35 +1036,54 @@ CANCEL_JOB = (
     _LIB
     + """
 local base = KEYS[6]
-local jobKey = base .. ARGV[1]
-local state = redis.call("HGET", jobKey, "state")
-if not state or isFinished(state) then return 0 end
 local now = tonumber(ARGV[2])
-if state == "active" then
-  -- Its worker owns the processor, so only the worker can stop it. Record the ask
-  -- where the lock check will find it, and say so now for the worker listening.
-  redis.call("HSET", jobKey, "cancel", "1")
-  redis.call("PUBLISH", KEYS[7],
-    cjson.encode({jobId = ARGV[1], event = "cancel-requested"}))
-  return 2
+-- Cancel one job and answer with its child list (read before recordFinished, which
+-- retention may follow with a DEL of the hash). A job already finished is left alone;
+-- a running one can only be stopped by the worker that owns its processor, so it is
+-- asked here and commits its own cancellation.
+local function cancelOne(jobId)
+  local jobKey = base .. jobId
+  local meta = redis.call("HMGET", jobKey, "state", "children", "ckey")
+  local state = meta[1]
+  if not state or isFinished(state) then return meta[2] end
+  if state == "active" then
+    redis.call("HSET", jobKey, "cancel", "1")
+    redis.call("PUBLISH", KEYS[7],
+      cjson.encode({jobId = jobId, event = "cancel-requested"}))
+    return meta[2]
+  end
+  if state == "wait" then redis.call("ZREM", KEYS[1], jobId)
+  elseif state == "delayed" then redis.call("ZREM", KEYS[2], jobId)
+  elseif state == "held" then redis.call("ZREM", KEYS[3], jobId)
+  elseif state == "waiting-children" then redis.call("ZREM", KEYS[4], jobId)
+  end
+  -- a job queued behind a key leaves that queue; a holder hands its key on inside
+  -- recordFinished, like any other job reaching a terminal state
+  unkey(base, jobId, state, meta[3], now)
+  recordFinished(KEYS[5], jobKey, base, jobId, now, "cancel", "1", "cancelled")
+  redis.call("PUBLISH", KEYS[7], cjson.encode({jobId = jobId, event = "cancelled"}))
+  return meta[2]
 end
-if state == "wait" then redis.call("ZREM", KEYS[1], ARGV[1])
-elseif state == "delayed" then redis.call("ZREM", KEYS[2], ARGV[1])
-elseif state == "held" then redis.call("ZREM", KEYS[3], ARGV[1])
-elseif state == "waiting-children" then redis.call("ZREM", KEYS[4], ARGV[1])
+-- A flow is cancelled as a unit: a child left running would report into a parent
+-- that has already gone. Descendants do NOT settle into their parents on the way,
+-- because those parents are being cancelled too.
+local function cancelTree(jobId)
+  local children = cancelOne(jobId)
+  if children then
+    for _, cid in ipairs(cjson.decode(children)) do cancelTree(cid) end
+  end
 end
--- a job queued behind a key leaves that queue; a holder hands its key on inside
--- recordFinished, like any other job reaching a terminal state
-unkey(base, ARGV[1], state, redis.call("HGET", jobKey, "ckey"), now)
--- read BEFORE recordFinished (retention may DEL the hash)
-local meta = redis.call("HMGET", jobKey, "parentId", "onFail")
-recordFinished(KEYS[5], jobKey, base, ARGV[1], now, "cancel", "1", "cancelled")
-redis.call("PUBLISH", KEYS[7], cjson.encode({jobId = ARGV[1], event = "cancelled"}))
--- A cancelled child did not produce what its parent waits for, so the parent's
--- own onFail policy decides, exactly as it does for a child that failed: there is
--- one rule for "this child will never deliver", not two.
-if meta[1] then
-  settleChildFailed(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[3]))
+local topState = redis.call("HGET", base .. ARGV[1], "state")
+if not topState or isFinished(topState) then return 0 end
+-- read BEFORE the cancellation (retention may DEL the hash)
+local top = redis.call("HMGET", base .. ARGV[1], "parentId", "onFail")
+cancelTree(ARGV[1])
+if topState == "active" then return 2 end   -- its worker settles it when it stops
+-- A cancelled child did not produce what its parent waits for, so the parent's own
+-- onFail policy decides, exactly as it does for a child that failed: there is one
+-- rule for "this child will never deliver", not two.
+if top[1] then
+  settleChildFailed(base, ARGV[1], top[1], top[2], "cancelled", now, tonumber(ARGV[3]))
 end
 return 1
 """
