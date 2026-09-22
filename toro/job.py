@@ -150,6 +150,7 @@ class Job:
     timestamp: int | None = None
     returnvalue: Any = None
     failed_reason: str | None = None
+    cancel_reason: str | None = None  # why it was stopped, when the caller said
     state: JobState | None = None
     processed_on: int | None = None
     finished_on: int | None = None
@@ -218,6 +219,7 @@ class Job:
             timestamp=int(h["timestamp"]) if h.get("timestamp") else None,
             returnvalue=json.loads(h["returnvalue"]) if h.get("returnvalue") else None,
             failed_reason=h.get("failedReason"),
+            cancel_reason=h.get("cancelReason"),
             state=cast("JobState | None", h.get("state")),  # Redis stores it untyped
             processed_on=int(h["processedOn"]) if h.get("processedOn") else None,
             finished_on=int(h["finishedOn"]) if h.get("finishedOn") else None,

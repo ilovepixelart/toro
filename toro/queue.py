@@ -404,7 +404,7 @@ class Queue:
             if job is not None and job.state == "failed":
                 raise JobFailedError(job.failed_reason)
             if job is not None and job.state == "cancelled":
-                raise JobCancelledError(job_id)
+                raise JobCancelledError(job_id, job.cancel_reason)
             try:
                 return await asyncio.wait_for(fut, timeout)
             except (TimeoutError, asyncio.TimeoutError):
@@ -472,7 +472,7 @@ class Queue:
             if event == "completed":
                 fut.set_result(data.get("result"))
             elif event == "cancelled":
-                fut.set_exception(JobCancelledError(job_id))
+                fut.set_exception(JobCancelledError(job_id, data.get("reason")))
             else:
                 fut.set_exception(JobFailedError(data.get("reason")))
 
@@ -1035,8 +1035,12 @@ class Queue:
         res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id, _now_ms()])
         return bool(res)
 
-    async def cancel_job(self, job_id: str) -> bool:
+    async def cancel_job(self, job_id: str, *, reason: str | None = None) -> bool:
         """Stop a job wherever it is. True when there was something to stop.
+
+        `reason` is recorded on every job the call stops, the subtree included, and
+        reaches whoever is waiting on `result()`. "Who stopped this and why" is the
+        first question asked of a cancelled job.
 
         A job that has not started ends here and now. A RUNNING job is asked to stop:
         its worker owns the processor, so only the worker can cancel it, which it does
@@ -1055,7 +1059,7 @@ class Queue:
                 self.keys.events,
                 self.keys.cancel,
             ],
-            args=[str(job_id), _now_ms(), scripts.METRICS_RETENTION_MS],
+            args=[str(job_id), _now_ms(), scripts.METRICS_RETENTION_MS, reason or ""],
         )
         return bool(res)
 

@@ -512,3 +512,54 @@ def _worker_cancelled(q: Queue, n: int):
         return any(w.get("cancelled") == n for w in await q.workers())
 
     return check
+
+
+async def test_a_cancellation_can_say_why(q):
+    """The first question asked of a cancelled job is who stopped it and why, and the
+    answer has to survive on the job, not just in whatever log the caller kept."""
+    job = await q.add("doomed", {})
+
+    assert await q.cancel_job(job.id, reason="superseded by order-99") is True
+
+    got = await q.get_job(job.id)
+    assert got.state == "cancelled"
+    assert got.cancel_reason == "superseded by order-99"
+
+
+async def test_a_cancellation_without_a_reason_has_none(q):
+    job = await q.add("doomed", {})
+    assert await q.cancel_job(job.id) is True
+    assert (await q.get_job(job.id)).cancel_reason is None
+
+
+async def test_a_running_job_carries_the_reason_it_was_stopped_for(q, run_worker):
+    """The worker commits the cancellation, so the reason has to reach it rather than
+    live only in the request."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id, reason="deploy window") is True
+
+        with pytest.raises(JobCancelledError, match="deploy window"):
+            await job.result(timeout=10)
+
+    assert (await q.get_job(job.id)).cancel_reason == "deploy window"
+
+
+async def test_result_reports_the_reason_to_a_waiter(q):
+    """A caller already waiting is told over the event, not by re-reading the job."""
+    job = await q.add("doomed", {})
+    waiting = asyncio.create_task(job.result(timeout=10))
+    await asyncio.sleep(0.2)
+
+    assert await q.cancel_job(job.id, reason="duplicate request") is True
+
+    with pytest.raises(JobCancelledError, match="duplicate request"):
+        await waiting

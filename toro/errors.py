@@ -22,6 +22,7 @@ class JobCancelledError(ToroError):
     was deliberately stopped.
     """
 
-    def __init__(self, job_id: str) -> None:
-        super().__init__(f"job {job_id} was cancelled")
+    def __init__(self, job_id: str, reason: str | None = None) -> None:
+        super().__init__(f"job {job_id} was cancelled" + (f": {reason}" if reason else ""))
         self.job_id = job_id
+        self.reason = reason

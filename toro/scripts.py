@@ -1026,9 +1026,11 @@ redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[2])
 -- read BEFORE recordFinished (retention may DEL the hash)
-local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail")
+local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail", "cancelReason")
 recordFinished(KEYS[2], KEYS[3], base, ARGV[1], now, "cancel", "1", "cancelled")
-redis.call("PUBLISH", KEYS[8], cjson.encode({jobId = ARGV[1], event = "cancelled"}))
+local msg = {jobId = ARGV[1], event = "cancelled"}
+if meta[3] then msg.reason = meta[3] end
+redis.call("PUBLISH", KEYS[8], cjson.encode(msg))
 if meta[1] then
   settleChildGone(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[4]),
     "cancelled")
@@ -1046,12 +1048,26 @@ return 1
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] held  KEYS[4] waiting-children
 # KEYS[5] cancelled  KEYS[6] key base  KEYS[7] events channel  KEYS[8] cancel channel
 # ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] metricsRetention(ms)
+# ARGV[4] reason ("" = none)
 # Returns 0 (nothing to cancel), 1 (cancelled here) or 2 (a running job was asked).
 CANCEL_JOB = (
     _LIB
     + """
 local base = KEYS[6]
 local now = tonumber(ARGV[2])
+local why = ARGV[4]
+-- The caller's reason belongs to every job this call stops, the subtree included:
+-- one cancellation, one explanation.
+local function saveReason(jobKey)
+  if why ~= "" then redis.call("HSET", jobKey, "cancelReason", why) end
+end
+local cancelledMsg = {jobId = "", event = "cancelled"}
+local function announceCancelled(jobId)
+  cancelledMsg.jobId = jobId
+  cancelledMsg.reason = nil
+  if why ~= "" then cancelledMsg.reason = why end
+  redis.call("PUBLISH", KEYS[7], cjson.encode(cancelledMsg))
+end
 -- Cancel one job and answer with its child list (read before recordFinished, which
 -- retention may follow with a DEL of the hash). A job already finished is left alone;
 -- a running one can only be stopped by the worker that owns its processor, so it is
@@ -1063,6 +1079,7 @@ local function cancelOne(jobId)
   if not state or isFinished(state) then return meta[2] end
   if state == "active" then
     redis.call("HSET", jobKey, "cancel", "1")
+    saveReason(jobKey)
     -- to the workers' own channel: `events` carries a message per job, and a worker
     -- listening there would parse every one of them to catch this
     redis.call("PUBLISH", KEYS[8], jobId)
@@ -1076,8 +1093,9 @@ local function cancelOne(jobId)
   -- a job queued behind a key leaves that queue; a holder hands its key on inside
   -- recordFinished, like any other job reaching a terminal state
   unkey(base, jobId, state, meta[3], now)
+  saveReason(jobKey)
   recordFinished(KEYS[5], jobKey, base, jobId, now, "cancel", "1", "cancelled")
-  redis.call("PUBLISH", KEYS[7], cjson.encode({jobId = jobId, event = "cancelled"}))
+  announceCancelled(jobId)
   return meta[2]
 end
 -- A flow is cancelled as a unit: a child left running would report into a parent
