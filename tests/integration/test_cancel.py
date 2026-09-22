@@ -730,3 +730,35 @@ async def test_a_removal_whose_message_is_lost_still_stops_the_processor(q, run_
         assert await q.remove_job(job.id) is True
 
         await asyncio.wait_for(cleaned.wait(), 5)  # the renewal noticed instead
+
+
+async def test_a_parent_can_read_which_children_were_stopped(q, run_worker, run_until):
+    """CN-006: under `continue` the parent runs and inspects what its children did.
+    Failures and cancellations are separate questions, so it can tell a child that
+    broke from one somebody stopped."""
+    seen: dict[str, dict[str, str]] = {}
+
+    async def proc(job):
+        if job.name == "report":
+            seen["failed"] = await job.failed_children()
+            seen["cancelled"] = await job.cancelled_children()
+        elif job.name == "breaks":
+            raise RuntimeError("boom")
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4) as w:
+        w.on("failed", lambda *a, **k: None)
+        root = await q.add_flow(
+            "report",
+            {},
+            children=[
+                FlowChild("breaks", {}, on_fail="continue"),
+                FlowChild("stopped", {}, delay=60_000, on_fail="continue"),
+            ],
+        )
+        stopped = (await q.get_flow(root.id))["children"][1]["job"].id
+        assert await q.cancel_job(stopped, reason="not needed") is True
+        assert await run_until(lambda: _in_state(q, root.id, "completed"), timeout=10)
+
+    assert list(seen["failed"]) != [stopped], "a stopped child was reported as failed"
+    assert seen["cancelled"] == {stopped: "not needed"}

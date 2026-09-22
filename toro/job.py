@@ -136,6 +136,7 @@ class JobContext:
     job_id: str
     results_key: str  # the flow aux keys, derived via Keys by the worker so
     cfail_key: str  # the layout stays defined in exactly one place (keys.py)
+    ccancel_key: str
 
 
 @dataclass
@@ -206,6 +207,15 @@ class Job:
         if self._ctx is None:
             raise RuntimeError("failed_children() is only available inside a worker processor")
         return _str_dict(await self._ctx.redis.hgetall(self._ctx.cfail_key))
+
+    async def cancelled_children(self) -> dict[str, str]:
+        """Pull child id -> why it was stopped, for children cancelled under
+        ``on_fail="continue"``. Separate from `failed_children()`: a job somebody
+        stopped did not fail, and a parent deciding what to do wants to know which.
+        """
+        if self._ctx is None:
+            raise RuntimeError("cancelled_children() is only available inside a worker processor")
+        return _str_dict(await self._ctx.redis.hgetall(self._ctx.ccancel_key))
 
     @classmethod
     def from_hash(cls, job_id: str, h: dict[str, str]) -> Job:

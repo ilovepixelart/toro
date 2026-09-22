@@ -93,8 +93,9 @@ due jobs into the prioritized set.
   skipped when that claim filled the last slot, and a script that omits the cap
   errors before its first write: the limit cannot fail open.
 - **Events** - Redis pub/sub on an `events` channel (`added`, `progress`,
-  `completed`, `failed`); `Queue.result()` awaits the terminal event and
-  `Worker.on(event, fn)` exposes in-process hooks. See [Concepts](concepts.md).
+  `completed`, `failed`, `cancelled`); `Queue.result()` awaits the terminal event and
+  `Worker.on(event, fn)` exposes in-process hooks. A second `cancel` channel carries
+  cancellation requests to workers and nothing else. See [Concepts](concepts.md).
 - **Retention** - `remove_on_complete` / `remove_on_fail` (bool / count /
   `{count, age}`, bounded when unset) enforced inside the finish script, not by a
   separate sweeper, at most 1000 deletions per finish plus the rest of one flow.

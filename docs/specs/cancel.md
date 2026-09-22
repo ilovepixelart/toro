@@ -40,9 +40,11 @@ told so rather than left waiting.
 - **The processor runs in its own task.** Today it is awaited inline in the process
   loop, so there is nothing to cancel without killing the loop. Cancelling the task
   raises `CancelledError` where the processor awaits, which is Python's own
-  cooperative cancellation: `finally` blocks and context managers run. A processor
-  that must not be interrupted can `asyncio.shield`; one that swallows
-  `CancelledError` is reported through the lock, not silently completed.
+  cooperative cancellation: `finally` blocks and context managers run. Work that must
+  not be interrupted belongs in that unwinding, not behind `asyncio.shield`, which
+  does not hold a cancellation back (see `processing.md`). The worker decides the
+  outcome by what it asked for, so a processor that swallows `CancelledError`, or a
+  cleanup that raises, still ends the job `cancelled`.
 - **A job that is not running needs no worker.** `wait`, `delayed`, `held` and
   `waiting-children` are cancelled inside the script that moves them, atomically.
   A held job leaves its key's queue; a holder hands the key on.
