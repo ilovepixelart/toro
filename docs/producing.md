@@ -64,7 +64,8 @@ cleanup process to run or forget. It follows that:
 - **A flow is one unit.** While a flow runs, nothing of it is trimmed: its
   finished children sit outside every bound until the root settles. Then the
   whole flow is as old as its root, so a trim reaches the root first and takes
-  the subtree with it. No retained flow is ever partial. See [Flows](flows.md).
+  the subtree with it. Within its root's finished set a retained flow is never
+  partial; the exceptions are listed under [Flows](flows.md).
 - **A trim is bounded.** One finish deletes at most 1000 jobs, oldest first,
   whichever bounds apply and however many flow ancestors fail with it, plus the
   rest of a flow it started to remove. A bound that meets a deep backlog drains

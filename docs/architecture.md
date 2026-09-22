@@ -123,7 +123,7 @@ The scripts share a small library of routines:
 | `wakeIfWaiting` | Arms the marker when jobs are waiting: a slot was freed without a claim. |
 | `tryRateLimit` | Token bucket: ms until a token frees, or 0 to proceed. |
 | `recordFinished` | Records a terminal job in `completed`/`failed` and applies the job's own retention. Every way a job finishes comes through it, and it is the only writer to those sets. A child of a running flow is scored `LIVE + now`; a settling root places its subtree. |
-| `placeSubtree` | Re-scores a job's finished descendants to a score plus their depth: the root's finish time when a root settles, `LIVE + now` when a failed root is retried. |
+| `settleLive` / `reviveSubtree` | A settling root drains its `:live` index, scoring each entry one above its finish time; a retried root walks its children and scores every finished descendant live again. |
 | `removeFinished` | The trims' one remover: a job and, with it, the finished subtree of a flow it roots, returning how many went for the budget. |
 | `settleChildCompleted` / `settleChildFailed` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent - or fails it eagerly, per `on_fail`. |
 | `keepFor` | The one place a `remove_on_complete` / `remove_on_fail` option is read. In Lua because two ways a job finishes have no worker behind them: a parent failed with its child, and a job the stalled sweep gives up on. |
