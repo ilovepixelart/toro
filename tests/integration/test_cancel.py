@@ -300,3 +300,26 @@ async def test_a_worker_does_not_listen_to_the_job_firehose(q, run_worker, run_u
 
 async def _subscribed(q: Queue, channel: str) -> bool:
     return channel in await q.redis.pubsub_channels(channel)
+
+
+async def test_a_cleanup_that_outlives_a_renewal_is_not_cut_short(q, run_worker):
+    """CN-002: a cancellation is ONE signal. The lock keeps reporting it for as long
+    as the job is active, so a second delivery must not land inside the processor's
+    cleanup and abort the very unwinding the cancellation promised to allow."""
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            await asyncio.sleep(0.6)  # spans several lock renewals
+            cleaned.set()
+
+    async with run_worker(q, proc, concurrency=2, lock_duration=5000, lock_renew_time=100):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+
+        await asyncio.wait_for(cleaned.wait(), 5)  # the cleanup ran to the end

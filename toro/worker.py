@@ -470,9 +470,19 @@ class Worker:
         return nxt
 
     def _request_cancel(self, job_id: str) -> None:
-        """Stop a job this worker is running. Nothing to do if it is not ours, or if
-        it already finished: the cancellation was simply too late.
+        """Stop a job this worker is running, once.
+
+        Nothing to do if the job is not ours, or if it already asked to stop: the
+        `cancel` field stays set while the job is active, so the lock keeps reporting
+        it and the request can arrive again and again. A second `cancel()` would land
+        inside the processor's cleanup and abort the unwinding the first one promised.
+
+        Nothing to do either if the task is finished, though a cancellation that lands
+        between the processor returning and the task being marked done still wins:
+        CPython discards the result and the job commits `cancelled`.
         """
+        if job_id in self._cancelling:
+            return
         task = self._processors.get(job_id)
         if task is None or task.done():
             return
