@@ -2,6 +2,18 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 0.10.0
+
+Nothing breaks. Two things are new and worth knowing about.
+
+A queue now keeps lifetime counters in a `totals` hash that never expires, written
+in the same step as the transitions they count. It is one small hash per queue; a
+queue upgraded mid-life starts counting from the upgrade, so `rate()` is correct
+from then on and the absolute totals are not history.
+
+`metrics_text()` renders OpenMetrics for a scraper, and matador serves every queue
+it watches from `/metrics`. See [Operating](operating.md).
+
 ## 0.9.0
 
 ### Upgrade every worker before you cancel anything
