@@ -668,10 +668,27 @@ async def test_removing_a_running_flow_leaves_no_live_index(q, run_worker, run_u
 # ---- what a second review found -----------------------------------------------------
 
 
-async def test_a_child_of_a_settled_parent_under_a_running_root_is_live(q, run_worker, run_until):
+async def _forget_root_ids(q: Queue, root_id: str) -> None:
+    """A flow as a version before `rootId` left it: every node knows only its parent."""
+    tree = await q.get_flow(root_id)
+    assert tree is not None
+
+    async def walk(node) -> None:
+        await q.redis.hdel(q.keys.job(node["job"].id), "rootId")
+        for child in node["children"]:
+            await walk(child)
+
+    await walk(tree)
+
+
+@pytest.mark.parametrize("version", ["current", "before rootId"])
+async def test_a_child_of_a_settled_parent_under_a_running_root_is_live(
+    q, run_worker, run_until, version
+):
     """FR-001: what keeps a job is its ROOT still running, not its parent. A parent can
     settle mid-flow (it failed with `on_fail="continue"`, so the root carries on), and
-    its children finishing afterwards still belong to a running flow."""
+    its children finishing afterwards still belong to a running flow. A flow from
+    before `rootId` finds its root by walking up, however deep it is."""
     slow_gate, held_gate = asyncio.Event(), asyncio.Event()
 
     async def proc(job):
@@ -685,7 +702,9 @@ async def test_a_child_of_a_settled_parent_under_a_running_root_is_live(q, run_w
 
     async with run_worker(q, proc, concurrency=4):
         mid = c("mid", {}, on_fail="continue", children=[c("bad", {}), c("slow", {})])
-        await q.add_flow("report", {}, children=[mid, c("held", {})])
+        root = await q.add_flow("report", {}, children=[mid, c("held", {})])
+        if version == "before rootId":
+            await _forget_root_ids(q, root.id)
         assert await run_until(lambda: _count_state(q, "failed", 2), timeout=10)  # bad, mid
 
         slow_gate.set()  # the root is still parked on `held`: the flow runs
