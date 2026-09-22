@@ -229,10 +229,12 @@ async def test_a_retried_flow_is_running_again(q, run_worker, run_until):
         first = await _scores(q, list(names.values()))
         assert first[root_id] < LIVE_SCORE
 
-        assert await q.retry_flow(root_id) >= 1
-        live = await _scores(q, [names["leaf2"], names["side"]])  # completed, untouched
-        assert all(s > LIVE_SCORE for s in live.values()), live
+    # with no worker the flow cannot settle again while we look at it
+    assert await q.retry_flow(root_id) >= 1
+    live = await _scores(q, [names["leaf2"], names["side"]])  # completed, untouched
+    assert all(s > LIVE_SCORE for s in live.values()), live
 
+    async with run_worker(q, proc, concurrency=4):
         assert await run_until(lambda: _in_state(q, root_id, "completed"), timeout=10)
     scores = await _scores(q, list(names.values()))
     _placed(scores, names, scores[root_id])
