@@ -5,6 +5,8 @@ processor is cancelled where it awaits. Either way it lands in `cancelled`, whic
 a terminal state of its own: a cancellation is not a failure.
 """
 
+import asyncio
+
 import pytest
 
 from toro import FlowChild, Queue
@@ -136,3 +138,65 @@ async def test_cancelling_what_cannot_be_cancelled(q, run_worker, run_until, sta
     assert await q.cancel_job(job.id) is False
     assert await _state(q, job.id) == state
     assert await _count(q, "cancelled") == 0
+
+
+async def test_cancelling_a_running_job_stops_its_processor(q, run_worker, run_until):
+    """CN-002: a running job's worker owns its processor, so only the worker can stop
+    it. Cancellation lands where the processor awaits, so its cleanup runs."""
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)  # it never finishes on its own
+        finally:
+            cleaned.set()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+
+        await asyncio.wait_for(cleaned.wait(), 5)  # the processor's finally ran
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=10)
+
+    assert await _count(q, "cancelled") == 1
+    assert await _count(q, "active") == 0
+    assert await _count(q, "failed") == 0  # a cancellation is not a failure
+
+
+async def test_a_cancel_arrives_promptly(q, run_worker, run_until):
+    """CN-003: the events channel is what makes a cancellation prompt. With the lock
+    backstop half a minute away, only the message can land it in time."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2, lock_duration=60_000, lock_renew_time=30_000):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=3)
+
+
+async def test_a_cancel_with_no_message_still_lands(q, run_worker, run_until):
+    """CN-003: a dropped message has to cost latency, never the cancellation. This
+    sets the flag the script sets and publishes nothing: the lock renewal finds it."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2, lock_duration=2000, lock_renew_time=200):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+        await q.redis.hset(q.keys.job(job.id), "cancel", "1")  # no PUBLISH
+
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=10)

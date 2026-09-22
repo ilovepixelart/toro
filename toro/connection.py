@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import redis.asyncio as aioredis
+from redis.asyncio.client import PubSub
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -15,6 +18,29 @@ DEFAULT_BLOCK_TIMEOUT = 5.0
 
 # How far a connection's read timeout sits above the longest blocking pop it serves.
 READ_MARGIN = 5.0
+
+# How long Redis gets to confirm a subscription before the subscriber gives up.
+SUBSCRIBE_TIMEOUT = 5.0
+
+
+async def confirm_subscribed(pubsub: PubSub, channels: int = 1) -> None:
+    """Wait until Redis has confirmed every channel.
+
+    `subscribe()` returns once the command is WRITTEN, not once it has taken effect: a
+    subscriber that reported itself ready in between would miss every message published
+    in that window. `result()` on a job its own finish removed has nothing else to read
+    the outcome from, and a worker would miss a cancellation.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SUBSCRIBE_TIMEOUT
+    while channels > 0:
+        left = deadline - loop.time()
+        if left <= 0:
+            msg = "Redis did not confirm the events subscription"
+            raise TimeoutError(msg)
+        reply = await pubsub.get_message(timeout=left)
+        if reply is not None and reply["type"] == "subscribe":
+            channels -= 1
 
 
 def connect(

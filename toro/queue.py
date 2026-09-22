@@ -15,7 +15,7 @@ from redis.asyncio.client import PubSub
 
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
-from .connection import connect
+from .connection import confirm_subscribed, connect
 from .errors import JobFailedError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
@@ -97,29 +97,6 @@ def _percentile(buckets: list[int], q: float) -> int:
 # children sit at scripts.LIVE_SCORE and above (see scripts.recordFinished). A
 # ZSET bound, exclusive.
 SETTLED = f"({scripts.LIVE_SCORE}"
-
-# How long Redis gets to confirm the events subscription before a waiter gives up.
-SUBSCRIBE_TIMEOUT = 5.0
-
-
-async def _confirm_subscribed(pubsub: PubSub) -> None:
-    """Wait until Redis has confirmed the subscription.
-
-    `subscribe()` returns once the command is WRITTEN, not once it has taken effect: a
-    dispatcher that reported itself ready in between would miss every event published
-    in that window, and `result()` on a job its own finish removed has nothing else to
-    read the outcome from.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + SUBSCRIBE_TIMEOUT
-    while True:
-        left = deadline - loop.time()
-        if left <= 0:
-            msg = "Redis did not confirm the events subscription"
-            raise TimeoutError(msg)
-        reply = await pubsub.get_message(timeout=left)
-        if reply is not None and reply["type"] == "subscribe":
-            return
 
 
 class Queue:
@@ -451,7 +428,7 @@ class Queue:
             pubsub = self.redis.pubsub()
             try:
                 await pubsub.subscribe(self.keys.events)
-                await _confirm_subscribed(pubsub)
+                await confirm_subscribed(pubsub)
             except BaseException:
                 with contextlib.suppress(Exception):
                     await pubsub.aclose()  # it owns a connection by now

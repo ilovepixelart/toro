@@ -694,10 +694,24 @@ return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7]
 # worker has taken over. A successful renew also resets the stalled window.
 # KEYS[1] lock key  KEYS[2] stalled set
 # ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] jobId
+# What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
+# and the script cannot drift over a bare 2.
+LOCK_CANCEL_REQUESTED = 2
+
+# What EXTEND_LOCK answers when the job has been asked to stop. Named so the worker
+# and the script cannot drift over a bare 2.
+LOCK_CANCEL_REQUESTED = 2
+
+# Returns 0 (the lock is gone), 1 (renewed) or 2 (renewed, and a cancellation has
+# been asked for). The renewal is the backstop for a cancel message that never
+# arrived: a worker that stops asking has lost the job to the stalled sweep anyway,
+# so this cannot be the thing that is missed.
+# KEYS[1] lock  KEYS[2] stalled  KEYS[3] job hash
 EXTEND_LOCK = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   redis.call("SET", KEYS[1], ARGV[1], "PX", tonumber(ARGV[2]))
   redis.call("SREM", KEYS[2], ARGV[3])
+  if redis.call("HGET", KEYS[3], "cancel") then return 2 end
   return 1
 end
 return 0
@@ -978,6 +992,34 @@ if parentId then
   end
 end
 return existed
+"""
+)
+
+# Commit a job its worker stopped. Token-guarded like every other finish: a worker
+# that lost its lock commits NOTHING, so a job taken over mid-cancellation is not
+# ended twice. No fetch-next: a cancellation is rare, and the loop takes the next job
+# the way an idle worker does.
+# KEYS[1] active  KEYS[2] cancelled  KEYS[3] job hash  KEYS[4] lock
+# KEYS[5] prioritized  KEYS[6] marker  KEYS[7] base  KEYS[8] events channel
+# ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] token  ARGV[4] metricsRetention(ms)
+# Returns -2 lock lost, -3 not active, 1 committed.
+MOVE_TO_CANCELLED = (
+    _LIB
+    + """
+local base = KEYS[7]
+if redis.call("GET", KEYS[4]) ~= ARGV[3] then return -2 end
+redis.call("DEL", KEYS[4])
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+local now = tonumber(ARGV[2])
+-- read BEFORE recordFinished (retention may DEL the hash)
+local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail")
+recordFinished(KEYS[2], KEYS[3], base, ARGV[1], now, "cancel", "1", "cancelled")
+redis.call("PUBLISH", KEYS[8], cjson.encode({jobId = ARGV[1], event = "cancelled"}))
+if meta[1] then
+  settleChildFailed(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[4]))
+end
+wakeIfWaiting(KEYS[5], KEYS[6])
+return 1
 """
 )
 
