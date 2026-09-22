@@ -232,6 +232,11 @@ local function wakeIfWaiting(prioritizedKey, markerKey)
     redis.call("ZADD", markerKey, 0, "0")
   end
 end
+-- A job is finished when it will not run again: no attempt left, retention applies.
+-- Every place that asks reads this, so a new terminal state joins them all at once.
+local function isFinished(state)
+  return state == "completed" or state == "failed" or state == "cancelled"
+end
 local function delKeys(base, id)
   redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
              base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail",
@@ -248,7 +253,7 @@ local function delJobs(ids, base)
     -- mid-flight and strand the concurrency key it holds.
     for _, cid in ipairs(redis.call("ZRANGE", base .. id .. ":live", 0, -1)) do
       local cstate = redis.call("HGET", base .. cid, "state")
-      if cstate == "completed" or cstate == "failed" then
+      if isFinished(cstate) then
         redis.call("ZREM", base .. cstate, cid)
         delKeys(base, cid)
       end
@@ -354,7 +359,7 @@ local function runningRoot(base, parentId, rootId)
     end
   end
   local rstate = redis.call("HGET", base .. rootId, "state")
-  if not rstate or rstate == "completed" or rstate == "failed" then return nil end
+  if not rstate or isFinished(rstate) then return nil end
   return rootId
 end
 -- Whether a job's own option keeps every job in its set: the one thing a cascade
@@ -379,7 +384,7 @@ local function removeFinished(base, setKey, jobId)
   if meta[2] then
     for _, cid in ipairs(cjson.decode(meta[2])) do
       local cstate = redis.call("HGET", base .. cid, "state")
-      if (cstate == "completed" or cstate == "failed") and not keptForever(base, cid, cstate) then
+      if isFinished(cstate) and not keptForever(base, cid, cstate) then
         gone = gone + removeFinished(base, base .. cstate, cid)
       end
     end
@@ -393,7 +398,7 @@ local function settleLive(base, rootId, now)
   local key = base .. rootId .. ":live"
   for _, cid in ipairs(redis.call("ZRANGE", key, 0, -1)) do
     local cstate = redis.call("HGET", base .. cid, "state")
-    if cstate == "completed" or cstate == "failed" then
+    if isFinished(cstate) then
       redis.call("ZADD", base .. cstate, now + 1, cid)
     end
   end
@@ -406,7 +411,7 @@ local function reviveSubtree(base, rootId, jobId, now)
   if not children then return end
   for _, cid in ipairs(cjson.decode(children)) do
     local cstate = redis.call("HGET", base .. cid, "state")
-    if cstate == "completed" or cstate == "failed" then
+    if isFinished(cstate) then
       redis.call("ZADD", base .. cstate, LIVE + now, cid)
       redis.call("ZADD", base .. rootId .. ":live", now, cid)
     end
@@ -918,6 +923,7 @@ return 1
 # dependency (nothing left to wait for).
 # KEYS[1] prioritized  KEYS[2] active  KEYS[3] delayed  KEYS[4] completed
 # KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base  KEYS[8] held
+# KEYS[9] cancelled
 # ARGV[1] jobId  ARGV[2] now(ms)
 REMOVE_JOB = (
     _LIB
@@ -936,6 +942,7 @@ local function removeFromState(jobId, state)
   elseif state == "delayed" then redis.call("ZREM", KEYS[3], jobId)
   elseif state == "completed" then redis.call("ZREM", KEYS[4], jobId)
   elseif state == "failed" then redis.call("ZREM", KEYS[5], jobId)
+  elseif state == "cancelled" then redis.call("ZREM", KEYS[9], jobId)
   elseif state == "waiting-children" then redis.call("ZREM", KEYS[6], jobId)
   elseif state == "held" then redis.call("ZREM", KEYS[8], jobId)
   else
@@ -946,6 +953,7 @@ local function removeFromState(jobId, state)
     redis.call("ZREM", KEYS[5], jobId)
     redis.call("ZREM", KEYS[6], jobId)
     redis.call("ZREM", KEYS[8], jobId)
+    redis.call("ZREM", KEYS[9], jobId)
   end
 end
 local function removeTree(jobId)
@@ -970,6 +978,45 @@ if parentId then
   end
 end
 return existed
+"""
+)
+
+# Cancel a job: stop it wherever it is. A job that has not started is ended right
+# here, with no worker involved; a running one is asked to stop, and its worker acts
+# on the request (through the events channel, or EXTEND_LOCK as the backstop).
+# Cancellation commits through recordFinished, so it hands a concurrency key on,
+# settles a flow parent and applies retention exactly as any other finish does.
+# KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] held  KEYS[4] waiting-children
+# KEYS[5] cancelled  KEYS[6] key base  KEYS[7] events channel
+# ARGV[1] jobId  ARGV[2] now(ms)
+# Returns 0 (nothing to cancel), 1 (cancelled here) or 2 (a running job was asked).
+CANCEL_JOB = (
+    _LIB
+    + """
+local base = KEYS[6]
+local jobKey = base .. ARGV[1]
+local state = redis.call("HGET", jobKey, "state")
+if not state or isFinished(state) then return 0 end
+local now = tonumber(ARGV[2])
+if state == "active" then
+  -- Its worker owns the processor, so only the worker can stop it. Record the ask
+  -- where the lock check will find it, and say so now for the worker listening.
+  redis.call("HSET", jobKey, "cancel", "1")
+  redis.call("PUBLISH", KEYS[7],
+    cjson.encode({jobId = ARGV[1], event = "cancel-requested"}))
+  return 2
+end
+if state == "wait" then redis.call("ZREM", KEYS[1], ARGV[1])
+elseif state == "delayed" then redis.call("ZREM", KEYS[2], ARGV[1])
+elseif state == "held" then redis.call("ZREM", KEYS[3], ARGV[1])
+elseif state == "waiting-children" then redis.call("ZREM", KEYS[4], ARGV[1])
+end
+-- a job queued behind a key leaves that queue; a holder hands its key on inside
+-- recordFinished, like any other job reaching a terminal state
+unkey(base, ARGV[1], state, redis.call("HGET", jobKey, "ckey"), now)
+recordFinished(KEYS[5], jobKey, base, ARGV[1], now, "cancel", "1", "cancelled")
+redis.call("PUBLISH", KEYS[7], cjson.encode({jobId = ARGV[1], event = "cancelled"}))
+return 1
 """
 )
 
@@ -1093,7 +1140,7 @@ return {total, ids}
 # counted by membership in the children index. One atomic round trip for all seven.
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] completed  KEYS[4] failed
 # KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] held
-# KEYS[8] children  KEYS[9] scratch
+# KEYS[8] children  KEYS[9] scratch  KEYS[10] cancelled
 ROOTS_COUNTS = """
 local ch = KEYS[8]
 local sc = KEYS[9]
@@ -1106,7 +1153,8 @@ local active = 0
 for _, jid in ipairs(redis.call("LRANGE", KEYS[6], 0, -1)) do
   if redis.call("ZSCORE", ch, jid) == false then active = active + 1 end
 end
-return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS[7]), active}
+return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS[7]),
+        rc(KEYS[10]), active}
 """
 
 

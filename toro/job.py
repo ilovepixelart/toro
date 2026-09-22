@@ -13,7 +13,13 @@ from ._replies import _str_dict
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
 # `waiting-children` is the flow-parent park: enqueued, but runnable only once
 # every child has settled. `held` waits on a concurrency key, not on a worker.
-JobState = Literal["wait", "active", "delayed", "held", "completed", "failed", "waiting-children"]
+# `cancelled` was stopped on purpose, which is not a failure and is not counted as one.
+JobState = Literal[
+    "wait", "active", "delayed", "held", "completed", "failed", "cancelled", "waiting-children"
+]
+# The states a job is finished in: no further attempt, and retention applies. The one
+# such list - Lua asks the same question through `isFinished` in scripts.py.
+FINISHED_STATES: tuple[JobState, ...] = ("completed", "failed", "cancelled")
 
 
 class BackoffOpts(TypedDict, total=False):

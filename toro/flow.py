@@ -12,12 +12,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from . import scripts
-from .job import JobOptions
+from .job import FINISHED_STATES, JobOptions
 
 OnFail = Literal["fail_parent", "continue"]
 
 # A flow node is terminal once it has settled; anything else is still moving.
-_TERMINAL = ("completed", "failed")
+_TERMINAL = FINISHED_STATES
 
 # Whole-tree cap: ADD_FLOW inserts the tree in one atomic script, so its size
 # bounds how long that script can hold Redis (same idea as PROMOTE_BATCH).

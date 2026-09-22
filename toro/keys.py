@@ -88,6 +88,11 @@ class Keys:
         return f"{self.base}limiter"
 
     @property
+    def cancelled(self) -> str:
+        # ZSET of jobs stopped on purpose, scored like the other finished sets.
+        return f"{self.base}cancelled"
+
+    @property
     def held(self) -> str:
         # ZSET of every job waiting on a concurrency key, scored by enqueue time.
         return f"{self.base}held"

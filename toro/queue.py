@@ -19,7 +19,7 @@ from .connection import connect
 from .errors import JobFailedError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
-from .job import Deduplication, Job, JobOptions, JobState, decode_results
+from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
 from .scheduler import next_run, valid_cron
 
@@ -149,6 +149,7 @@ class Queue:
         self._add_flow_script = self.redis.register_script(scripts.ADD_FLOW)
         self._retry_job = self.redis.register_script(scripts.RETRY_JOB)
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
+        self._cancel_job = self.redis.register_script(scripts.CANCEL_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
         self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
@@ -647,7 +648,17 @@ class Queue:
         pipe.zcard(self.keys.failed)
         pipe.zcard(self.keys.waiting_children)
         pipe.zcard(self.keys.held)
-        wait, active, delayed, completed, failed, waiting_children, held = await pipe.execute()
+        pipe.zcard(self.keys.cancelled)
+        (
+            wait,
+            active,
+            delayed,
+            completed,
+            failed,
+            waiting_children,
+            held,
+            cancelled,
+        ) = await pipe.execute()
         return {
             "wait": wait,
             "active": active,
@@ -656,6 +667,7 @@ class Queue:
             "failed": failed,
             "waiting-children": waiting_children,
             "held": held,
+            "cancelled": cancelled,
         }
 
     async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
@@ -874,7 +886,7 @@ class Queue:
         """
         if state == "active":
             ids = await self.redis.lrange(self.keys.active, start, end)
-        elif state in ("completed", "failed"):
+        elif state in FINISHED_STATES:
             count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
             ids = await self._newest_finished(self._finished_zset(state), start, count)
         else:
@@ -912,7 +924,7 @@ class Queue:
         """Map a ZSET-backed state to (key, newest_first) for the roots diff.
         `active` is a LIST and is handled separately by the caller.
         """
-        if state in ("completed", "failed"):  # finished states read newest-first
+        if state in FINISHED_STATES:  # finished states read newest-first
             return self._finished_zset(state), True
         return self._state_zset(state), False
 
@@ -958,9 +970,12 @@ class Queue:
                 self.keys.held,
                 self.keys.children,
                 self.keys.roots_scratch,
+                self.keys.cancelled,
             ],
         )
-        wait, delayed, completed, failed, waiting_children, held, active = (int(x) for x in res)
+        (wait, delayed, completed, failed, waiting_children, held, cancelled, active) = (
+            int(x) for x in res
+        )
         return {
             "wait": wait,
             "active": active,
@@ -969,6 +984,7 @@ class Queue:
             "failed": failed,
             "waiting-children": waiting_children,
             "held": held,
+            "cancelled": cancelled,
         }
 
     def _retry_job_keys(self, job_id: str) -> list[str]:
@@ -1022,6 +1038,7 @@ class Queue:
             self.keys.waiting_children,
             self.keys.base,
             self.keys.held,
+            self.keys.cancelled,
         ]
 
     async def remove_job(self, job_id: str) -> bool:
@@ -1032,6 +1049,29 @@ class Queue:
         nothing else is left to wait for.
         """
         res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id, _now_ms()])
+        return bool(res)
+
+    async def cancel_job(self, job_id: str) -> bool:
+        """Stop a job wherever it is. True when there was something to stop.
+
+        A job that has not started ends here and now. A RUNNING job is asked to stop:
+        its worker owns the processor, so only the worker can cancel it, which it does
+        as soon as it hears (over the events channel, or at its next lock renewal).
+        Either way the job ends in `cancelled`, which is not a failure and is not
+        retried. A job that has already finished, or that is gone, returns False.
+        """
+        res = await self._cancel_job(
+            keys=[
+                self.keys.prioritized,
+                self.keys.delayed,
+                self.keys.held,
+                self.keys.waiting_children,
+                self.keys.cancelled,
+                self.keys.base,
+                self.keys.events,
+            ],
+            args=[str(job_id), _now_ms()],
+        )
         return bool(res)
 
     async def promote_job(self, job_id: str) -> bool:
@@ -1055,7 +1095,7 @@ class Queue:
         """
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
-        if state in ("completed", "failed"):
+        if state in FINISHED_STATES:
             zset = self._finished_zset(state)
             if newest:
                 return await self._newest_finished(zset, 0, limit)
@@ -1065,8 +1105,10 @@ class Queue:
         return _str_list(await self.redis.zrange(self._state_zset(state), 0, limit - 1))
 
     def _finished_zset(self, state: JobState) -> str:
-        """Name the ZSET a finished state lists from. The pair reads newest-first."""
-        return self.keys.completed if state == "completed" else self.keys.failed
+        """Name the ZSET a finished state lists from; all of them read newest-first."""
+        if state == "completed":
+            return self.keys.completed
+        return self.keys.failed if state == "failed" else self.keys.cancelled
 
     def _state_zset(self, state: JobState) -> str:
         """Name the ZSET a non-active, non-finished state lists from.
