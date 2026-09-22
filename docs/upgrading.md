@@ -12,6 +12,11 @@ commits nothing, leaving the job `cancelled` in Redis while the work carried on.
 Roll the fleet first, then start cancelling. Nothing changes for a queue that never
 calls `cancel_job()`.
 
+`remove_job()` on a RUNNING job now stops its processor, where it used to leave the
+work running with nowhere to report until it ended on its own. A processor that must
+not be interrupted should not be removed mid-flight; wait for it, or let the job
+finish. The slot it holds, including under a global concurrency cap, frees at once.
+
 `cancelled` is a new `JobState`, so anything enumerating states sees an eighth. It
 is NOT a failure: it is counted, listed and retained separately, `retry_job()`
 refuses it, and `result()` raises `JobCancelledError` rather than `JobFailedError`.

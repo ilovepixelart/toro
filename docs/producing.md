@@ -187,7 +187,7 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.retry_all_failed(limit=1000)` | Re-queue every failed job (pipelined, one round trip per batch); returns how many were retried. |
 | `await queue.promote_job(job_id)` | Run a delayed job now. |
 | `await queue.cancel_job(job_id)` | Stop a job wherever it is, leaving it in `cancelled`. One that has not started ends at once; a RUNNING one is asked, and its worker stops the processor where it awaits ([Processing](processing.md#cancellation)). A flow parent takes its subtree. False when there was nothing to stop. |
-| `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. Removing a flow parent removes its whole subtree - children included, even running ones. |
+| `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. A RUNNING job's processor is stopped too, so its worker slot frees at once rather than when the work happens to end; the job is removed, not `cancelled`. Removing a flow parent removes its whole subtree - children included, even running ones. |
 | `await queue.clean(state, limit=1000)` | Remove every job in a state (pipelined). |
 | `await queue.pause()` / `resume()` / `is_paused()` | Stop workers claiming new jobs (in-flight jobs finish); resume wakes idle workers. |
 

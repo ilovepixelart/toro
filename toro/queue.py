@@ -808,6 +808,7 @@ class Queue:
                     "heartbeat": heartbeat,
                     "processed": int(h.get("processed", 0)),
                     "failed": int(h.get("failed", 0)),
+                    "cancelled": int(h.get("cancelled", 0)),
                     "current": json.loads(h.get("current", "[]")),
                     "state": h.get("state", "running"),
                 }

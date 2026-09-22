@@ -485,3 +485,30 @@ async def test_removing_a_running_job_stops_its_processor(q, run_worker):
 
     assert await q.redis.exists(q.keys.job(job.id)) == 0  # removed, not cancelled
     assert await _count(q, "cancelled") == 0
+
+
+async def test_a_worker_reports_its_cancellations(q, run_worker, run_until):
+    """The count has to reach the API, not just Redis: a dashboard shows a worker's
+    completions and its failures, and the work it was told to stop belongs beside
+    them."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2, heartbeat_interval=50):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=10)
+
+        assert await run_until(_worker_cancelled(q, 1), timeout=10)
+
+
+def _worker_cancelled(q: Queue, n: int):
+    async def check() -> bool:
+        return any(w.get("cancelled") == n for w in await q.workers())
+
+    return check
