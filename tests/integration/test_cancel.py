@@ -891,3 +891,25 @@ async def test_a_worker_shutting_down_does_not_swallow_its_own_cancellation(q):
 
 async def _noop_proc(job):
     return None
+
+
+async def test_a_job_already_queued_is_cancellable_the_instant_it_runs(q, run_worker, run_until):
+    """CN-003: a worker starting against a queue that already has work claims it in
+    the same breath as it starts. Subscribing after that, rather than before, leaves
+    the job running with nobody able to hear a cancellation for it, and the request
+    waits out a whole lock renewal."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    job = await q.add("waiting-already", {})  # queued BEFORE any worker exists
+
+    async with run_worker(q, proc, concurrency=2, lock_duration=60_000, lock_renew_time=30_000):
+        await asyncio.wait_for(started.wait(), 10)
+
+        assert await q.cancel_job(job.id) is True
+
+        # the lock backstop is half a minute away, so only the message can land this
+        assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=3)
