@@ -62,6 +62,8 @@ class JobOptions:
     priority: int = 0  # higher = more urgent (global order); 0 = default, FIFO
     remove_on_complete: RemoveOption = None
     remove_on_fail: RemoveOption = None
+    # Jobs that share a key run one at a time, in the order they were added.
+    concurrency_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +73,7 @@ class JobOptions:
             "priority": self.priority,
             "removeOnComplete": self.remove_on_complete,
             "removeOnFail": self.remove_on_fail,
+            "concurrencyKey": self.concurrency_key,
         }
 
     @classmethod
@@ -82,6 +85,7 @@ class JobOptions:
             priority=d.get("priority", 0),
             remove_on_complete=d.get("removeOnComplete"),
             remove_on_fail=d.get("removeOnFail"),
+            concurrency_key=d.get("concurrencyKey"),
         )
 
 

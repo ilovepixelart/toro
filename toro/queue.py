@@ -121,6 +121,20 @@ async def _confirm_subscribed(pubsub: PubSub) -> None:
             return
 
 
+def _key_segment(value: object, what: str) -> str | None:
+    """Validate an id that becomes a Redis key segment, or None when unset.
+
+    `:` or a control character would let two distinct ids collide into one key, and
+    silently share what belongs to one of them.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or ":" in value or any(ord(c) < 0x20 for c in value):
+        msg = f"{what} must be a non-empty string with no ':' or control characters"
+        raise ValueError(msg)
+    return value
+
+
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -204,6 +218,7 @@ class Queue:
         """
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
+        options.concurrency_key = _key_segment(options.concurrency_key, "concurrency_key")
         if job_id is not None:
             job_id = self._custom_job_id(job_id)
         dedup_id, dedup_ttl = "", 0
@@ -529,7 +544,11 @@ class Queue:
             raise ValueError(f"invalid cron expression: {cron!r}")
         # The queue's defaults go INTO the template: a worker mints every later
         # occurrence from it, and a worker never sees the producer's defaults.
-        merged = {**self.default_job_options, **job_opts, "priority": _clamp_priority(priority)}
+        merged: dict[str, Any] = {
+            **self.default_job_options,
+            **job_opts,
+            "priority": _clamp_priority(priority),
+        }
         opts = JobOptions(**merged).to_dict()
         template = {
             "name": name or scheduler_id,

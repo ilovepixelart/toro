@@ -402,6 +402,19 @@ async def test_deduplication_throttles_within_ttl(q):
     assert (await q.counts())["wait"] == 2
 
 
+@pytest.mark.parametrize("bad", ["", "a:b", "ctrl\x01", "\n", 7])
+async def test_a_concurrency_key_must_be_a_key_segment(q, bad):
+    """It becomes a Redis key segment, like a scheduler or deduplication id: two
+    logically distinct keys must not collide into one."""
+    with pytest.raises(ValueError, match="concurrency_key"):
+        await q.add("job", {}, concurrency_key=bad)
+
+
+async def test_a_concurrency_key_is_visible_on_the_job(q):
+    job = await q.add("job", {}, concurrency_key="order-42")
+    assert (await q.get_job(job.id)).opts.concurrency_key == "order-42"
+
+
 async def test_the_events_dispatcher_is_live_before_a_result_waits(q):
     """`result()` reads a job's outcome from its terminal event, and a job whose own
     finish removed it has nothing else to read. redis-py's `subscribe()` returns once
