@@ -916,7 +916,10 @@ RETRY_JOB = (
     _LIB
     + """
 if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
-redis.call("HDEL", KEYS[4], "failedReason", "finishedOn")
+-- A retry is a decision to run this job again, so a cancellation that was asked for
+-- but never acted on goes with the failure it outlived. Left behind, it would stop
+-- the job at its next claim and leave it unrunnable: retry refuses a cancelled job.
+redis.call("HDEL", KEYS[4], "failedReason", "finishedOn", "cancel", "cancelReason")
 local base = KEYS[6]
 -- A flow that runs again: its finished jobs are live until it settles once more. Only
 -- a ROOT revives the subtree. A descendant retried under a running root finds its flow

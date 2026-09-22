@@ -654,3 +654,31 @@ async def test_a_message_for_another_claim_does_not_stop_this_one(q, run_worker,
 
         await q.redis.publish(q.keys.cancel, f"dup:{claim}")  # this claim
         assert await run_until(lambda: _in_state(q, "dup", "cancelled"), timeout=10)
+
+
+async def test_retrying_a_job_clears_an_unacted_cancellation(q, run_worker, run_until):
+    """A request that was never acted on leaves its flag on the hash: the job finished
+    some other way first, or an older worker could not hear it. Retrying is a decision
+    to run the job again, so the stale request must not kill it at the claim and leave
+    it unrunnable for good."""
+    runs = []
+
+    async def proc(job):
+        runs.append(job.id)
+        if not runs[1:]:
+            raise RuntimeError("boom")
+        return job.name
+
+    async with run_worker(q, proc, concurrency=2) as w:
+        w.on("failed", lambda *a, **k: None)
+        job = await q.add("j", {}, attempts=1)
+        assert await run_until(lambda: _in_state(q, job.id, "failed"), timeout=10)
+        # the request that never landed, still on the hash
+        await q.redis.hset(q.keys.job(job.id), mapping={"cancel": "1", "cancelReason": "stale"})
+
+        assert await q.retry_job(job.id) is True
+
+        assert await run_until(lambda: _in_state(q, job.id, "completed"), timeout=10)
+
+    assert runs == [job.id, job.id]  # it really ran again
+    assert (await q.get_job(job.id)).cancel_reason is None
