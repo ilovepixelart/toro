@@ -106,7 +106,7 @@ class Queue:
     ) -> None:
         self.name = name
         # Defaults merged into every add() (per-call options win) - e.g.
-        # default_job_options={"remove_on_complete": 1000} so you don't repeat it.
+        # default_job_options={"remove_on_complete": 100} so you don't repeat it.
         self.default_job_options = dict(default_job_options or {})
         self.keys = Keys(name, prefix)
         # NB: created with decode_responses=True, so every command returns str -
@@ -129,6 +129,23 @@ class Queue:
         self._events_task: asyncio.Task[None] | None = None
         self._dispatcher_lock = asyncio.Lock()
 
+    def _custom_job_id(self, job_id: object) -> str:
+        """Validate a custom job id: it becomes the job's Redis key, `<base><id>`."""
+        job_id = str(job_id)
+        if not job_id or job_id.isdigit():
+            raise ValueError(
+                "custom job_id must be a non-empty, non-all-digits string "
+                "(digits collide with auto-generated ids) - try e.g. 'order-123'"
+            )
+        conflict = self.keys.job_id_conflict(job_id)
+        if conflict:
+            # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
+            # add() that finds the key and returns as if the job already existed
+            raise ValueError(
+                f"custom job_id {job_id!r} is reserved: it is {conflict} - try e.g. 'job-{job_id}'"
+            )
+        return job_id
+
     async def add(
         self,
         name: str,
@@ -146,7 +163,8 @@ class Queue:
         `job_id`: a custom id. Adding a second job with an id that already exists
         is IDEMPOTENT - it's ignored, not duplicated (id-based dedup). Once the job
         is removed, the id is free to reuse. Must be a non-empty, non-all-digits
-        string (all-digit ids collide with auto-generated ones).
+        string (all-digit ids collide with auto-generated ones) that does not land
+        on another key of the queue (`Keys.job_id_conflict`).
 
         `deduplication`: `{"id": str, "ttl": ms}` - a throttle window. While the
         ttl is live, repeat adds with the same dedup id are ignored and the
@@ -155,12 +173,7 @@ class Queue:
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
         if job_id is not None:
-            job_id = str(job_id)
-            if not job_id or job_id.isdigit():
-                raise ValueError(
-                    "custom job_id must be a non-empty, non-all-digits string "
-                    "(digits collide with auto-generated ids) - try e.g. 'order-123'"
-                )
+            job_id = self._custom_job_id(job_id)
         dedup_id, dedup_ttl = "", 0
         if deduplication is not None:
             dedup_id = str(deduplication.get("id") or "")
@@ -476,7 +489,10 @@ class Queue:
             # fail at enqueue, not later inside a worker's _schedule_next (a silent
             # scheduler that errors on the backend)
             raise ValueError(f"invalid cron expression: {cron!r}")
-        opts = JobOptions(priority=_clamp_priority(priority), **job_opts).to_dict()
+        # The queue's defaults go INTO the template: a worker mints every later
+        # occurrence from it, and a worker never sees the producer's defaults.
+        merged = {**self.default_job_options, **job_opts, "priority": _clamp_priority(priority)}
+        opts = JobOptions(**merged).to_dict()
         template = {
             "name": name or scheduler_id,
             "every": str(every) if every else "",
@@ -528,16 +544,19 @@ class Queue:
         if not t:
             return False
         name = cast("str", t.get("name", scheduler_id))
-        opts = JobOptions.from_dict(json.loads(t.get("opts") or "{}"))
-        await self.add(
-            name,
-            json.loads(t.get("data") or "null"),
-            attempts=opts.attempts,
-            backoff=opts.backoff,
-            priority=opts.priority,
-            remove_on_complete=opts.remove_on_complete,
-            remove_on_fail=opts.remove_on_fail,
-        )
+        stored = JobOptions.from_dict(json.loads(t.get("opts") or "{}"))
+        opts: dict[str, Any] = {
+            "attempts": stored.attempts,
+            "backoff": stored.backoff,
+            "priority": stored.priority,
+        }
+        # Retention the template leaves unset stays the queue's call: passed on as an
+        # explicit None it would override `default_job_options`.
+        if stored.remove_on_complete is not None:
+            opts["remove_on_complete"] = stored.remove_on_complete
+        if stored.remove_on_fail is not None:
+            opts["remove_on_fail"] = stored.remove_on_fail
+        await self.add(name, json.loads(t.get("data") or "null"), **opts)
         return True
 
     async def schedulers(self) -> list[dict[str, Any]]:

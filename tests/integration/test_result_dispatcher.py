@@ -138,7 +138,7 @@ async def test_promote_drains_more_than_one_full_batch(q, run_worker, run_until)
                 "id": jid,
                 "name": "bench",
                 "data": "{}",
-                "opts": "{}",
+                "opts": '{"removeOnComplete": false}',  # the count below is of every job
                 "timestamp": due,
                 "attemptsMade": 0,
                 "priority": 0,

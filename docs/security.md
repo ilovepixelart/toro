@@ -16,9 +16,11 @@ amplifying that access.
   ids and payloads as arguments (`KEYS[]`/`ARGV[]`), and every published event
   is one `cjson.encode` document - there is no string interpolation into
   commands or event JSON anywhere.
-- **Key-safe identifiers.** Custom job ids, scheduler ids and deduplication
-  ids are validated (no `:`, no control characters) so two logically distinct
-  ids can never collide into one Redis key.
+- **Key-safe identifiers.** Scheduler ids and deduplication ids are validated
+  (no `:`, no control characters) so two logically distinct ids can never
+  collide into one Redis key. A custom job id may contain `:`, and is refused
+  when it would land on another key of the queue: a queue key's name, a queue
+  namespace, or another job's aux key.
 
 ## What you own
 

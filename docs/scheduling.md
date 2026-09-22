@@ -19,7 +19,9 @@ Re-calling with the same id **updates** the schedule in place.
 The `scheduler_id` is your handle (and a Redis key segment): a non-empty string
 without `:` or control characters. `name` defaults to the scheduler id; `data`
 and the job options (attempts, backoff, auto-removal, priority) are stamped onto
-every occurrence.
+every occurrence. The queue's `default_job_options` merge under them when the
+scheduler is registered, and are stored with it: workers mint each occurrence from
+the stored template, so call `add_scheduler()` again to change them.
 
 ## The two cadences
 

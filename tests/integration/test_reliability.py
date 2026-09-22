@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from toro import JobFailedError, Queue, Worker
+from toro import JobFailedError, Queue, Worker, scripts
 
 PREFIX = "torotest"
 QUEUE = "reliability"
@@ -141,7 +141,17 @@ async def test_fetch_next_in_finish(q):
             q.keys.meta_paused,
             q.keys.limiter,
         ],
-        args=[cur.id, "{}", _now_ms(), w.token, "1", 30000, -1, -1, 0, 0, 60_000, 0],
+        args=scripts.completed_args(
+            job_id=cur.id,
+            returnvalue="{}",
+            now=_now_ms(),
+            token=w.token,
+            fetch="1",
+            lock_duration=30000,
+            rl_max=0,
+            rl_duration=0,
+            global_concurrency=0,
+        ),
     )
     assert isinstance(res, list) and res[0] == 1
     assert len(res) == 3 and res[2] == nxt.id  # next handed back
@@ -338,6 +348,49 @@ async def test_custom_job_id_rejects_all_digits(q):
         await q.add("x", {}, job_id="123")
 
 
+@pytest.mark.parametrize(
+    "job_id",
+    [
+        "completed",  # the job hash WOULD BE the completed set: WRONGTYPE for the queue
+        "active",
+        "prioritized",  # add() found the queue's key and returned as if the job existed
+        "marker",
+        "id",
+        "repeat:nightly",  # a scheduler's template
+        "de:sync-user-42",  # a deduplication window
+        "de",  # its own lock, `de:lock`, is the window of the deduplication id `lock`
+        "metrics:1700000000000",
+        "7:lock",  # job 7's lock: claiming job 7 would overwrite this job
+        "order-123:results",
+    ],
+)
+async def test_custom_job_id_cannot_land_on_another_key(q, run_worker, run_until, job_id):
+    await q.add("first", {})  # the queue's own keys exist
+    with pytest.raises(ValueError, match="reserved"):
+        await q.add("victim", {}, job_id=job_id)
+
+    # nothing was written, and the queue still works end to end
+    ran = []
+
+    async def proc(job):
+        ran.append(job.name)
+
+    async with run_worker(q, proc):
+        assert await run_until(lambda: ran == ["first"])
+    assert (await q.counts())["completed"] == 1
+
+
+async def test_custom_job_id_may_use_colons(q, run_worker, run_until):
+    # `order:123` is how ids are written; only the queue's own namespaces are taken
+    async def proc(job):
+        return job.id
+
+    job = await q.add("welcome", {}, job_id="order:123")
+    async with run_worker(q, proc):
+        assert await job.result(timeout=10) == "order:123"
+    assert (await q.get_job("order:123")).state == "completed"
+
+
 async def test_deduplication_throttles_within_ttl(q):
     """A dedup id with a ttl ignores repeats within the window."""
     j1 = await q.add("notify", {"u": 1}, deduplication={"id": "user-1", "ttl": 5000})
@@ -371,6 +424,37 @@ async def test_rate_limit_throttles_throughput(q):
     assert len(done) < 12
     # The rest stay queued (rate limiting never fails or drops a job).
     assert (await q.counts())["wait"] == 12 - len(done)
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_finish_that_fetches_the_next_job_pays_the_limiter(q, outcome):
+    """Each finish script fetches the next job under the same limiter, reading the
+    limit from its own argument slots. A slot off by one is a limiter silently off, or
+    silently wrong, on that path alone. The bucket in Redis tells: the next fetch
+    spends one token of a bucket sized exactly `max`, and refills at `max/duration`."""
+    for i in range(3):
+        await q.add("job", {"i": i})
+
+    async def proc(job):
+        if outcome == "failed":
+            raise RuntimeError("boom")
+
+    w = Worker(
+        QUEUE, proc, prefix=PREFIX, rate_limit={"max": 7, "duration": 60_000}, stalled_interval=0
+    )
+    w.on("failed", lambda *a, **k: None)
+    task = asyncio.create_task(w.run())
+    try:
+        await asyncio.sleep(0.5)  # three claims: the first pop, then two finish-fetches
+    finally:
+        await w.stop()
+        task.cancel()
+
+    bucket = await q.redis.hgetall(q.keys.limiter)
+    assert (await q.counts())[outcome] == 3
+    # 7 tokens, one per claim, refilled by at most 0.5 s at 7 per minute
+    assert 4.0 <= float(bucket["tokens"]) < 4.1, bucket
+    assert 60_000 < await q.redis.pttl(q.keys.limiter) <= 61_000  # duration + 1 s
 
 
 async def test_rate_limit_disabled_runs_everything(q):
