@@ -108,11 +108,17 @@ async def test_cancelling_a_key_holder_hands_the_key_on(q):
     assert await _state(q, behind.id) == "wait"
 
 
-@pytest.mark.parametrize(("on_fail", "parent"), [("fail_parent", "failed"), ("continue", "wait")])
+@pytest.mark.parametrize(
+    ("on_fail", "parent"), [("fail_parent", "cancelled"), ("continue", "wait")]
+)
 async def test_a_cancelled_child_settles_its_parent_by_policy(q, on_fail, parent):
     """CN-006: a parent waits on its children, so a cancelled one has to settle it or
     the flow is parked forever. A child that was stopped will never deliver what its
-    parent waits for, which is what `on_fail` already decides: one rule, not two."""
+    parent waits for, which is what `on_fail` already decides: one rule, not two.
+
+    `fail_parent` stops the parent rather than failing it. The stop was deliberate, and
+    recording it as a failure is the one thing the separate state exists to prevent.
+    """
     root = await q.add_flow(
         "report", {}, children=[FlowChild("leaf", {}, delay=60_000, on_fail=on_fail)]
     )
@@ -123,9 +129,10 @@ async def test_a_cancelled_child_settles_its_parent_by_policy(q, on_fail, parent
 
     assert await _state(q, leaf) == "cancelled"
     assert await _in_state(q, root.id, parent)
-    if parent == "failed":
-        assert "cancelled" in (await q.get_job(root.id)).failed_reason
+    if parent == "cancelled":
+        assert await _count(q, "failed") == 0  # nothing failed, so nothing is counted
     else:
+        # the parent runs and can see why the child never delivered
         assert await q.redis.hget(q.keys.cfail(root.id), leaf) == "cancelled"
 
 
@@ -429,3 +436,27 @@ async def test_a_job_claimed_with_a_cancellation_pending_never_runs(q, run_worke
 
     assert ran == [], "a job with a cancellation pending was run"
     assert await _count(q, "completed") == 0
+
+
+async def test_a_cancellation_cascades_upward_as_a_cancellation(q):
+    """CN-005: the whole reason `cancelled` is a state of its own is that counting a
+    deliberate stop as a failure corrupts the failure signal. An ancestor failed by a
+    cancelled child would do exactly that, one bucket at a time."""
+    root = await q.add_flow(
+        "report",
+        {},
+        children=[FlowChild("mid", {}, children=[FlowChild("leaf", {}, delay=60_000)])],
+    )
+    mid = (await q.get_flow(root.id))["children"][0]["job"].id
+    leaf = (await q.get_flow(mid))["children"][0]["job"].id
+
+    assert await q.cancel_job(leaf) is True
+
+    assert await _state(q, leaf) == "cancelled"
+    assert await _state(q, mid) == "cancelled"  # not "failed": nothing failed
+    assert await _state(q, root.id) == "cancelled"
+    assert await _count(q, "failed") == 0
+    assert await _count(q, "cancelled") == 3
+
+    minute = (await q.metrics(minutes=5))[-1]
+    assert minute["failed"] == 0, "a cancellation was counted as a failure"

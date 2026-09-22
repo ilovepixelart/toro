@@ -46,7 +46,12 @@ told so rather than left waiting.
 - **A job that is not running needs no worker.** `wait`, `delayed`, `held` and
   `waiting-children` are cancelled inside the script that moves them, atomically.
   A held job leaves its key's queue; a holder hands the key on.
-- **Flows cancel as a unit**, like removal: cancelling a parent cancels its subtree.
+- **Flows cancel as a unit**, like removal: cancelling a parent cancels its subtree,
+  and a cancellation cascades UPWARD as a cancellation. A `fail_parent` ancestor of a
+  cancelled child is stopped, not failed: the stop was deliberate, so counting it as a
+  failure is the one thing the separate state exists to prevent, and a flow is not a
+  way back in. Under `continue` nothing changes: the parent still runs, and reads
+  "cancelled" as the reason in its `failed_children()` record.
 - **`result()` raises `JobCancelledError`**, a sibling of `JobFailedError`, rather
   than waiting out its timeout.
 
@@ -59,7 +64,7 @@ told so rather than left waiting.
 | CN-003 | The cancellation reaches the worker over `<base>cancel` within a fraction of the lock-renew interval, and reaches it through `EXTEND_LOCK` even when the message never arrives. | `::test_a_cancel_arrives_promptly`, `::test_a_cancel_with_no_message_still_lands` |
 | CN-004 | A cancelled job is terminal: it does not retry however many `attempts` remain, `retry_job()` returns False, and no further attempt is recorded. | `::test_a_cancelled_job_does_not_retry` |
 | CN-005 | `cancelled` is a state everywhere: `counts()`, `roots_counts()`, `get_jobs`, `get_jobs_roots`, `search`, `remove_job`, `clean`. Retention applies to it under `remove_on_fail`. | `::test_cancelled_is_a_state` |
-| CN-006 | Cancelling frees what the job held: a concurrency-key holder hands the key on, a held job leaves its key's queue, and a cancelled child settles its parent by the parent's own `on_fail` policy. | `::test_cancelling_a_held_job_leaves_its_keys_queue`, `::test_cancelling_a_key_holder_hands_the_key_on`, `::test_a_cancelled_child_settles_its_parent_by_policy` |
+| CN-006 | Cancelling frees what the job held: a concurrency-key holder hands the key on, a held job leaves its key's queue, and a cancelled child settles its parent by the parent's own `on_fail` policy, stopping a `fail_parent` ancestor rather than failing it. | `::test_cancelling_a_held_job_leaves_its_keys_queue`, `::test_cancelling_a_key_holder_hands_the_key_on`, `::test_a_cancelled_child_settles_its_parent_by_policy`, `::test_a_cancellation_cascades_upward_as_a_cancellation` |
 | CN-007 | Cancelling a flow parent cancels its whole subtree, running children included. | `::test_cancelling_a_flow_takes_its_subtree` |
 | CN-008 | `result()` on a cancelled job raises `JobCancelledError`, whether it was waiting when the cancel landed or asked afterwards. | `::test_result_reports_a_cancellation` |
 | CN-009 | `cancel_job()` on a job that is already terminal, or absent, returns False and changes nothing. | `::test_cancelling_what_cannot_be_cancelled` |

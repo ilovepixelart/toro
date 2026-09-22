@@ -491,13 +491,18 @@ local function settleChildCompleted(base, jobId, parentId, returnvalue, now)
     releaseParent(base, parentId, now)
   end
 end
--- A terminally-failed child settles its parent per its `onFail` policy:
+-- A child that will never deliver settles its parent per its `onFail` policy:
 -- "continue" records the failure and releases the parent once nothing is
 -- pending; anything else fails the parent NOW - eagerly, no worker needed -
 -- walking up through ancestors that are themselves fail_parent children.
 -- There is no "park forever" outcome by design. Eager failure goes through
 -- recordFinished so remove_on_fail retention applies like any other failure.
-local function settleChildFailed(base, jobId, parentId, onFail, reason, now, retentionMs)
+-- `state` is how the child ended: an ancestor stopped by a CANCELLED child is
+-- cancelled, not failed. Counting a deliberate stop as a failure is the one thing
+-- the separate state exists to prevent, so it must not come back through the flow.
+-- Under `continue` the parent still runs either way, with the reason in its `:cfail`
+-- record: a cancelled child reads there as "cancelled".
+local function settleChildGone(base, jobId, parentId, onFail, reason, now, retentionMs, state)
   local cid = jobId
   local pid = parentId
   while pid do
@@ -511,18 +516,25 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
       end
       return
     end
-    -- already settled (a sibling failed it first, or it was removed): stop
+    -- already settled (a sibling settled it first, or it was removed): stop
     if redis.call("ZREM", base .. "waiting-children", pid) == 0 then return end
-    reason = "child " .. cid .. " failed: " .. reason
-    -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+    -- read BEFORE recordFinished (retention may DEL the hash)
     local pmeta = redis.call("HMGET", base .. pid, "parentId", "onFail", "name")
-    recordFinished(base .. "failed", base .. pid, base, pid, now,
-      "failedReason", reason, "failed")
-    recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
-    -- reached the ROOT of the flow (no grandparent): count one flow failure
-    if not pmeta[1] then recordFlow(base, false, now, 0, retentionMs) end
-    redis.call("PUBLISH", base .. "events",
-      cjson.encode({jobId = tostring(pid), event = "failed", reason = reason}))
+    if state == "cancelled" then
+      recordFinished(base .. "cancelled", base .. pid, base, pid, now,
+        "cancel", "1", "cancelled")
+      redis.call("PUBLISH", base .. "events",
+        cjson.encode({jobId = tostring(pid), event = "cancelled"}))
+    else
+      reason = "child " .. cid .. " failed: " .. reason
+      recordFinished(base .. "failed", base .. pid, base, pid, now,
+        "failedReason", reason, "failed")
+      recordMetrics(base, "failed", now, 0, retentionMs, pmeta[3])
+      -- reached the ROOT of the flow (no grandparent): count one flow failure
+      if not pmeta[1] then recordFlow(base, false, now, 0, retentionMs) end
+      redis.call("PUBLISH", base .. "events",
+        cjson.encode({jobId = tostring(pid), event = "failed", reason = reason}))
+    end
     cid = pid
     pid = pmeta[1]
     onFail = pmeta[2]
@@ -811,12 +823,13 @@ else
   redis.call("PUBLISH", KEYS[11],
     cjson.encode({jobId = ARGV[1], event = "failed", reason = ARGV[2]}))
   -- a root flow whose own processor failed (children all settled): count it.
-  -- A child failing (meta[3] set) instead propagates through settleChildFailed,
+  -- A child failing (meta[3] set) instead propagates through settleChildGone,
   -- which counts the root it reaches - the two paths are disjoint, no double count
   if meta[5] and not meta[3] then recordFlow(KEYS[9], false, now, 0, tonumber(ARGV[12])) end
   -- a flow child settles into its parent per its on_fail policy, atomically
   if meta[3] then
-    settleChildFailed(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[12]))
+    settleChildGone(KEYS[9], ARGV[1], meta[3], meta[4], ARGV[2], now, tonumber(ARGV[12]),
+      "failed")
   end
   outcome = 1
 end
@@ -1011,7 +1024,8 @@ local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail")
 recordFinished(KEYS[2], KEYS[3], base, ARGV[1], now, "cancel", "1", "cancelled")
 redis.call("PUBLISH", KEYS[8], cjson.encode({jobId = ARGV[1], event = "cancelled"}))
 if meta[1] then
-  settleChildFailed(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[4]))
+  settleChildGone(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[4]),
+    "cancelled")
 end
 wakeIfWaiting(KEYS[5], KEYS[6])
 return 1
@@ -1079,7 +1093,8 @@ if topState == "active" then return 2 end   -- its worker settles it when it sto
 -- onFail policy decides, exactly as it does for a child that failed: there is one
 -- rule for "this child will never deliver", not two.
 if top[1] then
-  settleChildFailed(base, ARGV[1], top[1], top[2], "cancelled", now, tonumber(ARGV[3]))
+  settleChildGone(base, ARGV[1], top[1], top[2], "cancelled", now, tonumber(ARGV[3]),
+    "cancelled")
 end
 return 1
 """
@@ -1126,7 +1141,8 @@ if #stalling > 0 then
           -- the crash path settles flow parents too - a dead worker must not
           -- leave a parent parked forever
           if meta[2] then
-            settleChildFailed(KEYS[6], jobId, meta[2], meta[3], reason, now, tonumber(ARGV[4]))
+            settleChildGone(KEYS[6], jobId, meta[2], meta[3], reason, now,
+              tonumber(ARGV[4]), "failed")
           elseif meta[4] then
             -- a released root flow parent that stalled out: count the flow failed
             recordFlow(KEYS[6], false, now, 0, tonumber(ARGV[4]))
