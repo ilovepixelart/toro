@@ -223,3 +223,54 @@ async def _until(predicate, *, timeout: float = 10.0) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError("condition never held")
+
+
+async def test_a_retried_job_waits_for_the_key_again(q, run_worker, run_until):
+    """CK-005: a failed job gave its key up. Retrying it puts it back in the queue for
+    the key, behind whoever holds it now, rather than beside them."""
+    gate = asyncio.Event()
+    started: list[str] = []
+
+    async def failing(job):
+        started.append(job.name)
+        if job.name == "flaky":
+            raise RuntimeError("boom")
+        if job.data.get("hold"):
+            await gate.wait()
+        return job.name
+
+    async with run_worker(q, failing, concurrency=4) as w:
+        w.on("failed", lambda *a, **k: None)
+        flaky = await q.add("flaky", {}, concurrency_key="k")
+        await _until(lambda: _in_state(q, flaky.id, "failed"))
+        holder = await q.add("holder", {"hold": True}, concurrency_key="k")
+        await _until(lambda: _in_state(q, holder.id, "active"))
+
+        assert await q.retry_job(flaky.id) is True
+
+        assert await _in_state(q, flaky.id, "held")
+        assert await q.redis.get(q.keys.concurrency("k")) == holder.id
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 1), timeout=10)
+        await _until(lambda: _left_held(q, flaky.id))
+
+
+async def test_a_scheduled_occurrence_waits_for_the_key(q, run_worker, run_until):
+    """CK-005: an occurrence a worker mints is a job like any other, and waits for the
+    key rather than running beside its holder."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        await _until(lambda: _count_is(q, "active", 1)())
+        await q.add_scheduler("tick", every=60_000, concurrency_key="k")
+
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+        assert await _count(q, "delayed") == 0  # it waits on the key, not on the clock
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 1), timeout=10)
+
+    # the key is free, so the occurrence goes back to waiting out its schedule
+    await _until(lambda: _count_is(q, "delayed", 1)())
+    assert await _count(q, "held") == 0

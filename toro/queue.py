@@ -579,6 +579,7 @@ class Queue:
                 when,
                 opts.get("priority", 0),
                 scheduler_id,
+                opts.get("concurrencyKey") or "",
             ],
         )
 

@@ -789,17 +789,27 @@ return {outcome}
 # KEYS[1] delayed  KEYS[2] key base
 # ARGV[1] jobId  ARGV[2] name  ARGV[3] data(json)  ARGV[4] opts(json)
 # ARGV[5] now(ms)  ARGV[6] processAt(ms)  ARGV[7] priority  ARGV[8] schedulerId
-ADD_SCHEDULED = """
-local jobKey = KEYS[2] .. ARGV[1]
+# ARGV[9] concurrency key ("" = none)
+ADD_SCHEDULED = (
+    _LIB
+    + """
+local base = KEYS[2]
+local jobKey = base .. ARGV[1]
 if redis.call("EXISTS", jobKey) == 1 then return 0 end
+local now = tonumber(ARGV[5])
 redis.call("HSET", jobKey,
   "id", ARGV[1], "name", ARGV[2], "data", ARGV[3], "opts", ARGV[4],
-  "timestamp", ARGV[5], "attemptsMade", 0, "priority", ARGV[7],
-  "delay", tonumber(ARGV[6]) - tonumber(ARGV[5]), "state", "delayed",
-  "schedulerId", ARGV[8])
-redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
+  "timestamp", now, "attemptsMade", 0, "priority", ARGV[7],
+  "delay", tonumber(ARGV[6]) - now, "schedulerId", ARGV[8])
+-- an occurrence waits for its key like any job: held now, and back to `delayed` at
+-- its own due time when the key frees (see releaseKey)
+if takeKey(base, jobKey, ARGV[1], ARGV[9], tonumber(ARGV[7]), base .. "pc", now) then
+  redis.call("HSET", jobKey, "state", "delayed")
+  redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
+end
 return 1
 """
+)
 
 # Promote a delayed job to run now (admin/dashboard action).
 # KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] job hash  KEYS[5] pc
@@ -850,8 +860,13 @@ if redis.call("SCARD", base .. ARGV[1] .. ":deps") > 0 then
   return 1
 end
 local priority = tonumber(redis.call("HGET", KEYS[4], "priority")) or 0
-redis.call("HSET", KEYS[4], "state", "wait")
-enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
+-- it gave its key up when it failed, so it queues for it again rather than
+-- running beside whoever holds it now
+local ckey = redis.call("HGET", KEYS[4], "ckey") or ""
+if takeKey(base, KEYS[4], ARGV[1], ckey, priority, KEYS[5], tonumber(ARGV[2])) then
+  redis.call("HSET", KEYS[4], "state", "wait")
+  enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
+end
 return 1
 """
 )
