@@ -8,8 +8,9 @@ import json
 import time
 
 import pytest
+from redis.exceptions import ResponseError
 
-from toro import FlowChild, Queue, Worker
+from toro import FlowChild, Queue, Worker, scripts
 
 PREFIX = "torotest"
 
@@ -573,3 +574,23 @@ async def test_an_add_that_enqueued_nothing_answers_for_the_job_that_is_there(q)
     assert (await q.add("job", {}, job_id="fixed")).state == "wait"  # the id replay
     await q.redis.hset(q.keys.job("fixed"), "state", "active")
     assert (await q.add("job", {}, job_id="fixed")).state == "active"
+
+
+async def test_a_removal_with_no_clock_changes_nothing(q):
+    """REMOVE_JOB grew a `now` argument when a removal started handing keys on. A
+    caller still on the old shape has to fail the call, not halfway through it: Redis
+    rolls nothing back, so a check after the first write leaves the removal standing
+    and the promoted job in no collection at all."""
+    holder = await q.add("holder", {}, concurrency_key="k")
+    behind = await q.add("behind", {}, concurrency_key="k")
+    sha = await q.redis.script_load(scripts.REMOVE_JOB)
+    keys = q._remove_job_keys()
+
+    with pytest.raises(ResponseError):
+        await q.redis.evalsha(sha, len(keys), *keys, holder.id)
+
+    assert await _state(q, holder.id) == "wait"  # nothing was removed
+    assert holder.id in await q.redis.zrange(q.keys.prioritized, 0, -1)
+    assert await _state(q, behind.id) == "held"  # and nobody was handed the key
+    assert await q.redis.get(q.keys.concurrency("k")) == holder.id
+    assert await q.redis.zrange(q.keys.held_for("k"), 0, -1) == [behind.id]
