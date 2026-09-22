@@ -50,7 +50,7 @@ from the page rather than merely refused.
 | OP-007 | In read-only mode every mutating route refuses, and the set is derived from the route table so a new route is covered without being listed. | `tests/integration/test_read_only.py::test_every_mutating_route_refuses` |
 | OP-008 | In read-only mode the controls are absent from the markup, not merely refused when clicked. | `::test_controls_are_not_drawn` |
 | OP-009 | `can_mutate` receives the request, so the host app can allow some callers and not others. | `::test_the_predicate_sees_the_request` |
-| OP-010 | Scraping costs one round trip per queue and nothing on the hot paths. | measured, as in `cancel.md` |
+| OP-010 | The totals cost no extra round trips: they are written inside scripts that already run. Measured exactly, as commands per job, because throughput cannot resolve a change this small. | measured: 30.4 commands per job before, 32.5 after, all inside existing scripts. A throughput run cannot separate that from noise, and an earlier attempt to do so was dominated by a positional effect (whichever version ran second measured faster) |
 
 ## Out of scope
 
