@@ -64,9 +64,9 @@ Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a
 
 ## How the pieces connect
 
-- A job moves between `prioritized` / `active` / `delayed` / `waiting-children` /
-  `completed` / `failed` as its state changes; the move and the hash update happen
-  in one Lua script. See [Architecture](architecture.md).
+- A job moves between `prioritized` / `active` / `delayed` / `held` /
+  `waiting-children` / `completed` / `failed` as its state changes; the move and the
+  hash update happen in one Lua script. See [Architecture](architecture.md).
 - `:deps` + `:results` + `:cfail` are the flow fan-in machinery - children settle
   into them as they finish. See [Flows](flows.md).
 - The `lock` + `stalled` keys are the at-least-once machinery. See

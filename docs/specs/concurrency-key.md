@@ -28,15 +28,15 @@ the queue while they wait. Other keys are unaffected, and so is the claim path.
   waits; a retrying holder holds it through its backoff. This is strict order,
   which is what a key asks for, and it keeps every hot path untouched: the claim
   path, promotion of delayed jobs and the stalled sweep never look at keys.
-- **One routine takes a key: `acquireKey(base, jobId, key, score)`**, called at
-  every point a job enters the pipeline: `ADD_JOB`, each leaf of `ADD_FLOW`,
-  `releaseParent` (a parent that becomes runnable), `RETRY_JOB` (a failed job
-  re-entering) and `ADD_SCHEDULED` (an occurrence). It returns whether the job
-  may be enqueued now. **One routine releases it: `releaseKey(base, jobId)`**,
-  called from `recordFinished` (every terminal path: a worker's finish, an eager
-  parent failure, a stall-out, a remove-at-once) and from `REMOVE_JOB`'s
-  `removeTree` for a holder removed before it finished. A held job that is
-  removed leaves both held sets and holds nothing.
+- **One routine takes a key, `takeKey`** (`toro/scripts.py`), called at every point
+  a job enters the pipeline: `ADD_JOB`, each leaf of `ADD_FLOW`, `releaseParent` (a
+  parent that becomes runnable), `RETRY_JOB` (a failed job re-entering) and
+  `ADD_SCHEDULED` (an occurrence). It returns whether the job may be enqueued now.
+  **One routine releases it, `releaseKey`**, called from `recordFinished` (every
+  terminal path: a worker's finish, an eager parent failure, a stall-out, a
+  remove-at-once) and, through `unkey`, from `REMOVE_JOB`'s `removeTree`. An id in
+  a key's queue whose hash is gone is skipped rather than made the holder: a
+  resurrected empty job would hold the key for good.
 - **`held` is a job state.** `JobState` gains `held`; `counts()` reports it;
   `get_jobs("held")` lists held jobs by their score; `remove_job` works on them;
   `retry`, `promote` and `clean` treat them as what they are. The dashboard shows
@@ -57,11 +57,11 @@ the queue while they wait. Other keys are unaffected, and so is the claim path.
 | CK-002 | Held jobs run in the order they were added, and a higher-priority job added under the key later runs before lower-priority ones still held, at its original score. | `::test_held_jobs_keep_their_order_and_priority` |
 | CK-003 | The key passes on every terminal path of the holder: completion, terminal failure, eager parent failure, stall-out, removal, remove-at-once retention. A retry with attempts left keeps the key. | `::test_the_key_passes_on_every_terminal_path` (parametrized) |
 | CK-004 | Nothing is left per key: after the last job under a key settles, no key of the queue names it. | `::test_a_key_leaves_nothing_behind` |
-| CK-005 | A delayed holder holds its key; a scheduled occurrence and a retried job take or wait for the key like an added job. | `::test_holding_spans_delays_schedules_and_retries` |
-| CK-006 | Flow nodes: a held leaf keeps its parent parked; a parent takes its key when released; a flow's keys pass on eager failure. | `::test_flow_nodes_hold_keys` |
-| CK-007 | A key is validated as a key segment; the option round-trips through `JobOptions` and is visible on the job. | `tests/unit/test_job_options.py` |
-| CK-008 | A held job is a `held` job everywhere: `counts()`, `get_jobs("held")`, `remove_job`, `clean("held")`; `retry_job` and `promote_job` on it are no-ops that return False. | `::test_held_is_a_state` |
-| CK-009 | The claim path and the finish scripts are unchanged for jobs with no key: throughput within noise of main. | measured, as in `flow-retention.md` |
+| CK-005 | A delayed holder holds its key; a scheduled occurrence and a retried job take or wait for the key like an added job. | `::test_a_retry_keeps_the_key`, `::test_a_retried_job_waits_for_the_key_again`, `::test_a_scheduled_occurrence_waits_for_the_key` |
+| CK-006 | Flow nodes: a held leaf keeps its parent parked; a parent takes its key when released; removing a flow frees the keys its nodes hold. | `::test_a_held_leaf_keeps_its_parent_parked`, `::test_a_flow_parent_waits_for_its_own_key`, `::test_removing_a_flow_whose_keyed_child_was_retried_frees_the_key` |
+| CK-007 | A key is validated as a key segment on every path that enqueues: `add`, a flow node, a scheduler. The option round-trips through `JobOptions` and is visible on the job. | `tests/unit/test_job_options.py`, `::test_a_flow_node_and_a_scheduler_validate_their_key` |
+| CK-008 | A held job is a `held` job everywhere: `counts()`, `roots_counts()`, `get_jobs("held")`, `get_jobs_roots("held")`, `remove_job`, `clean("held")`; `retry_job` and `promote_job` on it are no-ops that return False. | `::test_held_is_a_state`, `::test_roots_listings_know_the_held_state` |
+| CK-009 | A queue that passes no key pays nothing measurable: the enqueue and claim paths take one comparison and the finish scripts one read. | measured, as in `flow-retention.md` |
 
 ## Out of scope
 
@@ -98,7 +98,7 @@ the queue while they wait. Other keys are unaffected, and so is the claim path.
 
 | # | Clause | Work | Files | Test strategy |
 |---|---|---|---|---|
-| 1 | CK-007 | The option: validation, `JobOptions`, the job's view | `toro/job.py`, `toro/queue.py` | unit, red first |
+| 1 | CK-007 | The option: validation in `JobOptions.__post_init__` (so no enqueue path can skip it), the job's view | `toro/job.py`, `toro/queue.py` | unit, red first |
 | 2 | CK-001, CK-002 | `acquireKey` in `ADD_JOB`; `releaseKey` in `recordFinished`; `held` in `counts` | `toro/scripts.py`, `toro/queue.py`, `toro/keys.py` | integration, red first |
 | 3 | CK-003, CK-004 | Every terminal path releases; removal of a holder and of a held job | `toro/scripts.py` | one test per path |
 | 4 | CK-005, CK-006 | Delays, schedules, retries, flow nodes | `toro/scripts.py` | integration |

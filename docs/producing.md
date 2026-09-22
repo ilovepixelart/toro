@@ -165,7 +165,7 @@ waiting; only the terminal outcome resolves the call.
 
 | Call | Returns |
 |---|---|
-| `await queue.counts()` | `{"wait": n, "active": n, "delayed": n, "waiting-children": n, "completed": n, "failed": n}` |
+| `await queue.counts()` | One count per `JobState`: `wait`, `active`, `delayed`, `held`, `waiting-children`, `completed`, `failed`. |
 | `await queue.get_job(job_id)` | A `Job` snapshot, or `None`. |
 | `await queue.get_jobs(state, start, end)` | A page of jobs; `wait` comes back in global priority order, finished states newest-first. |
 | `await queue.get_logs(job_id)` | Log lines appended by the processor. |
