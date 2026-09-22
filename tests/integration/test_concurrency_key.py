@@ -4,6 +4,7 @@ holds no slot and no place in the queue until the key is free.
 """
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -123,7 +124,11 @@ async def test_the_key_passes_on_every_terminal_path(q, run_worker, run_until, p
 
     async def failing(job):
         started.append(job.name)
-        raise RuntimeError("boom")
+        if job.name == "holder":
+            raise RuntimeError("boom")
+        if job.data.get("hold"):
+            await gate.wait()
+        return job.name
 
     if path == "stalled out":
         holder = await q.add("holder", {}, concurrency_key="k")
@@ -135,17 +140,23 @@ async def test_the_key_passes_on_every_terminal_path(q, run_worker, run_until, p
         failed, _ = await w.check_stalled(throttle_ms=0)
         assert failed == [holder.id]
     else:
+        fails = path in ("failed", "failed with its parent")
         opts = {"remove_on_complete": True} if path == "removed at once" else {}
-        async with run_worker(q, failing if path == "failed" else proc, concurrency=4) as w:
+        async with run_worker(q, failing if fails else proc, concurrency=4) as w:
             w.on("failed", lambda *a, **k: None)
             if path == "failed with its parent":
-                await q.add_flow(
+                # the child holds the key and fails, which fails its parent eagerly
+                root = await q.add_flow(
                     "report", {}, children=[FlowChild("holder", {}, concurrency_key="k")]
                 )
             else:
-                await q.add("holder", {}, **opts, concurrency_key="k")
+                # gated, so the second add always finds the key taken
+                await q.add("holder", {"hold": True}, **opts, concurrency_key="k")
             held = await q.add("held", {}, concurrency_key="k")
             assert await run_until(_count_is(q, "held", 1), timeout=10)
+            gate.set()
+            if path == "failed with its parent":
+                await _until(lambda: _in_state(q, root.id, "failed"))
             await _until(lambda: _left_held(q, held.id))
 
     # it left the held set and ran: however the holder ended, the key moved on
@@ -314,3 +325,219 @@ async def test_a_held_leaf_keeps_its_parent_parked(q, run_worker, run_until):
         assert await _in_state(q, root.id, "waiting-children")
         gate.set()
         assert await root.result(timeout=10) == "report"
+
+
+async def test_removing_a_flow_whose_keyed_child_was_retried_frees_the_key(
+    q, run_worker, run_until
+):
+    """CK-004: a retried child is queued again under its key, and is indexed among its
+    flow's finished jobs from its first run. Removing the flow must free the key: no
+    job holds it afterwards, so nothing else ever would."""
+
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if (
+            job.name == "child"
+            and json.loads(await q.redis.hget(q.keys.job(job.id), "data"))["fail"]
+        ):
+            raise RuntimeError("boom")
+        await gate.wait()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4) as w:
+        w.on("failed", lambda *a, **k: None)
+        root = await q.add_flow(
+            "report", {}, children=[FlowChild("child", {"fail": True}, concurrency_key="k")]
+        )
+        await _until(lambda: _in_state(q, root.id, "failed"))
+        child = (await _tree_ids(q, root.id))[0]
+        await q.redis.hset(q.keys.job(child), "data", json.dumps({"fail": False}))
+        assert await q.retry_flow(root.id) >= 1
+        await _until(lambda: _in_state(q, child, "active"))  # running, holding the key
+
+        assert await q.remove_job(root.id) is True
+        gate.set()
+
+        assert await q.redis.keys(q.keys.base + "ck:*") == [], "a removed flow kept its key"
+        runs = await q.add("after", {}, concurrency_key="k")
+        assert await runs.result(timeout=10) == "after"
+
+
+async def _tree_ids(q: Queue, root_id: str) -> list[str]:
+    tree = await q.get_flow(root_id)
+    assert tree is not None
+    return [n["job"].id for n in tree["children"]]
+
+
+async def test_a_job_that_is_gone_is_not_made_a_holder(q, run_worker, run_until):
+    """A queue for a key can name a job whose hash is gone. Handing it the key would
+    resurrect it as an empty job, run it, and pin the key to it for good."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4) as w:
+        ran: list[str] = []
+        w.on("completed", lambda job, _res: ran.append(job.name))
+        holder = await q.add("holder", {"hold": True}, concurrency_key="k")
+        real = await q.add("real", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+        await q.redis.zadd(q.keys.held_for("k"), {"ghost": 1})  # a job that no longer exists
+
+        gate.set()
+        assert await holder.result(timeout=10) == "holder"
+        assert await real.result(timeout=10) == "real"
+
+    assert "" not in ran, "an empty job was run"
+    assert await q.redis.get(q.keys.concurrency("k")) is None
+
+
+async def test_held_jobs_keep_their_order_when_the_queue_empties(q, run_worker, run_until):
+    """CK-002: a held job carries a sequence number minted from the queue's counter,
+    which starts over whenever nothing is waiting anywhere. A held job IS waiting, so
+    the counter has to stand: two jobs held either side of an empty queue still run in
+    the order they were added."""
+    gate = asyncio.Event()
+    started, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=2):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        await q.add("first", {}, concurrency_key="k")
+        # the free loop polls an empty queue over and over meanwhile
+        assert not await run_until(lambda: _gone(q, q.keys.pc), timeout=1)
+        await q.add("second", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 2), timeout=10)
+
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 3), timeout=10)
+
+    assert started == ["holder", "first", "second"]
+
+
+async def _gone(q: Queue, key: str) -> bool:
+    return not await q.redis.exists(key)
+
+
+async def test_a_released_job_keeps_its_place_among_jobs_with_no_key(q, run_worker, run_until):
+    """CK-002: a held job waits for its key, not for its turn. Released, it goes back
+    where it would have been, ahead of jobs added after it."""
+    gate = asyncio.Event()
+    started, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=1):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        await q.add("held", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+        await q.add("later", {})
+
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 3), timeout=10)
+
+    assert started == ["holder", "held", "later"]
+
+
+async def test_a_released_job_wakes_a_worker(q, run_worker, run_until):
+    """A holder that is removed rather than finished promotes the next job with no
+    claim of its own to follow it: the release has to wake an idle worker itself, or
+    the job waits out the whole idle poll."""
+    _, proc = _recorder(asyncio.Event())
+
+    holder = await q.add("holder", {}, concurrency_key="k", delay=60_000)
+    held = await q.add("held", {}, concurrency_key="k")
+    async with run_worker(q, proc, concurrency=1, block_timeout=30):
+        # the worker pops the marker it armed at startup and blocks: nothing else
+        # will arm it, so only the release can end that 30s wait
+        assert await run_until(lambda: _gone(q, q.keys.marker), timeout=10)
+
+        assert await q.remove_job(holder.id) is True
+        assert await held.result(timeout=5) == "held"  # well inside the idle poll
+
+
+async def test_a_flow_parent_waits_for_its_own_key(q, run_worker, run_until):
+    """CK-006: a parent takes its key when its children settle and it becomes runnable,
+    not at enqueue - it was not runnable then."""
+    gate = asyncio.Event()
+    started, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=8):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        root = await q.add_flow("report", {}, children=[FlowChild("leaf", {})], concurrency_key="k")
+        await _until(lambda: _in_state(q, root.id, "held"))
+
+        assert started == ["holder", "leaf"]  # the leaf has no key and ran
+        gate.set()
+        assert await root.result(timeout=10) == "report"
+
+
+async def test_only_the_holder_hands_the_key_on(q, run_worker, run_until):
+    """A job that finishes without holding the key must not hand it to anyone: two jobs
+    would then run under it."""
+    gate = asyncio.Event()
+    started, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=8):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        await q.add("held", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+
+        # a job with the same key field but no claim on it, finishing beside the holder
+        await (await q.add("stranger", {})).result(timeout=10)
+        await q.redis.hset(q.keys.job("stranger"), "ckey", "k")
+        await (await q.add("stranger2", {})).result(timeout=10)
+
+        assert await _count(q, "held") == 1, "someone else handed the key on"
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 4), timeout=10)
+    assert started.index("holder") < started.index("held")
+
+
+@pytest.mark.parametrize("bad", ["a:b", "", 7])
+async def test_a_flow_node_and_a_scheduler_validate_their_key(q, bad):
+    """CK-007: every way of enqueuing validates the key, or a caller computing one
+    from data gets no serialization at all where `add()` would have raised."""
+    with pytest.raises(ValueError, match="concurrency_key"):
+        await q.add_flow("report", {}, children=[FlowChild("leaf", {}, concurrency_key=bad)])
+    with pytest.raises(ValueError, match="concurrency_key"):
+        await q.add_scheduler("tick", every=60_000, concurrency_key=bad)
+
+
+async def test_removing_a_held_job_does_not_scan_the_active_list(q, run_worker, run_until):
+    """A held job is in one place. Removing it must not pay the blanket sweep, which
+    scans the whole active list - `clean("held")` would do that a thousand times."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+
+        before = await _lrem_calls(q)
+        assert await q.remove_job(held.id) is True
+        assert await _lrem_calls(q) == before
+
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 1), timeout=10)
+
+
+async def _lrem_calls(q: Queue) -> int:
+    stats = await q.redis.info("commandstats")
+    return int(stats.get("cmdstat_lrem", {}).get("calls", 0))
+
+
+async def test_roots_listings_know_the_held_state(q, run_worker, run_until):
+    """`held` is a JobState, so every listing that takes one has to answer for it."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+
+        total, roots = await q.get_jobs_roots("held", 0, -1)
+        assert (total, [j.id for j in roots]) == (1, [held.id])
+        assert (await q.roots_counts())["held"] == 1
+
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 2), timeout=10)

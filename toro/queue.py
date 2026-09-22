@@ -121,20 +121,6 @@ async def _confirm_subscribed(pubsub: PubSub) -> None:
             return
 
 
-def _key_segment(value: object, what: str) -> str | None:
-    """Validate an id that becomes a Redis key segment, or None when unset.
-
-    `:` or a control character would let two distinct ids collide into one key, and
-    silently share what belongs to one of them.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value or ":" in value or any(ord(c) < 0x20 for c in value):
-        msg = f"{what} must be a non-empty string with no ':' or control characters"
-        raise ValueError(msg)
-    return value
-
-
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -218,7 +204,6 @@ class Queue:
         """
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
-        options.concurrency_key = _key_segment(options.concurrency_key, "concurrency_key")
         if job_id is not None:
             job_id = self._custom_job_id(job_id)
         dedup_id, dedup_ttl = "", 0
@@ -939,6 +924,8 @@ class Queue:
             return self.keys.delayed, False
         if state == "waiting-children":
             return self.keys.waiting_children, False
+        if state == "held":
+            return self.keys.held, False
         # finished states read newest-first
         if state == "completed":
             return self.keys.completed, True
@@ -985,11 +972,12 @@ class Queue:
                 self.keys.failed,
                 self.keys.waiting_children,
                 self.keys.active,
+                self.keys.held,
                 self.keys.children,
                 self.keys.roots_scratch,
             ],
         )
-        wait, delayed, completed, failed, waiting_children, active = (int(x) for x in res)
+        wait, delayed, completed, failed, waiting_children, held, active = (int(x) for x in res)
         return {
             "wait": wait,
             "active": active,
@@ -997,6 +985,7 @@ class Queue:
             "completed": completed,
             "failed": failed,
             "waiting-children": waiting_children,
+            "held": held,
         }
 
     def _retry_job_keys(self, job_id: str) -> list[str]:
@@ -1037,9 +1026,9 @@ class Queue:
         return bool(res)
 
     def _remove_job_keys(self) -> list[str]:
-        """Build the seven KEYS the REMOVE_JOB script takes (every state set plus
-        the base; the job id rides in as an ARGV) - one definition so remove_job
-        and clean can't drift apart.
+        """Build the KEYS the REMOVE_JOB script takes (every state set plus the base;
+        the job id rides in as an ARGV) - one definition so remove_job and clean can't
+        drift apart. `held` is last: the base sat there before the state existed.
         """
         return [
             self.keys.prioritized,
@@ -1049,6 +1038,7 @@ class Queue:
             self.keys.failed,
             self.keys.waiting_children,
             self.keys.base,
+            self.keys.held,
         ]
 
     async def remove_job(self, job_id: str) -> bool:
@@ -1202,8 +1192,9 @@ class Queue:
         sha = await self.redis.script_load(scripts.REMOVE_JOB)  # ensure loaded for EVALSHA
         now = _now_ms()
         pipe = self.redis.pipeline(transaction=False)
+        keys = self._remove_job_keys()
         for job_id in ids:
-            pipe.evalsha(sha, 7, *self._remove_job_keys(), job_id, now)
+            pipe.evalsha(sha, len(keys), *keys, job_id, now)
         await pipe.execute()
         return len(ids)
 
