@@ -64,3 +64,29 @@ def _settled(q: Queue, n: int):
         return c["completed"] + c["failed"] + c["cancelled"] >= n
 
     return check
+
+
+async def test_metrics_text_reports_the_queue_a_scraper_would_see(q, run_worker, run_until):
+    """OP-001, OP-005: one round trip renders what is in Redis, counters and current
+    depth together, with every state covered."""
+
+    async def proc(job):
+        return job.name
+
+    async with run_worker(q, proc, concurrency=2):
+        await q.add("done", {})
+        assert await run_until(_settled(q, 1), timeout=10)
+    await q.add("waiting", {})
+    stopped = await q.add("stopped", {}, delay=60_000)
+    assert await q.cancel_job(stopped.id) is True
+
+    text = await q.metrics_text()
+
+    assert f'toro_jobs_total{{queue="{q.name}",outcome="completed"}} 1' in text
+    assert f'toro_jobs_total{{queue="{q.name}",outcome="cancelled"}} 1' in text
+    assert f'toro_jobs_total{{queue="{q.name}",outcome="failed"}} 0' in text
+    assert f'toro_queue_depth{{queue="{q.name}",state="wait"}} 1' in text
+    # every state a job can be in, so a dashboard and a scraper agree
+    for state in await q.counts():
+        assert f'state="{state}"' in text
+    assert text.endswith("# EOF\n")
