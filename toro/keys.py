@@ -133,7 +133,7 @@ class Keys:
     # Where a custom job id could land on a key that is not its own: the namespaces
     # built under the base (`de:` only in Lua) and the suffixes of a job's aux keys.
     _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:")
-    _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail")
+    _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail", ":live")
 
     def job_id_conflict(self, job_id: str) -> str | None:
         """Name what a custom job id would collide with, or return None when it is free.
@@ -174,3 +174,8 @@ class Keys:
     def cfail(self, job_id: str | int) -> str:
         # HASH child id -> failed reason, for children failed under on_fail="continue".
         return f"{self.base}{job_id}:cfail"
+
+    def live(self, job_id: str | int) -> str:
+        # ZSET of a running flow's finished descendants, kept out of the trims' reach
+        # while the flow runs; drained when the root settles (see scripts.recordFinished).
+        return f"{self.base}{job_id}:live"

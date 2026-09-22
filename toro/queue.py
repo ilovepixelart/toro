@@ -92,6 +92,11 @@ def _percentile(buckets: list[int], q: float) -> int:
     return bucket_estimate_ms(len(buckets) - 1)  # pragma: no cover - cum reaches total above
 
 
+# The score below which a finished job has settled: a running flow's finished
+# children sit at scripts.LIVE_SCORE and above (see scripts.recordFinished). A
+# ZSET bound, exclusive.
+SETTLED = f"({scripts.LIVE_SCORE}"
+
 # How long Redis gets to confirm the events subscription before a waiter gives up.
 SUBSCRIBE_TIMEOUT = 5.0
 
@@ -864,10 +869,25 @@ class Queue:
         elif state == "waiting-children":
             ids = await self.redis.zrange(self.keys.waiting_children, start, end)
         elif state in ("completed", "failed"):
-            ids = await self.redis.zrevrange(getattr(self.keys, state), start, end)
+            count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
+            ids = await self._newest_finished(getattr(self.keys, state), start, count)
         else:
             raise ValueError(f"unknown state: {state}")
         return await self._hydrate_ids(_str_list(ids))
+
+    async def _newest_finished(self, key: str, start: int, count: int) -> list[str]:
+        """Page a finished set newest first: what has settled, then a running flow's
+        finished children, which score above SETTLED and are not "recent". A negative
+        `count` means to the end, which is how Redis reads it too.
+        """
+        settled = _str_list(await self.redis.zrevrangebyscore(key, SETTLED, "-inf", start, count))
+        if 0 <= count == len(settled):
+            return settled
+        skip = max(0, start - int(await self.redis.zcount(key, "-inf", SETTLED)))
+        live = self.redis.zrevrangebyscore(
+            key, "+inf", scripts.LIVE_SCORE, skip, -1 if count < 0 else count - len(settled)
+        )
+        return settled + _str_list(await live)
 
     async def _hydrate_ids(self, ids: list[str]) -> list[Job]:
         """Load a list of job ids into Jobs in one pipelined round trip (one
@@ -1039,11 +1059,15 @@ class Queue:
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
         if state == "waiting-children":
             return _str_list(await self.redis.zrange(self.keys.waiting_children, 0, limit - 1))
-        if state in ("delayed", "completed", "failed"):
+        if state == "delayed":
+            return _str_list(await self.redis.zrange(self.keys.delayed, 0, limit - 1))
+        if state in ("completed", "failed"):
             zset = getattr(self.keys, state)
-            if newest and state in ("completed", "failed"):
-                return _str_list(await self.redis.zrevrange(zset, 0, limit - 1))
-            return _str_list(await self.redis.zrange(zset, 0, limit - 1))
+            if newest:
+                return await self._newest_finished(zset, 0, limit)
+            # oldest first, and settled only: a running flow's finished children are
+            # not history to clean
+            return _str_list(await self.redis.zrangebyscore(zset, "-inf", SETTLED, 0, limit))
         raise ValueError(f"unknown state: {state}")
 
     async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:

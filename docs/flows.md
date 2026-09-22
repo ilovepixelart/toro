@@ -57,12 +57,42 @@ async def process(job):
 ```
 
 A child's result is copied into the parent at the moment the child completes,
-so a child trimmed from `completed` - by the default retention, its own
-`remove_on_complete`, or routine history cleanup (`clean("completed")`) - costs
-the parent nothing: the parent's copy survives. Children are jobs like any other
-to [retention](producing.md#retention), so on a busy queue a finished child can be
-trimmed while its flow is still running. It then leaves the tree `get_flow()`
-returns; `flow_view()`'s `done` and `failed` still count it, from the parent's copy.
+so a child removed from `completed` by routine history cleanup
+(`clean("completed")`, `remove_job()`) costs the parent nothing: the parent's
+copy survives, and `flow_view()`'s `done` and `failed` still count it.
+
+[Retention](producing.md#retention) treats a flow as one unit. What keeps a
+finished job is its ROOT still running, not its parent: a parent can settle
+mid-flow (it failed under `on_fail="continue"`, say) while the root carries on.
+While the flow runs, its finished jobs are kept whatever the queue's bound does
+meanwhile: they are scored above every finish time in `completed` and `failed`,
+out of the trims' reach, and they neither count against the bound nor age out.
+Each is indexed under its root (`<root>:live`), so a node that disappears in
+between cannot strand the ones below it, and removing the flow takes them with
+it. When the root settles, on any path, or is removed at
+once by its own option, they are re-scored one above the root's finish time, so
+the root is the oldest of its flow: a trim reaches it first and removes the
+whole subtree in the same script. A child of a root that already settled
+(failed with a sibling, say) is an ordinary job, scored just above its root and
+trimmed like any other. Retrying a failed root puts its finished children back
+out of reach until the flow settles again.
+
+Three things the unit rule does not do:
+
+- A flow's jobs in the *other* finished set from its root (a completed root's
+  tolerated failures in `failed`, a failed root's completed children in
+  `completed`) follow that set's own bound and can be trimmed before the root.
+  The parent's copies (`children_results()`, `failed_children()`) survive, and
+  `flow_view()` still counts them.
+- A descendant whose own option keeps everything (`remove_on_fail=False` on a
+  queue that keeps failures, say) is not removed with its root.
+- A flow larger than the bound cannot be kept: its root is trimmed at its own
+  finish, subtree included.
+
+The score of a flow child is a retention position; its finish time is
+`finishedOn` in the job's hash. `get_jobs("completed")` newest-first pages
+settled jobs before a running flow's children, `search` scans settled jobs
+first, and `clean` removes settled history only.
 
 ## When a child fails
 

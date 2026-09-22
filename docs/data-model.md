@@ -27,8 +27,8 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `pc` | string (counter) | Priority sequence counter, so same-priority jobs stay FIFO. |
 | `active` | LIST | Ids currently claimed by a worker and running. |
 | `delayed` | ZSET | Ids scored by their process-at timestamp (ms); promoted to `prioritized` when due. |
-| `completed` | ZSET | Successfully-finished ids, scored by finish time (for auto-removal + listing). |
-| `failed` | ZSET | Terminally-failed ids, scored by finish time. |
+| `completed` | ZSET | Successfully-finished ids, scored by retention position: finish time, except a running flow's children (above every timestamp) and a settled flow's children (just above their root). |
+| `failed` | ZSET | Terminally-failed ids, scored the same way. |
 | `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |
 | `meta-paused` | string (flag) | Exists only while the queue is paused; workers stop claiming new jobs. |
 | `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed`; drives `result()` and live dashboards. |
@@ -47,12 +47,13 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 |---|---|---|
 | `repeat:<schedulerId>` | HASH | A scheduler's template: `name`, `every`/`cron`, `data`, `opts`. |
 | `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, global concurrency cap, current jobs, processed/failed counts, state. Expires a day after the last heartbeat. |
-| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail` (children), `children` (parents). |
+| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail`/`rootId` (children), `children` (parents). |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |
 | `<jobId>:deps` | SET | A flow parent's still-pending child ids - the fan-in barrier; the parent releases when it empties. |
 | `<jobId>:results` | HASH | Child id → returnvalue JSON, written as each child completes. |
 | `<jobId>:cfail` | HASH | Child id → failure reason for children failed under `on_fail="continue"`. |
+| `<jobId>:live` | ZSET | On a flow ROOT while its flow runs: the flow's finished jobs, which are scored out of the trims' reach until the root settles. |
 
 Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a job
 `5` on `toro:emails:` is the hash `toro:emails:5`, with `toro:emails:5:lock` and

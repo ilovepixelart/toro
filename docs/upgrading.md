@@ -47,9 +47,13 @@ fractional `count` in the dict form failed the finish inside Redis.
   enqueues the work again. On defaults that is after 1000 newer completions. Keep
   more history, or keep everything, on queues that rely on an id for longer.
 - A trimmed job can no longer be read: `get_job()` returns `None` and `result()`
-  called after the trim times out. A trimmed flow child leaves its flow's tree; the
-  parent's `children_results()` and the flow's progress counts are unaffected.
-  Metrics are separate counters and keep counting.
+  called after the trim times out. Metrics are separate counters and keep
+  counting.
+- **A flow is retained as one unit.** While it runs, its finished children are out
+  of every bound's reach; when its root is trimmed, the subtree goes with it. In
+  `completed` and `failed` a flow child's score is its retention position, not
+  its finish time (`finishedOn` is): a running flow's children score above every
+  timestamp, a settled flow's children score just above their root.
 
 ### Schedulers inherit the queue's `default_job_options`
 
