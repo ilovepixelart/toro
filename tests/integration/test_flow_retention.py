@@ -306,6 +306,93 @@ async def test_orphans_are_ordinary_jobs(q, run_worker, run_until):
     assert await _count_state(q, "completed", 1)
 
 
+async def test_a_nested_flow_keeps_its_grandchildren(q, run_worker, run_until):
+    """FR-001, nested: a mid-level parent that finishes under a running root is live
+    itself, so it must not place its children among the settled."""
+    gate = asyncio.Event()
+    async with run_worker(q, _holding(gate, "slow"), concurrency=4):
+        mid = c("mid", {}, children=[c("leaf1", {}), c("leaf2", {})])
+        root = await q.add_flow("report", {}, children=[mid, c("slow", {})])
+        assert await run_until(lambda: _count_state(q, "completed", 3), timeout=10)  # leaves, mid
+        done = await q.redis.zrange(q.keys.completed, 0, -1)
+        await _seed_history(q, DEFAULT_KEEP_COMPLETED, newer_than_now=True)
+
+        await (await q.add("unrelated", {})).result(timeout=10)
+
+        assert await _present(q, done) == 3, "a running flow's grandchildren were trimmed"
+        gate.set()
+        assert await root.result(timeout=10) == ["mid", "slow"]
+
+
+async def test_a_sibling_running_past_a_trimmed_root_is_left_alone(q, run_worker, run_until):
+    """FR-006: the root failed with one child while another still ran, and was trimmed
+    before that child finished. The child is not removed with the root, and when it
+    finishes it belongs to no flow: scored at its own time, trimmed like any job."""
+    gate = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        if job.name == "slow":
+            await gate.wait()
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        root = await q.add_flow("report", {}, children=[c("bad", {}), c("slow", {})])
+        assert await run_until(lambda: _in_state(q, root.id, "failed"), timeout=10)
+        children = await _tree_ids(q, root.id)
+        states = [await q.redis.hget(q.keys.job(cid), "state") for cid in children]
+        slow = children[states.index("active")]
+
+        # a failure under a bound of one: the root, older, is the victim; its subtree goes
+        await q.add("bad", {}, remove_on_fail=1)
+        assert await run_until(lambda: _gone(q, root.id), timeout=10)
+        assert await _present(q, [slow]) == 1, "a running child was removed with its root"
+
+        gate.set()
+        assert await run_until(lambda: _count_state(q, "completed", 1), timeout=10)
+        assert (await _scores(q, [slow]))[slow] < LIVE_SCORE
+        await (await q.add("unrelated", {}, remove_on_complete=1)).result(timeout=10)
+
+    assert await _present(q, [slow]) == 0
+    assert await _count_state(q, "completed", 1)
+
+
+async def _gone(q: Queue, job_id: str) -> bool:
+    return not await q.redis.exists(q.keys.job(job_id))
+
+
+async def test_a_cascade_spends_the_age_trims_budget(q, run_worker, run_until):
+    """FR-004 for the age trim: an aged root's cascade into the other set spends the
+    budget, and the remaining expired victims wait for the next finish."""
+    width = 999
+
+    async def proc(job):
+        if job.name == "bad":
+            raise RuntimeError("boom")
+        return "ok"
+
+    async with run_worker(q, proc, concurrency=16):
+        root = await q.add_flow(
+            "report", {}, children=[c("bad", {}, on_fail="continue") for _ in range(width)]
+        )
+        assert await run_until(lambda: _settled(q, root.id), timeout=60)
+    # age the whole flow past a one hour bound, and two plain jobs behind it
+    old = int(time.time() * 1000) - 7_200_000
+    await q.redis.zadd(q.keys.completed, {root.id: old})
+    for cid in await _tree_ids(q, root.id):
+        await q.redis.zadd(q.keys.failed, {cid: old + 1})
+    seeds = await _seed_history(q, 2)
+    await q.redis.zadd(q.keys.completed, {seeds[0]: old + 2, seeds[1]: old + 3})
+
+    async with run_worker(q, proc, concurrency=1):
+        job = await q.add("unrelated", {}, remove_on_complete={"age": 3600})
+        await job.result(timeout=10)
+
+    assert await _count_state(q, "failed", 0)
+    assert await _present(q, seeds) == 2, "expired victims past a spent budget were still trimmed"
+
+
 # ---- over a long run --------------------------------------------------------------
 
 
