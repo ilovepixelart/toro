@@ -6,7 +6,7 @@ checked here without a Redis in the loop.
 
 import pytest
 
-from toro.openmetrics import render
+from toro.openmetrics import render, render_all
 
 TOTALS = {"added": 7, "completed": 4, "failed": 2, "cancelled": 1, "ms": 512}
 DEPTHS = {"wait": 3, "active": 1, "held": 2, "delayed": 0, "cancelled": 1}
@@ -79,3 +79,23 @@ def test_a_label_value_cannot_break_out_of_its_quotes(name):
         structural = line.replace("\\\\", "").replace('\\"', "").replace("\\n", "")
         assert structural.count('"') % 2 == 0, f"unbalanced quotes: {line!r}"
         assert "\n" not in line
+
+
+def test_a_family_is_declared_once_however_many_queues():
+    """A dashboard serves several queues from one endpoint. Concatenating a render
+    per queue repeats every TYPE and HELP line, which is not valid exposition: a
+    parser is entitled to reject the duplicate or to drop the samples after it."""
+    text = render_all({"emails": (TOTALS, DEPTHS), "reports": (TOTALS, DEPTHS)})
+
+    types = [line for line in text.splitlines() if line.startswith("# TYPE ")]
+    assert len(types) == len(set(types)), f"a family was declared twice: {types}"
+    helps = [line for line in text.splitlines() if line.startswith("# HELP ")]
+    assert len(helps) == len(set(helps))
+    for queue in ("emails", "reports"):
+        assert f'toro_jobs_total{{queue="{queue}",outcome="completed"}} 4' in text
+    assert text.count("# EOF") == 1
+    assert text.endswith("# EOF\n")
+
+
+def test_one_queue_renders_the_same_either_way():
+    assert render("emails", TOTALS, DEPTHS) == render_all({"emails": (TOTALS, DEPTHS)})

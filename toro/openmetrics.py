@@ -13,6 +13,15 @@ from collections.abc import Mapping
 # failed makes `rate()` start at a cliff, which reads as a spike that never happened.
 OUTCOMES = ("added", "completed", "failed", "cancelled")
 
+_FAMILIES = (
+    ("toro_jobs_total", "counter", "Jobs by outcome since the queue was created."),
+    ("toro_job_duration_ms_total", "counter", "Processing time of finished jobs, in ms."),
+    ("toro_queue_depth", "gauge", "Jobs currently in each state."),
+)
+
+# queue name -> (lifetime totals, current depth per state)
+Snapshot = Mapping[str, tuple[Mapping[str, int], Mapping[str, int]]]
+
 
 def _label(value: str) -> str:
     """Escape a label value. A queue name is a Redis key segment, not a vetted
@@ -22,29 +31,43 @@ def _label(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def render(queue: str, totals: Mapping[str, int], depths: Mapping[str, int]) -> str:
-    """OpenMetrics text for one queue: lifetime counters and current depth."""
-    name = _label(queue)
-    out = [
-        "# TYPE toro_jobs_total counter",
-        "# HELP toro_jobs_total Jobs by outcome since the queue was created.",
-    ]
-    out += [
-        f'toro_jobs_total{{queue="{name}",outcome="{outcome}"}} {int(totals.get(outcome, 0))}'
-        for outcome in OUTCOMES
-    ]
-    out += [
-        "# TYPE toro_job_duration_ms_total counter",
-        "# HELP toro_job_duration_ms_total Processing time of finished jobs, in ms.",
-        f'toro_job_duration_ms_total{{queue="{name}"}} {int(totals.get("ms", 0))}',
-        "# TYPE toro_queue_depth gauge",
-        "# HELP toro_queue_depth Jobs currently in each state.",
-    ]
-    # Depth is read at scrape time, which is what a gauge means: it can go down, so it
-    # must never be derived from a counter.
-    out += [
-        f'toro_queue_depth{{queue="{name}",state="{_label(state)}"}} {int(count)}'
-        for state, count in depths.items()
-    ]
+def _samples(family: str, queues: Snapshot) -> list[str]:
+    out: list[str] = []
+    for queue, (totals, depths) in queues.items():
+        name = _label(queue)
+        if family == "toro_jobs_total":
+            out += [
+                f'toro_jobs_total{{queue="{name}",outcome="{o}"}} {int(totals.get(o, 0))}'
+                for o in OUTCOMES
+            ]
+        elif family == "toro_job_duration_ms_total":
+            out.append(f'toro_job_duration_ms_total{{queue="{name}"}} {int(totals.get("ms", 0))}')
+        else:
+            # Depth is read at scrape time, which is what a gauge means: it can go
+            # down, so it must never be derived from a counter.
+            out += [
+                f'toro_queue_depth{{queue="{name}",state="{_label(state)}"}} {int(count)}'
+                for state, count in depths.items()
+            ]
+    return out
+
+
+def render_all(queues: Snapshot) -> str:
+    """OpenMetrics text for any number of queues.
+
+    Every family is declared ONCE and its samples follow, whatever the queue count:
+    a render per queue concatenated would repeat each TYPE and HELP line, which a
+    parser may reject outright or silently drop the samples after.
+    """
+    out: list[str] = []
+    for family, kind, help_text in _FAMILIES:
+        out.append(f"# TYPE {family} {kind}")
+        out.append(f"# HELP {family} {help_text}")
+        out += _samples(family, queues)
     out.append("# EOF")
     return "\n".join(out) + "\n"
+
+
+def render(queue: str, totals: Mapping[str, int], depths: Mapping[str, int]) -> str:
+    """One queue's exposition."""
+    return render_all({queue: (totals, depths)})
