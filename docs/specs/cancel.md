@@ -63,7 +63,7 @@ told so rather than left waiting.
 | CN-007 | Cancelling a flow parent cancels its whole subtree, running children included. | `::test_cancelling_a_flow_takes_its_subtree` |
 | CN-008 | `result()` on a cancelled job raises `JobCancelledError`, whether it was waiting when the cancel landed or asked afterwards. | `::test_result_reports_a_cancellation` |
 | CN-009 | `cancel_job()` on a job that is already terminal, or absent, returns False and changes nothing. | `::test_cancelling_what_cannot_be_cancelled` |
-| CN-010 | A worker with no cancellations pays nothing measurable: the claim and finish paths are unchanged, and the subscription is one per worker, on a channel carrying nothing but cancellations. | measured against main, interleaved runs of 5,000 jobs at concurrency 20: 9,600 against 9,170 jobs/s. Subscribed to the general `events` channel instead, the same measurement read 8,560: a worker parsed one message per job to catch a rare one. Pinned by `::test_a_worker_does_not_listen_to_the_job_firehose` |
+| CN-010 | A worker with no cancellations pays nothing measurable: the claim and finish paths are unchanged, and the subscription is one per worker, on a channel carrying nothing but cancellations. | measured against main, interleaved runs of 5,000 jobs at concurrency 20: 9,650 against 9,340 jobs/s. Subscribed to the general `events` channel instead, the same measurement read 8,560: a worker parsed one message per job to catch a rare one. Pinned by `::test_a_worker_does_not_listen_to_the_job_firehose` |
 
 ## Out of scope
 
