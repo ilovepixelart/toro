@@ -988,7 +988,7 @@ return existed
 # settles a flow parent and applies retention exactly as any other finish does.
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] held  KEYS[4] waiting-children
 # KEYS[5] cancelled  KEYS[6] key base  KEYS[7] events channel
-# ARGV[1] jobId  ARGV[2] now(ms)
+# ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] metricsRetention(ms)
 # Returns 0 (nothing to cancel), 1 (cancelled here) or 2 (a running job was asked).
 CANCEL_JOB = (
     _LIB
@@ -1014,8 +1014,16 @@ end
 -- a job queued behind a key leaves that queue; a holder hands its key on inside
 -- recordFinished, like any other job reaching a terminal state
 unkey(base, ARGV[1], state, redis.call("HGET", jobKey, "ckey"), now)
+-- read BEFORE recordFinished (retention may DEL the hash)
+local meta = redis.call("HMGET", jobKey, "parentId", "onFail")
 recordFinished(KEYS[5], jobKey, base, ARGV[1], now, "cancel", "1", "cancelled")
 redis.call("PUBLISH", KEYS[7], cjson.encode({jobId = ARGV[1], event = "cancelled"}))
+-- A cancelled child did not produce what its parent waits for, so the parent's
+-- own onFail policy decides, exactly as it does for a child that failed: there is
+-- one rule for "this child will never deliver", not two.
+if meta[1] then
+  settleChildFailed(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[3]))
+end
 return 1
 """
 )

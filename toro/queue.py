@@ -1070,7 +1070,7 @@ class Queue:
                 self.keys.base,
                 self.keys.events,
             ],
-            args=[str(job_id), _now_ms()],
+            args=[str(job_id), _now_ms(), scripts.METRICS_RETENTION_MS],
         )
         return bool(res)
 
