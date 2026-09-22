@@ -153,6 +153,35 @@ record expires a day after its last heartbeat, and any live worker's heartbeat
 drops index entries older than that. A worker that died more than a day before
 the first read is gone without a `lost` departure.
 
+## Cancellation
+
+`queue.cancel_job(job_id)` stops a job that is already running. The worker running
+it cancels the task its processor is on, so `CancelledError` is raised where the
+processor awaits: `finally` blocks and `async with` exits run, and the job lands in
+`cancelled`.
+
+```python
+async def process(job):
+    handle = await open_upload(job.data["path"])
+    try:
+        await handle.stream()          # cancellation lands here
+    finally:
+        await handle.abort()           # and this still runs
+```
+
+- **Nothing is raised into a processor that never awaits.** Cancellation is
+  delivered at an await point, so a tight CPU loop runs to completion. Yield if you
+  want to be interruptible.
+- **Work that must not be interrupted** can `await asyncio.shield(...)`, which
+  finishes it before the cancellation takes effect.
+- **Do not swallow `CancelledError`.** A processor that catches it and returns
+  normally keeps running work the queue has already given up on; its completion then
+  commits nothing (the job is no longer active and the lock is gone) and the worker
+  reports a lost lock instead.
+- Workers hear a cancellation over a channel of their own and act at once. A worker
+  that missed the message finds it at its next lock renewal instead, so the delay is
+  bounded by `lock_renew_time`, never lost.
+
 ## Shutdown
 
 ```python

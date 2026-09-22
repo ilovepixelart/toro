@@ -39,6 +39,7 @@ type, `JobState`:
 | `held` | Waiting on a `concurrency_key` another job holds. It waits on that job, not on a worker, so it occupies no slot and no place in the queue. |
 | `active` | Claimed by a worker and currently running. |
 | `waiting-children` | A flow parent, parked until every child settles; released to `wait` by its last child. |
+| `cancelled` | Stopped on purpose, by `cancel_job()`. Terminal, and not a failure: it is counted and listed separately, and never retried. |
 | `completed` | Finished successfully; `returnvalue` holds the result. |
 | `failed` | Exhausted its retry attempts; `failed_reason` holds the error. |
 
