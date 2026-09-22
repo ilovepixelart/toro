@@ -1057,7 +1057,7 @@ class Queue:
         even mid-flight); removing a pending child releases its parent when
         nothing else is left to wait for.
         """
-        res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id])
+        res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id, _now_ms()])
         return bool(res)
 
     async def promote_job(self, job_id: str) -> bool:
@@ -1199,9 +1199,10 @@ class Queue:
         if not ids:
             return 0
         sha = await self.redis.script_load(scripts.REMOVE_JOB)  # ensure loaded for EVALSHA
+        now = _now_ms()
         pipe = self.redis.pipeline(transaction=False)
         for job_id in ids:
-            pipe.evalsha(sha, 7, *self._remove_job_keys(), job_id)
+            pipe.evalsha(sha, 7, *self._remove_job_keys(), job_id, now)
         await pipe.execute()
         return len(ids)
 

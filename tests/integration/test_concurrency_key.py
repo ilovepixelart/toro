@@ -4,8 +4,11 @@ holds no slot and no place in the queue until the key is free.
 """
 
 import asyncio
+import time
 
-from toro import Queue
+import pytest
+
+from toro import FlowChild, Queue, Worker
 
 PREFIX = "torotest"
 
@@ -37,6 +40,14 @@ def _count_is(q: Queue, state: str, n: int):
 
 async def _state(q: Queue, job_id: str) -> str | None:
     return await q.redis.hget(q.keys.job(job_id), "state")
+
+
+async def _in_state(q: Queue, job_id: str, state: str) -> bool:
+    return await _state(q, job_id) == state
+
+
+async def _left_held(q: Queue, job_id: str) -> bool:
+    return await _state(q, job_id) != "held"
 
 
 async def test_one_job_per_key_at_a_time(q, run_worker, run_until):
@@ -100,3 +111,115 @@ async def test_a_key_leaves_nothing_behind(q, run_worker, run_until):
     assert await q.redis.keys(q.keys.base + "ck:*") == []
     assert await q.redis.keys(q.keys.base + "held:*") == []
     assert await _count(q, "held") == 0
+
+
+@pytest.mark.parametrize(
+    "path", ["completed", "failed", "failed with its parent", "stalled out", "removed at once"]
+)
+async def test_the_key_passes_on_every_terminal_path(q, run_worker, run_until, path):
+    """CK-003: however the holder ends, the next job under its key runs."""
+    gate = asyncio.Event()
+    started, proc = _recorder(gate)
+
+    async def failing(job):
+        started.append(job.name)
+        raise RuntimeError("boom")
+
+    if path == "stalled out":
+        holder = await q.add("holder", {}, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        await q.redis.zrem(q.keys.prioritized, holder.id)  # its worker died holding it
+        await q.redis.rpush(q.keys.active, holder.id)
+        w = Worker(q.name, proc, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+        await w.check_stalled(throttle_ms=0)
+        failed, _ = await w.check_stalled(throttle_ms=0)
+        assert failed == [holder.id]
+    else:
+        opts = {"remove_on_complete": True} if path == "removed at once" else {}
+        async with run_worker(q, failing if path == "failed" else proc, concurrency=4) as w:
+            w.on("failed", lambda *a, **k: None)
+            if path == "failed with its parent":
+                await q.add_flow(
+                    "report", {}, children=[FlowChild("holder", {}, concurrency_key="k")]
+                )
+            else:
+                await q.add("holder", {}, **opts, concurrency_key="k")
+            held = await q.add("held", {}, concurrency_key="k")
+            assert await run_until(_count_is(q, "held", 1), timeout=10)
+            await _until(lambda: _left_held(q, held.id))
+
+    # it left the held set and ran: however the holder ended, the key moved on
+    assert await _left_held(q, held.id)
+    assert held.id not in await q.redis.zrange(q.keys.held, 0, -1)
+
+
+async def test_a_retry_keeps_the_key(q, run_worker, run_until):
+    """CK-003: a failure with attempts left is not terminal. The key stays with the job
+    through its backoff, or another job would run beside its retry."""
+    tries = []
+
+    async def proc(job):
+        tries.append(job.name)
+        if job.name == "flaky" and len(tries) == 1:
+            raise RuntimeError("boom")
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4) as w:
+        w.on("failed", lambda *a, **k: None)
+        flaky = await q.add("flaky", {}, attempts=2, backoff=400, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        await _until(lambda: _in_state(q, flaky.id, "delayed"))
+
+        assert await _state(q, held.id) == "held"  # the retry still holds the key
+        assert await q.redis.get(q.keys.concurrency("k")) == flaky.id
+
+        assert await run_until(_count_is(q, "completed", 2), timeout=10)
+    assert tries == ["flaky", "flaky", "held"]
+
+
+async def test_removing_a_holder_hands_the_key_on(q, run_worker, run_until):
+    """CK-003: a job removed before it finishes must not take its key to the grave."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+        holder_id = await q.redis.get(q.keys.concurrency("k"))
+
+        assert await q.remove_job(holder_id) is True
+
+        assert await run_until(_count_is(q, "completed", 1), timeout=10)
+        assert await _state(q, held.id) == "completed"
+        gate.set()
+    assert await q.redis.get(q.keys.concurrency("k")) is None
+
+
+async def test_removing_a_held_job_leaves_the_key_alone(q, run_worker, run_until):
+    """CK-004: a held job that is removed leaves both held sets and holds nothing."""
+    gate = asyncio.Event()
+    _, proc = _recorder(gate)
+
+    async with run_worker(q, proc, concurrency=4):
+        await q.add("holder", {"hold": True}, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        assert await run_until(_count_is(q, "held", 1), timeout=10)
+
+        assert await q.remove_job(held.id) is True
+
+        assert await _count(q, "held") == 0
+        assert await q.redis.zrange(q.keys.held_for("k"), 0, -1) == []
+        gate.set()
+        assert await run_until(_count_is(q, "completed", 1), timeout=10)
+
+    assert await q.redis.keys(q.keys.base + "ck:*") == []
+
+
+async def _until(predicate, *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never held")

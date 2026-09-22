@@ -116,6 +116,7 @@ def to_tree(node: FlowChild, defaults: dict[str, Any]) -> dict[str, Any]:
         "delay": options.delay,
         "priority": options.priority,
         "onFail": node.on_fail,
+        "concurrencyKey": options.concurrency_key or "",
     }
     if node.children:
         payload["children"] = [to_tree(child, defaults) for child in node.children]

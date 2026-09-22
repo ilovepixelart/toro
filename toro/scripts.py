@@ -434,20 +434,27 @@ end
 -- inside the SAME script that commits their own transition (finish, stalled
 -- escalation, removal), so the fan-in barrier resolves on the crash path too.
 -- Queue-level keys derive from `base` (single-node assumption, see header).
-local function releaseParent(base, parentId)
+local function releaseParent(base, parentId, now)
   -- no-op unless the parent is still parked (it may have failed eagerly)
   if redis.call("ZREM", base .. "waiting-children", parentId) == 0 then return end
-  local priority = tonumber(redis.call("HGET", base .. parentId, "priority")) or 0
-  redis.call("HSET", base .. parentId, "state", "wait")
-  enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc")
+  local parentKey = base .. parentId
+  local priority = tonumber(redis.call("HGET", parentKey, "priority")) or 0
+  -- a parent takes its key only now: it was not runnable while its children ran
+  local ckey = redis.call("HGET", parentKey, "opts")
+  ckey = ckey and (cjson.decode(ckey).concurrencyKey or "") or ""
+  if ckey == cjson.null then ckey = "" end
+  if takeKey(base, parentKey, parentId, ckey, priority, base .. "pc", now) then
+    redis.call("HSET", parentKey, "state", "wait")
+    enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc")
+  end
 end
-local function settleChildCompleted(base, jobId, parentId, returnvalue)
+local function settleChildCompleted(base, jobId, parentId, returnvalue, now)
   -- a fully-removed parent (retention trim) must not get orphan keys recreated
   if redis.call("EXISTS", base .. parentId) == 0 then return end
   redis.call("HSET", base .. parentId .. ":results", jobId, returnvalue)
   redis.call("SREM", base .. parentId .. ":deps", jobId)
   if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
-    releaseParent(base, parentId)
+    releaseParent(base, parentId, now)
   end
 end
 -- A terminally-failed child settles its parent per its `onFail` policy:
@@ -465,7 +472,7 @@ local function settleChildFailed(base, jobId, parentId, onFail, reason, now, ret
         redis.call("HSET", base .. pid .. ":cfail", cid, reason)
         redis.call("SREM", base .. pid .. ":deps", cid)
         if redis.call("SCARD", base .. pid .. ":deps") == 0 then
-          releaseParent(base, pid)
+          releaseParent(base, pid, now)
         end
       end
       return
@@ -593,13 +600,17 @@ local function createNode(node, parentId, rootId)
     redis.call("ZADD", base .. "waiting-children", now, jobId)
   else
     local delay = tonumber(node.delay)
-    if delay > 0 then
-      redis.call("HSET", jobKey, "delay", delay, "state", "delayed")
-      redis.call("ZADD", base .. "delayed", now + delay, jobId)
-    else
-      redis.call("HSET", jobKey, "state", "wait")
-      enqueue(base .. "prioritized", base .. "marker", jobId,
-              tonumber(node.priority), base .. "pc")
+    if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
+    if takeKey(base, jobKey, jobId, node.concurrencyKey, tonumber(node.priority),
+               base .. "pc", now) then
+      if delay > 0 then
+        redis.call("HSET", jobKey, "state", "delayed")
+        redis.call("ZADD", base .. "delayed", now + delay, jobId)
+      else
+        redis.call("HSET", jobKey, "state", "wait")
+        enqueue(base .. "prioritized", base .. "marker", jobId,
+                tonumber(node.priority), base .. "pc")
+      end
     end
   end
   return jobId
@@ -676,7 +687,7 @@ if meta[4] and not meta[3] then
   recordFlow(KEYS[8], true, now, now - (tonumber(meta[5]) or now), tonumber(ARGV[9]))
 end
 -- a flow child settles into its parent here, atomically with its own commit
-if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2]) end
+if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2], now) end
 -- the result is decoded and re-encoded as part of ONE cjson document: a
 -- return value full of JSON metacharacters can never corrupt the message
 local okr, resultDoc = pcall(cjson.decode, ARGV[2])
@@ -850,7 +861,8 @@ return 1
 # from its parent's barrier, releasing the parent when it was the last
 # dependency (nothing left to wait for).
 # KEYS[1] prioritized  KEYS[2] active  KEYS[3] delayed  KEYS[4] completed
-# KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base   ARGV[1] jobId
+# KEYS[5] failed  KEYS[6] waiting-children  KEYS[7] key base
+# ARGV[1] jobId  ARGV[2] now(ms)
 REMOVE_JOB = (
     _LIB
     + """
@@ -875,8 +887,13 @@ local function removeFromState(jobId, state)
   end
 end
 local function removeTree(jobId)
-  local meta = redis.call("HMGET", base .. jobId, "children", "state")
+  local meta = redis.call("HMGET", base .. jobId, "children", "state", "ckey")
   removeFromState(jobId, meta[2])
+  if meta[3] then  -- a holder passes its key on; a job queued behind one just leaves
+    releaseKey(base, base .. jobId, jobId, tonumber(ARGV[2]))
+    redis.call("ZREM", base .. "held:" .. meta[3], jobId)
+    redis.call("ZREM", base .. "held", jobId)
+  end
   delJobs({jobId}, base)
   if meta[1] then
     for _, cid in ipairs(cjson.decode(meta[1])) do removeTree(cid) end
@@ -891,7 +908,7 @@ if parentId then
   -- cleanup (clean('completed')) must never mutate a pending parent's data
   redis.call("SREM", base .. parentId .. ":deps", ARGV[1])
   if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
-    releaseParent(base, parentId)
+    releaseParent(base, parentId, tonumber(ARGV[2]))
   end
 end
 return existed
