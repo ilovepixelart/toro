@@ -189,7 +189,9 @@ class Worker:
         # The processor task of each running job, so a cancellation can reach it, and
         # the jobs whose cancellation THIS worker asked for: a CancelledError that is
         # not in here is the worker shutting down, which must not commit a cancel.
-        self._processors: dict[str, asyncio.Task[Any]] = {}
+        # job id -> (its processor's task, the claim it is running). The claim fences
+        # a cancellation against an id that has been reused since the request was made.
+        self._processors: dict[str, tuple[asyncio.Task[Any], str]] = {}
         self._cancelling: set[str] = set()
         # Held on the instance, not inside the listener: stop() cancels that task while
         # it waits on a message, so a close in its own `finally` may never be reached,
@@ -460,7 +462,7 @@ class Worker:
             return await self.processor(job)
 
         task = asyncio.create_task(run_processor())
-        self._processors[job_id] = task
+        self._processors[job_id] = (task, str(fields.get("processedOn", "")))
         try:
             nxt = await self._outcome(job, task)
         finally:
@@ -499,8 +501,12 @@ class Worker:
         self._processed += 1
         return await self._finish_completed(job, result)
 
-    def _request_cancel(self, job_id: str) -> None:
+    def _request_cancel(self, job_id: str, claim: str | None = None) -> None:
         """Stop a job this worker is running, once.
+
+        `claim` names the run the request was meant for. Without it the caller already
+        knows (a lock renewal answered for the job in hand); with it, a request for an
+        earlier run of a reused id is ignored rather than killing its successor.
 
         Nothing to do if the job is not ours, or if it already asked to stop: the
         `cancel` field stays set while the job is active, so the lock keeps reporting
@@ -513,8 +519,11 @@ class Worker:
         """
         if job_id in self._cancelling:
             return
-        task = self._processors.get(job_id)
-        if task is None or task.done():
+        running = self._processors.get(job_id)
+        if running is None:
+            return
+        task, mine = running
+        if task.done() or (claim is not None and claim != mine):
             return
         self._cancelling.add(job_id)
         task.cancel()
@@ -696,9 +705,11 @@ class Worker:
                     )
                     if msg is None:
                         continue
-                    # the channel carries nothing but job ids, so there is nothing to
-                    # parse and nothing to filter: everything here is a cancellation
-                    self._request_cancel(str(msg["data"]))
+                    # "<jobId>:<claim>". Split from the RIGHT: a scheduler occurrence
+                    # id carries colons of its own.
+                    jid, _, claim = str(msg["data"]).rpartition(":")
+                    if jid:
+                        self._request_cancel(jid, claim)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - reconnect; the lock still backstops

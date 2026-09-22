@@ -630,3 +630,27 @@ async def test_cancelling_a_job_with_nothing_left_to_stop_is_false(q, run_worker
         assert await run_until(lambda: _in_state(q, job.id, "completed"), timeout=10)
 
     assert await q.cancel_job(job.id) is False
+
+
+async def test_a_message_for_another_claim_does_not_stop_this_one(q, run_worker, run_until):
+    """A job id is free again the moment its job is gone, so a message naming only an
+    id can land on the NEXT job to wear it: removal publishes one, and a producer that
+    re-adds the same custom id immediately gets its new job killed. Each message names
+    the claim it was meant for, and a worker ignores one meant for another."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2, lock_renew_time=30_000, lock_duration=60_000):
+        await q.add("long", {}, job_id="dup")
+        await asyncio.wait_for(started.wait(), 10)
+        claim = await q.redis.hget(q.keys.job("dup"), "processedOn")
+
+        await q.redis.publish(q.keys.cancel, f"dup:{int(claim) - 1}")  # an earlier claim
+        await asyncio.sleep(0.4)
+        assert await _state(q, "dup") == "active", "a message for another claim stopped this one"
+
+        await q.redis.publish(q.keys.cancel, f"dup:{claim}")  # this claim
+        assert await run_until(lambda: _in_state(q, "dup", "cancelled"), timeout=10)

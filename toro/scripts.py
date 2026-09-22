@@ -91,6 +91,13 @@ local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
   redis.call("ZADD", markerKey, 0, "0")
 end
+-- A cancellation names the CLAIM it is meant for, not just the job: an id is free
+-- again the moment its job is gone, so a bare id can land on the next job to wear it.
+-- `processedOn` is rewritten by every claim (see lockAndLoad), which is exactly the
+-- incarnation a worker is running.
+local function cancelMessage(base, jobId)
+  return jobId .. ":" .. (redis.call("HGET", base .. jobId, "processedOn") or "")
+end
 -- Jobs that share a concurrency key run one at a time, in the order they were added.
 -- The key is held from enqueue until the holder reaches a terminal state: `ck:<key>`
 -- names the holder and `held:<key>` is the queue behind it, scored as `prioritized`
@@ -988,7 +995,7 @@ local function removeTree(jobId)
     -- Its processor is still running, and removal gives it nowhere to report. Tell
     -- the worker, or the slot it holds (and any global-concurrency slot) stays taken
     -- until the work happens to end. Its commit finds no lock and stands down.
-    redis.call("PUBLISH", KEYS[10], jobId)
+    redis.call("PUBLISH", KEYS[10], cancelMessage(base, jobId))
   end
   unkey(base, jobId, meta[2], meta[3], now)
   delJobs({jobId}, base)
@@ -1087,7 +1094,7 @@ local function cancelOne(jobId)
     saveReason(jobKey)
     -- to the workers' own channel: `events` carries a message per job, and a worker
     -- listening there would parse every one of them to catch this
-    redis.call("PUBLISH", KEYS[8], jobId)
+    redis.call("PUBLISH", KEYS[8], cancelMessage(base, jobId))
     return meta[2]
   end
   if state == "wait" then redis.call("ZREM", KEYS[1], jobId)
