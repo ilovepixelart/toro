@@ -142,18 +142,19 @@ async def test_the_key_passes_on_every_terminal_path(q, run_worker, run_until, p
     else:
         fails = path in ("failed", "failed with its parent")
         opts = {"remove_on_complete": True} if path == "removed at once" else {}
+        # Both enqueued before any worker exists: a holder that fails the moment it is
+        # claimed cannot free the key before the second add asks for it.
+        if path == "failed with its parent":
+            # the child holds the key and fails, which fails its parent eagerly
+            root = await q.add_flow(
+                "report", {}, children=[FlowChild("holder", {}, concurrency_key="k")]
+            )
+        else:
+            await q.add("holder", {"hold": True}, **opts, concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        assert await _state(q, held.id) == "held"
         async with run_worker(q, failing if fails else proc, concurrency=4) as w:
             w.on("failed", lambda *a, **k: None)
-            if path == "failed with its parent":
-                # the child holds the key and fails, which fails its parent eagerly
-                root = await q.add_flow(
-                    "report", {}, children=[FlowChild("holder", {}, concurrency_key="k")]
-                )
-            else:
-                # gated, so the second add always finds the key taken
-                await q.add("holder", {"hold": True}, **opts, concurrency_key="k")
-            held = await q.add("held", {}, concurrency_key="k")
-            assert await run_until(_count_is(q, "held", 1), timeout=10)
             gate.set()
             if path == "failed with its parent":
                 await _until(lambda: _in_state(q, root.id, "failed"))
@@ -470,24 +471,32 @@ async def test_a_flow_parent_waits_for_its_own_key(q, run_worker, run_until):
 
 
 async def test_only_the_holder_hands_the_key_on(q, run_worker, run_until):
-    """A job that finishes without holding the key must not hand it to anyone: two jobs
-    would then run under it."""
+    """A flow parent carries its key from enqueue but takes it only once its children
+    settle. One that fails before then must not hand on a key it never held, or the job
+    waiting for the real holder runs beside it."""
     gate = asyncio.Event()
-    started, proc = _recorder(gate)
+    started: list[str] = []
 
-    async with run_worker(q, proc, concurrency=8):
-        await q.add("holder", {"hold": True}, concurrency_key="k")
-        await q.add("held", {}, concurrency_key="k")
-        assert await run_until(_count_is(q, "held", 1), timeout=10)
+    async def proc(job):
+        started.append(job.name)
+        if job.name == "leaf":
+            raise RuntimeError("boom")  # fails its parent eagerly, which releases it
+        if job.data.get("hold"):
+            await gate.wait()
+        return job.name
 
-        # a job with the same key field but no claim on it, finishing beside the holder
-        await (await q.add("stranger", {})).result(timeout=10)
-        await q.redis.hset(q.keys.job("stranger"), "ckey", "k")
-        await (await q.add("stranger2", {})).result(timeout=10)
+    async with run_worker(q, proc, concurrency=8) as w:
+        w.on("failed", lambda *a, **k: None)
+        holder = await q.add("holder", {"hold": True}, concurrency_key="k")
+        await _until(lambda: _in_state(q, holder.id, "active"))
+        root = await q.add_flow("report", {}, children=[FlowChild("leaf", {})], concurrency_key="k")
+        held = await q.add("held", {}, concurrency_key="k")
+        await _until(lambda: _in_state(q, root.id, "failed"))
 
-        assert await _count(q, "held") == 1, "someone else handed the key on"
+        assert await q.redis.get(q.keys.concurrency("k")) == holder.id, "the parent gave it away"
+        assert await _state(q, held.id) == "held"
         gate.set()
-        assert await run_until(_count_is(q, "completed", 4), timeout=10)
+        assert await run_until(_count_is(q, "completed", 2), timeout=10)
     assert started.index("holder") < started.index("held")
 
 
@@ -541,3 +550,26 @@ async def test_roots_listings_know_the_held_state(q, run_worker, run_until):
 
         gate.set()
         assert await run_until(_count_is(q, "completed", 2), timeout=10)
+
+
+async def test_the_job_an_add_returns_knows_it_is_held(q):
+    """`add()` answers with a Job. One parked on a key that reads `wait` sends a caller
+    looking for a worker that was never the problem."""
+    await q.add("holder", {}, concurrency_key="k")
+
+    held = await q.add("held", {}, concurrency_key="k")
+
+    assert held.state == "held"
+    assert (await q.get_job(held.id)).state == "held"
+
+
+async def test_an_add_that_enqueued_nothing_answers_for_the_job_that_is_there(q):
+    """A dedup hit and an id replay return an existing job's id; its state is that
+    job's, not a guess about the add that did nothing."""
+    first = await q.add("job", {}, job_id="fixed", concurrency_key="k")
+    behind = await q.add("behind", {}, concurrency_key="k")
+    assert (first.state, behind.state) == ("wait", "held")
+
+    assert (await q.add("job", {}, job_id="fixed")).state == "wait"  # the id replay
+    await q.redis.hset(q.keys.job("fixed"), "state", "active")
+    assert (await q.add("job", {}, job_id="fixed")).state == "active"

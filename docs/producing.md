@@ -93,7 +93,10 @@ await queue.add("charge", {"order": 42}, concurrency_key="order-42")
 await queue.add("invoice", {"order": 42}, concurrency_key="order-42")  # runs after
 ```
 
-At most one job per key runs at a time, however many workers are running. A job
+At most one job per key is claimed at a time, however many workers are running.
+At-least-once still applies: a job whose worker stops reporting is recovered by the
+stalled sweep and runs again, beside a processor that may still be going, so a key
+orders work rather than making a second run impossible. A job
 added under a taken key is **held**: it sits in no other collection, holds no
 worker slot and no place in the queue, and takes the key when the holder reaches
 a terminal state. Held jobs run in the order they were added, and a more urgent

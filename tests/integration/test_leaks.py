@@ -153,7 +153,10 @@ async def test_stopped_worker_leaks_no_tasks(q, run_until):
 
 def _open(client) -> int:
     """Connections this client's own pool still holds open. The server's total counts
-    every other test's clients too, which makes it useless as an assertion."""
+    every other test's clients too, which makes it useless as an assertion. redis-py
+    exposes no public accessor for a pool's connections, so the private one is reached
+    here and nowhere else.
+    """
     pool = client.connection_pool
     held = [*pool._available_connections, *pool._in_use_connections]
     return sum(1 for c in held if c.is_connected)

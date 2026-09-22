@@ -139,3 +139,14 @@ async def test_trigger_scheduler_leaves_unset_retention_to_the_queue(q):
 
 async def _all_failed(q, n):
     return (await q.counts())["failed"] == n
+
+
+async def test_trigger_scheduler_carries_the_concurrency_key(q):
+    """A manual run that drops the key runs beside the scheduled occurrence, which is
+    exactly what the key was asked to prevent."""
+    await q.add_scheduler("sync", every=60_000, concurrency_key="tenant-1")
+    assert await q.trigger_scheduler("sync") is True
+
+    # the occurrence holds the key, so the manual run has to queue behind it
+    assert (await q.counts())["held"] == 1
+    assert (await q.get_jobs("held", 0, -1))[0].opts.concurrency_key == "tenant-1"

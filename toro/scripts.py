@@ -538,32 +538,37 @@ end
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
 # ARGV[10] metricsRetention(ms)  ARGV[11] concurrency key ("" = none)
+# Returns {jobId, state}: on a dedup hit or an id replay, the id of the job that is
+# already there and the state it is really in.
 ADD_JOB = (
     _LIB
     + """
+local base = KEYS[5]
 local function announce(jobId)
   -- whole-message cjson.encode: no hand-built JSON anywhere on the event bus
   redis.call("PUBLISH", KEYS[7],
     cjson.encode({jobId = tostring(jobId), event = "added"}))
 end
-local base = KEYS[5]
+-- An add that enqueued nothing answers with the job that is already there, in the
+-- state it is really in: the caller's Job must not read `wait` for one that is
+-- running, or for one held on its key.
+local function alreadyThere(jobId)
+  announce(jobId)
+  return {tostring(jobId), redis.call("HGET", base .. jobId, "state") or ""}
+end
 -- Throttle dedup: within the TTL window, a repeat dedup id is ignored and the
 -- already-queued job's id is returned (self-expiring, no finish-side cleanup).
 local dedupKey
 if ARGV[8] ~= "" then
   dedupKey = base .. "de:" .. ARGV[8]
   local existing = redis.call("GET", dedupKey)
-  if existing then
-    announce(existing)
-    return existing
-  end
+  if existing then return alreadyThere(existing) end
 end
 local jobId = ARGV[7]
 if jobId == "" then
   jobId = redis.call("INCR", KEYS[1])
 elseif redis.call("EXISTS", base .. jobId) == 1 then
-  announce(jobId)
-  return jobId
+  return alreadyThere(jobId)
 end
 local jobKey = base .. jobId
 redis.call("HSET", jobKey,
@@ -576,19 +581,22 @@ end
 local delay = tonumber(ARGV[5])
 local now = tonumber(ARGV[4])
 if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
+local state = "held"  -- takeKey parks it there when the key is taken
 if takeKey(base, jobKey, jobId, ARGV[11], tonumber(ARGV[6]), KEYS[6], now) then
   if delay > 0 then
-    redis.call("HSET", jobKey, "state", "delayed")
+    state = "delayed"
+    redis.call("HSET", jobKey, "state", state)
     redis.call("ZADD", KEYS[4], now + delay, jobId)
   else
-    redis.call("HSET", jobKey, "state", "wait")
+    state = "wait"
+    redis.call("HSET", jobKey, "state", state)
     enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
   end
 end
 -- only real inserts count (dedup hits and id replays returned above)
 recordMetrics(base, "added", tonumber(ARGV[4]), 0, tonumber(ARGV[10]))
 announce(jobId)
-return jobId
+return {tostring(jobId), state}
 """
 )
 
@@ -915,6 +923,10 @@ REMOVE_JOB = (
     _LIB
     + """
 local base = KEYS[7]
+-- Read BEFORE the first write, like requireCap: Redis rolls nothing back, so a
+-- missing clock has to fail the call rather than halfway through it.
+local now = tonumber(ARGV[2])
+if now == nil then error("REMOVE_JOB needs a now argument") end
 -- The job's `state` field says which single collection holds it (every
 -- transition writes it atomically); only an unreadable state pays the blanket
 -- sweep - notably the O(active) LREM.
@@ -939,7 +951,7 @@ end
 local function removeTree(jobId)
   local meta = redis.call("HMGET", base .. jobId, "children", "state", "ckey")
   removeFromState(jobId, meta[2])
-  unkey(base, jobId, meta[2], meta[3], tonumber(ARGV[2]))
+  unkey(base, jobId, meta[2], meta[3], now)
   delJobs({jobId}, base)
   if meta[1] then
     for _, cid in ipairs(cjson.decode(meta[1])) do removeTree(cid) end
@@ -954,7 +966,7 @@ if parentId then
   -- cleanup (clean('completed')) must never mutate a pending parent's data
   redis.call("SREM", base .. parentId .. ":deps", ARGV[1])
   if redis.call("SCARD", base .. parentId .. ":deps") == 0 then
-    releaseParent(base, parentId, tonumber(ARGV[2]))
+    releaseParent(base, parentId, now)
   end
 end
 return existed

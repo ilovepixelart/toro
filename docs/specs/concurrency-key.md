@@ -85,6 +85,10 @@ the queue while they wait. Other keys are unaffected, and so is the claim path.
 - **Held jobs are invisible to `prioritized`**, so `latency()` (age of the next
   waiting job) does not see them. A held job waits on its key, not on workers;
   documented.
+- **A key orders claims; it does not defeat at-least-once.** The stalled sweep
+  re-runs a job whose worker went quiet, and gives the key up when it fails one for
+  good, while that worker's processor may still be running. Same rule as every
+  other guarantee in the queue, and the producing page says so.
 
 ## Decisions
 

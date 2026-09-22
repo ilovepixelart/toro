@@ -221,7 +221,7 @@ class Queue:
                     "(it is used as a Redis key segment)"
                 )
         now = _now_ms()
-        new_id = str(
+        new_id, state = _str_list(
             await self._add_job(
                 keys=[
                     self.keys.id,
@@ -254,7 +254,10 @@ class Queue:
             data=data,
             opts=options,
             timestamp=now,
-            state="delayed" if options.delay > 0 else "wait",
+            # The script's answer, not a guess: an add that found the key taken parks
+            # the job in `held`, and one that hit a dedup window or replayed an id
+            # answers for the job already there, in whatever state that job is in.
+            state=cast("JobState", state) if state else None,
             _queue=self,
         )
 
@@ -588,17 +591,15 @@ class Queue:
             return False
         name = cast("str", t.get("name", scheduler_id))
         stored = JobOptions.from_dict(json.loads(t.get("opts") or "{}"))
-        opts: dict[str, Any] = {
-            "attempts": stored.attempts,
-            "backoff": stored.backoff,
-            "priority": stored.priority,
+        # Every option the template stored, taken off the options object itself so an
+        # option added later cannot be left behind here. Two exceptions: `delay`, since
+        # a manual run is now; and retention the template leaves unset (every scheduler
+        # registered by an earlier release), which stays the queue's call - passed on as
+        # an explicit None it would override `default_job_options`.
+        skip = {"delay"} | {
+            k for k in ("remove_on_complete", "remove_on_fail") if getattr(stored, k) is None
         }
-        # Retention the template leaves unset stays the queue's call: passed on as an
-        # explicit None it would override `default_job_options`.
-        if stored.remove_on_complete is not None:
-            opts["remove_on_complete"] = stored.remove_on_complete
-        if stored.remove_on_fail is not None:
-            opts["remove_on_fail"] = stored.remove_on_fail
+        opts: dict[str, Any] = {k: v for k, v in vars(stored).items() if k not in skip}
         await self.add(name, json.loads(t.get("data") or "null"), **opts)
         return True
 
@@ -870,21 +871,13 @@ class Queue:
         """Page through job ids in a given state and hydrate them into Jobs.
         `wait` returns jobs in global priority order (most urgent first).
         """
-        if state in ("wait", "prioritized"):
-            ids = await self.redis.zrange(self.keys.prioritized, start, end)
-        elif state == "active":
+        if state == "active":
             ids = await self.redis.lrange(self.keys.active, start, end)
-        elif state == "delayed":
-            ids = await self.redis.zrange(self.keys.delayed, start, end)
-        elif state == "waiting-children":
-            ids = await self.redis.zrange(self.keys.waiting_children, start, end)
-        elif state == "held":
-            ids = await self.redis.zrange(self.keys.held, start, end)
         elif state in ("completed", "failed"):
             count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
-            ids = await self._newest_finished(getattr(self.keys, state), start, count)
+            ids = await self._newest_finished(self._finished_zset(state), start, count)
         else:
-            raise ValueError(f"unknown state: {state}")
+            ids = await self.redis.zrange(self._state_zset(state), start, end)
         return await self._hydrate_ids(_str_list(ids))
 
     async def _newest_finished(self, key: str, start: int, count: int) -> list[str]:
@@ -918,20 +911,9 @@ class Queue:
         """Map a ZSET-backed state to (key, newest_first) for the roots diff.
         `active` is a LIST and is handled separately by the caller.
         """
-        if state in ("wait", "prioritized"):
-            return self.keys.prioritized, False
-        if state == "delayed":
-            return self.keys.delayed, False
-        if state == "waiting-children":
-            return self.keys.waiting_children, False
-        if state == "held":
-            return self.keys.held, False
-        # finished states read newest-first
-        if state == "completed":
-            return self.keys.completed, True
-        if state == "failed":
-            return self.keys.failed, True
-        raise ValueError(f"unknown state: {state}")
+        if state in ("completed", "failed"):  # finished states read newest-first
+            return self._finished_zset(state), True
+        return self._state_zset(state), False
 
     async def get_jobs_roots(
         self, state: JobState, start: int = 0, end: int = 20
@@ -1073,7 +1055,7 @@ class Queue:
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
         if state in ("completed", "failed"):
-            zset = getattr(self.keys, state)
+            zset = self._finished_zset(state)
             if newest:
                 return await self._newest_finished(zset, 0, limit)
             # oldest first, and settled only: a running flow's finished children are
@@ -1081,8 +1063,16 @@ class Queue:
             return _str_list(await self.redis.zrangebyscore(zset, "-inf", SETTLED, 0, limit))
         return _str_list(await self.redis.zrange(self._state_zset(state), 0, limit - 1))
 
+    def _finished_zset(self, state: JobState) -> str:
+        """Name the ZSET a finished state lists from. The pair reads newest-first."""
+        return self.keys.completed if state == "completed" else self.keys.failed
+
     def _state_zset(self, state: JobState) -> str:
-        """Name the ZSET a non-active, non-finished state lists from."""
+        """Name the ZSET a non-active, non-finished state lists from.
+
+        The one such mapping: `get_jobs`, `_ids` and `_roots_zset` all read it, so a
+        new state joins the listings by being added here and nowhere else.
+        """
         if state in ("wait", "prioritized"):
             return self.keys.prioritized
         if state == "delayed":

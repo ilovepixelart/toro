@@ -1,5 +1,7 @@
 """Unit: JobOptions - defaults, (de)serialization, and the key a job serializes on."""
 
+import pytest
+
 from toro.job import JobOptions
 
 
@@ -35,3 +37,11 @@ def test_a_concurrency_key_round_trips():
 
 def test_no_concurrency_key_by_default():
     assert JobOptions().concurrency_key is None
+
+
+@pytest.mark.parametrize("bad", ["", "a:b", "ctrl\x01", "\n", 7])
+def test_a_key_that_could_collide_is_refused(bad):
+    """Every enqueue path builds its options here, so this is the one place the rule
+    has to hold: a key becomes a Redis key segment."""
+    with pytest.raises(ValueError, match="concurrency_key"):
+        JobOptions(concurrency_key=bad)
