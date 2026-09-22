@@ -88,6 +88,20 @@ class Keys:
         return f"{self.base}limiter"
 
     @property
+    def held(self) -> str:
+        # ZSET of every job waiting on a concurrency key, scored by enqueue time.
+        return f"{self.base}held"
+
+    def concurrency(self, key: str) -> str:
+        # STRING naming the job that currently holds a concurrency key.
+        return f"{self.base}ck:{key}"
+
+    def held_for(self, key: str) -> str:
+        # ZSET of the jobs queued behind one concurrency key, in the order they
+        # would have had in `prioritized`.
+        return f"{self.base}held:{key}"
+
+    @property
     def stalled(self) -> str:
         return f"{self.base}stalled"
 
@@ -132,7 +146,7 @@ class Keys:
 
     # Where a custom job id could land on a key that is not its own: the namespaces
     # built under the base (`de:` only in Lua) and the suffixes of a job's aux keys.
-    _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:")
+    _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:", "ck:", "held:")
     _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail", ":live")
 
     def job_id_conflict(self, job_id: str) -> str | None:

@@ -247,18 +247,18 @@ class Queue:
                     self.keys.pc,
                     self.keys.events,
                 ],
-                args=[
-                    name,
-                    json.dumps(data),
-                    json.dumps(options.to_dict()),
-                    now,
-                    options.delay,
-                    options.priority,
-                    job_id or "",
-                    dedup_id,
-                    dedup_ttl,
-                    scripts.METRICS_RETENTION_MS,
-                ],
+                args=scripts.add_job_args(
+                    name=name,
+                    data=json.dumps(data),
+                    opts=json.dumps(options.to_dict()),
+                    now=now,
+                    delay=options.delay,
+                    priority=options.priority,
+                    job_id=job_id or "",
+                    dedup_id=dedup_id,
+                    dedup_ttl=dedup_ttl,
+                    concurrency_key=options.concurrency_key or "",
+                ),
             )
         )
         # The "added" event publishes from inside ADD_JOB (so a live dashboard
@@ -658,7 +658,8 @@ class Queue:
         pipe.zcard(self.keys.completed)
         pipe.zcard(self.keys.failed)
         pipe.zcard(self.keys.waiting_children)
-        wait, active, delayed, completed, failed, waiting_children = await pipe.execute()
+        pipe.zcard(self.keys.held)
+        wait, active, delayed, completed, failed, waiting_children, held = await pipe.execute()
         return {
             "wait": wait,
             "active": active,
@@ -666,6 +667,7 @@ class Queue:
             "completed": completed,
             "failed": failed,
             "waiting-children": waiting_children,
+            "held": held,
         }
 
     async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
@@ -890,6 +892,8 @@ class Queue:
             ids = await self.redis.zrange(self.keys.delayed, start, end)
         elif state == "waiting-children":
             ids = await self.redis.zrange(self.keys.waiting_children, start, end)
+        elif state == "held":
+            ids = await self.redis.zrange(self.keys.held, start, end)
         elif state in ("completed", "failed"):
             count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
             ids = await self._newest_finished(getattr(self.keys, state), start, count)
@@ -1075,14 +1079,8 @@ class Queue:
         states come newest-first (what a dashboard shows as "recent"); the other
         states have one natural order (priority / claim / due-time) either way.
         """
-        if state in ("wait", "prioritized"):
-            return _str_list(await self.redis.zrange(self.keys.prioritized, 0, limit - 1))
         if state == "active":
             return _str_list(await self.redis.lrange(self.keys.active, 0, limit - 1))
-        if state == "waiting-children":
-            return _str_list(await self.redis.zrange(self.keys.waiting_children, 0, limit - 1))
-        if state == "delayed":
-            return _str_list(await self.redis.zrange(self.keys.delayed, 0, limit - 1))
         if state in ("completed", "failed"):
             zset = getattr(self.keys, state)
             if newest:
@@ -1090,7 +1088,20 @@ class Queue:
             # oldest first, and settled only: a running flow's finished children are
             # not history to clean
             return _str_list(await self.redis.zrangebyscore(zset, "-inf", SETTLED, 0, limit))
-        raise ValueError(f"unknown state: {state}")
+        return _str_list(await self.redis.zrange(self._state_zset(state), 0, limit - 1))
+
+    def _state_zset(self, state: JobState) -> str:
+        """Name the ZSET a non-active, non-finished state lists from."""
+        if state in ("wait", "prioritized"):
+            return self.keys.prioritized
+        if state == "delayed":
+            return self.keys.delayed
+        if state == "held":
+            return self.keys.held
+        if state == "waiting-children":
+            return self.keys.waiting_children
+        msg = f"unknown state: {state}"
+        raise ValueError(msg)
 
     async def search(self, state: JobState, query: str, scan_limit: int = 500) -> list[Job]:
         """Substring-search `name`/`data` within a state's most recent `scan_limit`

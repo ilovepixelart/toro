@@ -91,6 +91,47 @@ local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
   redis.call("ZADD", markerKey, 0, "0")
 end
+-- Jobs that share a concurrency key run one at a time, in the order they were added.
+-- The key is held from enqueue until the holder reaches a terminal state: `ck:<key>`
+-- names the holder and `held:<key>` is the queue behind it, scored as `prioritized`
+-- would have scored those jobs, so a job keeps its place among the ones added with it.
+-- A held job is in no other collection: it waits on the key, not on a worker.
+local function takeKey(base, jobKey, jobId, ckey, priority, pcKey, now)
+  if ckey == "" then return true end
+  redis.call("HSET", jobKey, "ckey", ckey)
+  if redis.call("SET", base .. "ck:" .. ckey, jobId, "NX") then return true end
+  redis.call("HSET", jobKey, "state", "held")
+  redis.call("ZADD", base .. "held:" .. ckey, priorityScore(priority, pcKey), jobId)
+  redis.call("ZADD", base .. "held", now, jobId)
+  return false
+end
+-- Hand a key to the job that has waited longest at the highest priority, or give it
+-- up. A job released with time still to run on its delay goes back to `delayed`: it
+-- waited on the key, which is not the same as having waited out its delay.
+local function releaseKey(base, jobKey, jobId, now)
+  local ckey = redis.call("HGET", jobKey, "ckey")
+  if not ckey then return end
+  local holder = base .. "ck:" .. ckey
+  if redis.call("GET", holder) ~= jobId then return end
+  local nxt = redis.call("ZPOPMIN", base .. "held:" .. ckey)
+  if not nxt[1] then
+    redis.call("DEL", holder)
+    return
+  end
+  local nid = nxt[1]
+  redis.call("SET", holder, nid)
+  redis.call("ZREM", base .. "held", nid)
+  local meta = redis.call("HMGET", base .. nid, "timestamp", "delay")
+  local due = (tonumber(meta[1]) or now) + (tonumber(meta[2]) or 0)
+  if due > now then
+    redis.call("HSET", base .. nid, "state", "delayed")
+    redis.call("ZADD", base .. "delayed", due, nid)
+  else
+    redis.call("HSET", base .. nid, "state", "wait")
+    redis.call("ZADD", base .. "prioritized", tonumber(nxt[2]), nid)
+    redis.call("ZADD", base .. "marker", 0, "0")
+  end
+end
 local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   local jobKey = base .. jobId
   redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
@@ -344,6 +385,7 @@ local function reviveSubtree(base, rootId, jobId, now)
   end
 end
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state)
+  releaseKey(base, jobKey, jobId, now)  -- terminal: whatever happens below, the key goes on
   local meta = redis.call("HMGET", jobKey, "opts", "parentId", "rootId", "children")
   local keepCount, keepAge = keepFor(meta[1], state)
   local root = meta[2] and runningRoot(base, meta[2], meta[3])
@@ -459,7 +501,7 @@ end
 # ARGV[1] name  ARGV[2] data(json)  ARGV[3] opts(json)
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
-# ARGV[10] metricsRetention(ms)
+# ARGV[10] metricsRetention(ms)  ARGV[11] concurrency key ("" = none)
 ADD_JOB = (
     _LIB
     + """
@@ -496,12 +538,16 @@ if dedupKey then
   redis.call("HSET", jobKey, "deid", ARGV[8])
 end
 local delay = tonumber(ARGV[5])
-if delay > 0 then
-  redis.call("HSET", jobKey, "delay", delay, "state", "delayed")
-  redis.call("ZADD", KEYS[4], tonumber(ARGV[4]) + delay, jobId)
-else
-  redis.call("HSET", jobKey, "state", "wait")
-  enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
+local now = tonumber(ARGV[4])
+if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
+if takeKey(base, jobKey, jobId, ARGV[11], tonumber(ARGV[6]), KEYS[6], now) then
+  if delay > 0 then
+    redis.call("HSET", jobKey, "state", "delayed")
+    redis.call("ZADD", KEYS[4], now + delay, jobId)
+  else
+    redis.call("HSET", jobKey, "state", "wait")
+    enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
+  end
 end
 -- only real inserts count (dedup hits and id replays returned above)
 recordMetrics(base, "added", tonumber(ARGV[4]), 0, tonumber(ARGV[10]))
@@ -988,9 +1034,38 @@ return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), active}
 """
 
 
-# The ARGV of the two finish scripts, in the order their headers document. Built here
-# and nowhere else: a hand-rolled list keeps "working" when the layout changes, with
-# its values in the wrong slots.
+# The ARGV of the scripts with many parameters, in the order their headers document.
+# Built here and nowhere else: a hand-rolled list keeps "working" when the layout
+# changes, with its values in the wrong slots.
+def add_job_args(
+    *,
+    name: str,
+    data: str,
+    opts: str,
+    now: int,
+    delay: int,
+    priority: int,
+    job_id: str,
+    dedup_id: str,
+    dedup_ttl: int,
+    concurrency_key: str,
+) -> list[str | int]:
+    """ARGV for ADD_JOB."""
+    return [
+        name,
+        data,
+        opts,
+        now,
+        delay,
+        priority,
+        job_id,
+        dedup_id,
+        dedup_ttl,
+        METRICS_RETENTION_MS,
+        concurrency_key,
+    ]
+
+
 def completed_args(
     *,
     job_id: str,

@@ -12,8 +12,8 @@ from ._replies import _str_dict
 
 # The lifecycle states a job can be in (also the queryable states for get_jobs).
 # `waiting-children` is the flow-parent park: enqueued, but runnable only once
-# every child has settled.
-JobState = Literal["wait", "active", "delayed", "completed", "failed", "waiting-children"]
+# every child has settled. `held` waits on a concurrency key, not on a worker.
+JobState = Literal["wait", "active", "delayed", "held", "completed", "failed", "waiting-children"]
 
 
 class BackoffOpts(TypedDict, total=False):
