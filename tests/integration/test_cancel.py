@@ -132,8 +132,10 @@ async def test_a_cancelled_child_settles_its_parent_by_policy(q, on_fail, parent
     if parent == "cancelled":
         assert await _count(q, "failed") == 0  # nothing failed, so nothing is counted
     else:
-        # the parent runs and can see why the child never delivered
-        assert await q.redis.hget(q.keys.cfail(root.id), leaf) == "cancelled"
+        # the parent runs and can see why the child never delivered, in the record
+        # for children that were stopped rather than the one for children that failed
+        assert await q.redis.hget(q.keys.ccancel(root.id), leaf) == "cancelled"
+        assert await q.redis.hget(q.keys.cfail(root.id), leaf) is None
 
 
 @pytest.mark.parametrize("state", ["completed", "failed"])
@@ -563,3 +565,26 @@ async def test_result_reports_the_reason_to_a_waiter(q):
 
     with pytest.raises(JobCancelledError, match="duplicate request"):
         await waiting
+
+
+async def test_a_cancelled_child_is_not_recorded_as_a_failure(q):
+    """CN-006: under `continue` the parent runs with a record of the children that did
+    not deliver. A cancelled one belongs in its own record: counted among failures it
+    is the same conflation the separate state exists to prevent, one flow at a time."""
+    root = await q.add_flow(
+        "report",
+        {},
+        children=[
+            FlowChild("stopped", {}, delay=60_000, on_fail="continue"),
+            FlowChild("broken", {}, delay=60_000, on_fail="continue"),
+        ],
+    )
+    stopped, broken = (n["job"].id for n in (await q.get_flow(root.id))["children"])
+
+    assert await q.cancel_job(stopped, reason="not needed") is True
+    await q.redis.hset(q.keys.cfail(root.id), broken, "boom")  # a real failure beside it
+
+    assert await q.redis.hget(q.keys.ccancel(root.id), stopped) == "not needed"
+    assert await q.redis.hget(q.keys.cfail(root.id), stopped) is None
+    _done, failed, cancelled = (await q.flow_progress([root.id]))[root.id]
+    assert (failed, cancelled) == (1, 1), "the cancelled child was counted as a failure"

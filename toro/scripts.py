@@ -240,7 +240,7 @@ end
 local function delKeys(base, id)
   redis.call("DEL", base .. id, base .. id .. ":lock", base .. id .. ":logs",
              base .. id .. ":deps", base .. id .. ":results", base .. id .. ":cfail",
-             base .. id .. ":live")
+             base .. id .. ":ccancel", base .. id .. ":live")
   redis.call("ZREM", base .. "children", id)  -- prune the flow-child index (hygiene)
 end
 local function delJobs(ids, base)
@@ -508,7 +508,10 @@ local function settleChildGone(base, jobId, parentId, onFail, reason, now, reten
   while pid do
     if onFail == "continue" then
       if redis.call("EXISTS", base .. pid) == 1 then
-        redis.call("HSET", base .. pid .. ":cfail", cid, reason)
+        -- its own record: the parent runs either way, but a stopped child is not a
+        -- failed one and its fan-in must not say otherwise
+        local record = state == "cancelled" and ":ccancel" or ":cfail"
+        redis.call("HSET", base .. pid .. record, cid, reason)
         redis.call("SREM", base .. pid .. ":deps", cid)
         if redis.call("SCARD", base .. pid .. ":deps") == 0 then
           releaseParent(base, pid, now)
@@ -1032,8 +1035,8 @@ local msg = {jobId = ARGV[1], event = "cancelled"}
 if meta[3] then msg.reason = meta[3] end
 redis.call("PUBLISH", KEYS[8], cjson.encode(msg))
 if meta[1] then
-  settleChildGone(base, ARGV[1], meta[1], meta[2], "cancelled", now, tonumber(ARGV[4]),
-    "cancelled")
+  settleChildGone(base, ARGV[1], meta[1], meta[2], meta[3] or "cancelled", now,
+    tonumber(ARGV[4]), "cancelled")
 end
 wakeIfWaiting(KEYS[5], KEYS[6])
 return 1
@@ -1117,8 +1120,8 @@ if topState == "active" then return 2 end   -- its worker settles it when it sto
 -- onFail policy decides, exactly as it does for a child that failed: there is one
 -- rule for "this child will never deliver", not two.
 if top[1] then
-  settleChildGone(base, ARGV[1], top[1], top[2], "cancelled", now, tonumber(ARGV[3]),
-    "cancelled")
+  settleChildGone(base, ARGV[1], top[1], top[2], why ~= "" and why or "cancelled", now,
+    tonumber(ARGV[3]), "cancelled")
 end
 return 1
 """

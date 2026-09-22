@@ -352,11 +352,13 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)
         pipe.hgetall(self.keys.results(job_id))
         pipe.hgetall(self.keys.cfail(job_id))
-        raw_results, raw_cfail = await pipe.execute()
+        pipe.hgetall(self.keys.ccancel(job_id))
+        raw_results, raw_cfail, raw_ccancel = await pipe.execute()
         return FlowView(
             tree=tree,
             results=decode_results(_str_dict(raw_results)),
             failures=_str_dict(raw_cfail),
+            cancellations=_str_dict(raw_ccancel),
         )
 
     async def children_results(self, job_id: str) -> dict[str, Any]:
@@ -370,11 +372,11 @@ class Queue:
         """Read child id -> failure reason recorded under ``on_fail="continue"``."""
         return _str_dict(await self.redis.hgetall(self.keys.cfail(job_id)))
 
-    async def flow_progress(self, parent_ids: list[str]) -> dict[str, tuple[int, int]]:
-        """For each flow parent id, ``(completed_children, failed_children)`` -
-        cheap pipelined HLEN reads of the ``:results`` / ``:cfail`` hashes (just
-        the counts, no values). Lets a dashboard show fan-in progress for a page
-        of parked parents without hydrating each tree.
+    async def flow_progress(self, parent_ids: list[str]) -> dict[str, tuple[int, int, int]]:
+        """For each flow parent id, ``(completed, failed, cancelled)`` children -
+        cheap pipelined HLEN reads of the ``:results`` / ``:cfail`` / ``:ccancel``
+        hashes (just the counts, no values). Lets a dashboard show fan-in progress
+        for a page of parked parents without hydrating each tree.
         """
         if not parent_ids:
             return {}
@@ -382,8 +384,12 @@ class Queue:
         for pid in parent_ids:
             pipe.hlen(self.keys.results(pid))
             pipe.hlen(self.keys.cfail(pid))
+            pipe.hlen(self.keys.ccancel(pid))
         res = await pipe.execute()
-        return {pid: (int(res[2 * i]), int(res[2 * i + 1])) for i, pid in enumerate(parent_ids)}
+        return {
+            pid: (int(res[3 * i]), int(res[3 * i + 1]), int(res[3 * i + 2]))
+            for i, pid in enumerate(parent_ids)
+        }
 
     async def result(self, job_id: str, *, timeout: float = 30.0) -> Any:
         """Wait for a job to finish; return its return value, or raise JobFailedError.
