@@ -593,3 +593,66 @@ async def test_an_orphan_is_never_older_than_its_root(q):
 
     ranked = await q.redis.zrange(q.keys.failed, 0, -1)
     assert ranked[0] == root.id, ranked
+
+
+async def test_a_live_entry_is_never_counted_against_the_bound(q, run_worker, run_until):
+    """The trims' boundary is LIVE itself. Lua formats a number it concatenates with
+    %.14g, four above LIVE, so entries just above LIVE would count as settled and the
+    bound would trim one settled job too many."""
+    await q.redis.zadd(q.keys.completed, {"live-ghost": LIVE_SCORE + 1})
+    seeds = await _seed_history(q, 3)
+
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=1):
+        await (await q.add("unrelated", {}, remove_on_complete=3)).result(timeout=10)
+
+    assert await _present(q, seeds) == 2, "a live entry counted against the bound"
+    assert await q.redis.zscore(q.keys.completed, "live-ghost") == LIVE_SCORE + 1
+
+
+async def test_a_listed_id_with_no_hash_is_cleaned_up(q, run_worker, run_until):
+    """A finished set can hold an id whose hash is gone: an operator's DEL, an older
+    version. It must not hold a slot in the bound for good."""
+    old = int(time.time() * 1000) - 86_400_000
+    await q.redis.zadd(q.keys.completed, {"ghost": old})
+    seeds = await _seed_history(q, 2)
+
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=1):
+        await (await q.add("unrelated", {}, remove_on_complete=2)).result(timeout=10)
+
+    assert await q.redis.zscore(q.keys.completed, "ghost") is None, "a dangling id stayed"
+    assert await _count_state(q, "completed", 2)
+    assert await _present(q, seeds) == 1
+
+
+async def test_retrying_a_child_under_a_settled_root_strands_nothing(q, run_worker, run_until):
+    """A failed root is not retried, but one of its children is. The flow is not
+    running again: its finished jobs stay settled. Scored live under a root that will
+    never settle again, nothing would ever place them back."""
+
+    async def proc(job):
+        if job.name == "leaf1":
+            while (await q.counts())["completed"] < 2:  # noqa: ASYNC110 - a poll, in a test
+                await asyncio.sleep(0.01)
+            raise RuntimeError("boom")
+        return job.name
+
+    async with run_worker(q, proc, concurrency=4):
+        root_id, names = await _nested(q)
+        assert await run_until(lambda: _in_state(q, root_id, "failed"), timeout=10)
+
+        assert await q.retry_job(names["mid"]) is True
+        scores = await _scores(q, [names["leaf2"], names["side"]])
+        assert all(s < LIVE_SCORE for s in scores.values()), scores
+        assert await q.redis.exists(q.keys.live(root_id)) == 0
+
+
+async def test_removing_a_running_flow_leaves_no_live_index(q, run_worker, run_until):
+    """`<root>:live` is the flow's own key: it goes when the flow does."""
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=4):
+        root = await q.add_flow("report", {}, children=[c("a", {}), c("b", {}, delay=30_000)])
+        assert await run_until(lambda: q.redis.exists(q.keys.live(root.id)), timeout=10)
+
+        assert await q.remove_job(root.id) is True
+
+    assert await q.redis.exists(q.keys.live(root.id)) == 0
+    assert await _count_state(q, "completed", 0)

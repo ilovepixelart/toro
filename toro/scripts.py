@@ -271,22 +271,24 @@ local function keptForever(base, jobId, state)
   local keepCount, keepAge = keepFor(redis.call("HGET", base .. jobId, "opts"), state)
   return keepCount < 0 and keepAge < 0
 end
--- Remove a finished job and, with it, the finished subtree of a flow it roots: the
--- trim reaches a root first (it is the oldest of its flow) and a partial flow is
--- worth nothing. Returns how many jobs went, which the trim budget pays for. A
--- descendant still running is left; it settles as an orphan and is trimmed alone.
--- A descendant kept forever by its own option stays, as an orphan.
-local function removeFinished(base, jobId)
+-- Remove a finished job from `setKey` and, with it, the finished subtree of a flow
+-- it roots: the trim reaches a root first (it is the oldest of its flow) and a
+-- partial flow is worth nothing. Returns how many jobs went, which the trim budget
+-- pays for. Left alone: a descendant still running (it settles as an orphan and is
+-- trimmed alone) and one whose own option keeps everything. An id whose hash is
+-- already gone (an earlier cascade in this script, an operator's DEL) is not a job:
+-- it costs nothing, and its listing goes with it rather than holding the bound.
+local function removeFinished(base, setKey, jobId)
   local meta = redis.call("HMGET", base .. jobId, "state", "children")
-  if meta[1] ~= "completed" and meta[1] ~= "failed" then return 0 end
-  redis.call("ZREM", base .. meta[1], jobId)
+  redis.call("ZREM", setKey, jobId)
+  if not meta[1] then return 0 end
   delJobs({jobId}, base)
   local gone = 1
   if meta[2] then
     for _, cid in ipairs(cjson.decode(meta[2])) do
       local cstate = redis.call("HGET", base .. cid, "state")
       if (cstate == "completed" or cstate == "failed") and not keptForever(base, cid, cstate) then
-        gone = gone + removeFinished(base, cid)
+        gone = gone + removeFinished(base, base .. cstate, cid)
       end
     end
   end
@@ -360,7 +362,7 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
                                "LIMIT", 0, trimBudget)
     for _, id in ipairs(expired) do
       if trimBudget <= 0 then break end
-      trimBudget = trimBudget - removeFinished(base, id)
+      trimBudget = trimBudget - removeFinished(base, setKey, id)
     end
   end
   -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
@@ -371,7 +373,7 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
       local victims = redis.call("ZRANGE", setKey, 0, math.min(excess, trimBudget) - 1)
       for _, id in ipairs(victims) do
         if trimBudget <= 0 then break end
-        trimBudget = trimBudget - removeFinished(base, id)
+        trimBudget = trimBudget - removeFinished(base, setKey, id)
       end
     end
   end
