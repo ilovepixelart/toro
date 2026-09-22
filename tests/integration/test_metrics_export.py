@@ -6,6 +6,8 @@ forever". These totals never expire, and are written in the same atomic step as 
 transition they count, so a counter can never disagree with the state change.
 """
 
+import asyncio
+
 from toro import FlowChild, Queue
 
 PREFIX = "torotest"
@@ -37,6 +39,32 @@ async def test_a_total_counts_every_way_a_job_can_end(q, run_worker, run_until):
     assert totals["completed"] == 1
     assert totals["failed"] == 1
     assert totals["cancelled"] == 1, "a cancellation was not counted as one"
+
+
+async def test_the_duration_total_counts_the_time_the_work_took(q, run_worker, run_until):
+    """`toro_job_duration_ms_total` is a published family: without it a scraper can
+    chart how much work a queue does and not what it costs. It is written where the
+    duration is already known, the same step as the outcome it belongs to."""
+
+    async def proc(job):
+        await asyncio.sleep(0.05)
+
+    async with run_worker(q, proc):
+        await q.add("slow", {})
+        assert await run_until(_settled(q, 1), timeout=10)
+
+    ms = (await _totals(q))["ms"]
+    assert ms >= 50, "the processing time was not counted"
+    assert f'toro_job_duration_ms_total{{queue="{q.name}"}} {ms}' in await q.metrics_text()
+
+
+async def test_a_flow_counts_every_job_it_adds(q):
+    """A whole tree is added in one script, and records one increment for it, so that
+    increment is the size of the tree: counting the tree as one job would report a
+    queue doing a fraction of the work it does."""
+    await q.add_flow("report", {}, children=[FlowChild("a", {}), FlowChild("b", {})])
+
+    assert (await _totals(q))["added"] == 3
 
 
 async def test_totals_never_expire(q):
