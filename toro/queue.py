@@ -167,6 +167,8 @@ class Queue:
         # a queue for every name it is given, and stamping on a read would create the
         # ones nobody has used yet.
         self._model_checked = False
+        # Tasks reading a result back for a waiter whose event could not carry it.
+        self._read_backs: set[asyncio.Task[None]] = set()
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
         self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
         self._roots_counts_script = self.redis.register_script(scripts.ROOTS_COUNTS)
@@ -585,11 +587,32 @@ class Queue:
             if fut.done():
                 continue
             if event == "completed":
-                fut.set_result(data.get("result"))
+                if "result" in data:
+                    fut.set_result(data["result"])
+                else:
+                    # too large or too deep to travel in the event: read it back from
+                    # the hash, where the finish script already wrote it
+                    self._read_back(job_id, fut)
             elif event == "cancelled":
                 fut.set_exception(JobCancelledError(job_id, data.get("reason")))
             else:
                 fut.set_exception(JobFailedError(data.get("reason")))
+
+    def _read_back(self, job_id: str, fut: asyncio.Future[Any]) -> None:
+        """Resolve a waiter from the job's stored return value.
+
+        The task is held in a set of its own: the loop keeps no reference to a task
+        nobody awaits, and a garbage-collected one leaves the waiter hanging forever.
+        """
+
+        async def read() -> None:
+            job = await self.get_job(job_id)
+            if not fut.done():
+                fut.set_result(job.returnvalue if job else None)
+
+        task = asyncio.create_task(read())
+        self._read_backs.add(task)
+        task.add_done_callback(self._read_backs.discard)
 
     # ---- schedulers (cron / repeatable) -----------------------------------
 
