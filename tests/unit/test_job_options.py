@@ -2,6 +2,7 @@
 
 import pytest
 
+from toro import Queue
 from toro.job import JobOptions
 
 
@@ -45,3 +46,20 @@ def test_a_key_that_could_collide_is_refused(bad):
     has to hold: a key becomes a Redis key segment."""
     with pytest.raises(ValueError, match="concurrency_key"):
         JobOptions(concurrency_key=bad)
+
+
+@pytest.mark.parametrize("name", ["", "x" * 200, "a\nb", "a\x00b"])
+def test_a_job_name_that_is_not_a_label_is_refused(name):
+    """A job name is a label: it is rendered on every row of a dashboard, written into
+    a metrics field per distinct value, and read back in log lines. An empty one names
+    nothing, and an unbounded one is a payload wearing a label's clothes."""
+    q = Queue("nametest", prefix="torotest")
+    with pytest.raises(ValueError, match="name"):
+        q._stage_add(name, {}, job_id=None, deduplication=None, opts={})
+
+
+@pytest.mark.parametrize("name", ["welcome", "email:daily", "a" * 128])
+def test_an_ordinary_name_is_accepted(name):
+    q = Queue("nametest", prefix="torotest")
+
+    assert q._stage_add(name, {}, job_id=None, deduplication=None, opts={}) is not None

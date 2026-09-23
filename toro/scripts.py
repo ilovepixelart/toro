@@ -301,7 +301,12 @@ local function recordMetrics(base, field, now, durMs, retentionMs, name, count)
   redis.call("HINCRBY", base .. "totals", field, count or 1)
   if durMs > 0 then redis.call("HINCRBY", base .. "totals", "ms", durMs) end
   if durMs > 0 then redis.call("HINCRBY", bucket, "ms", durMs) end
-  if name then
+  -- A job name is a LABEL, and this bucket keeps a field per distinct value for its
+  -- whole life. A producer that puts an id in the name ("email-<user>") would hand
+  -- Redis a field per user, times every bucket in the retention window, and make the
+  -- by-name read walk all of them. Past the ceiling the breakdown stops; the
+  -- queue-level counters, which are what alerting reads, are untouched.
+  if name and redis.call("HLEN", bucket) < 1024 then
     redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
     if durMs > 0 then redis.call("HINCRBY", bucket, "ms:" .. name, durMs) end
     -- duration histogram ("h:<name>:<bucketIdx>"), successful jobs only

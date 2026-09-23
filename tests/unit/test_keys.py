@@ -1,5 +1,7 @@
 """Unit: Keys - the one place that knows the Redis key layout."""
 
+import pytest
+
 from toro.keys import Keys
 
 
@@ -43,3 +45,26 @@ def test_scheduler_key():
 
 def test_prefix_is_configurable():
     assert Keys("q", "myapp").base == "myapp:q:"
+
+
+@pytest.mark.parametrize("name", ["orders:eu", "", "x" * 300, "a\nb", "a b" * 100])
+def test_a_queue_name_that_could_collide_is_refused(name):
+    """`base = f"{prefix}:{name}:"`, so a colon in the NAME makes two different
+    (prefix, name) pairs the same namespace: queue `orders`' job `5:x` and queue
+    `orders:5`' job `x` shared a lock key, and one queue's worker could expire the
+    other's lock. With no colon in a name the decomposition is unique.
+    """
+    with pytest.raises(ValueError, match="queue name"):
+        Keys(name, "toro")
+
+
+def test_a_prefix_may_still_namespace_with_colons():
+    """A prefix is the operator's own namespace and often contains one: `app:toro`.
+    It cannot collide with anything once names have none."""
+    assert Keys("orders", "app:toro").base == "app:toro:orders:"
+
+
+@pytest.mark.parametrize("prefix", ["", "a\nb"])
+def test_a_prefix_still_has_to_be_a_key_segment(prefix):
+    with pytest.raises(ValueError, match="prefix"):
+        Keys("orders", prefix)

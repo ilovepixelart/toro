@@ -29,6 +29,27 @@ from .scheduler import next_run, valid_cron
 # A job id travels in URLs and log lines, so it is bounded like anything else a
 # stranger writes.
 MAX_JOB_ID_CHARS = 256
+# A job name is a LABEL: it is rendered on every row, and the per-minute metrics keep
+# a field per distinct value for eight hours. Bounded for the same reasons.
+MAX_JOB_NAME_CHARS = 128
+
+
+def _job_name(name: object) -> str:
+    """Check a job name: a label a person reads and a metrics series is kept under,
+    not a place to put a payload or an id.
+    """
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > MAX_JOB_NAME_CHARS
+        or any(ord(c) < 0x20 for c in name)
+    ):
+        msg = (
+            f"job name must be a non-empty string of at most {MAX_JOB_NAME_CHARS} "
+            f"characters with no control characters"
+        )
+        raise ValueError(msg)
+    return name
 
 
 def _now_ms() -> int:
@@ -247,6 +268,7 @@ class Queue:
         """Everything `add()` does except the round trip. Shared with `pending()`,
         which stages a batch and sends it in one.
         """
+        _job_name(name)
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
         if job_id is not None:
@@ -335,6 +357,7 @@ class Queue:
         self, name: str, data: Any, *, children: list[FlowChild], opts: dict[str, Any]
     ) -> _Staged:
         """Everything `add_flow()` does except the round trip."""
+        _job_name(name)
         if not children:
             raise ValueError("a flow needs at least one child - use add() for a single job")
         # The root is a FlowChild too: same validation (incl. "no delay on a

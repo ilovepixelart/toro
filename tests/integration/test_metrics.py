@@ -414,3 +414,32 @@ async def test_stalled_root_flow_parent_counts_one_flow_failed(q):
     points = await q.flow_metrics(minutes=2)
     assert sum(p["failed"] for p in points) == 1
     assert sum(p["completed"] for p in points) == 0
+
+
+async def test_the_per_name_breakdown_stops_taking_new_names(q, run_worker, run_until):
+    """A job name is a label, and the per-minute bucket keeps a field per distinct
+    value for the bucket's whole eight-hour life. A producer that puts an id in the
+    name (`f"email-{user_id}"`) would otherwise hand Redis a field per user in
+    every bucket of the window, and make the dashboard's by-name read walk all of them.
+
+    Past the ceiling the breakdown stops taking new names. The queue-level counters,
+    which are what alerting reads, are not affected.
+    """
+
+    async def proc(job):
+        return 1
+
+    async with run_worker(q, proc, concurrency=8):
+        for i in range(800):  # at least two fields each: past any sane ceiling
+            await q.add(f"job-{i}", {})
+
+        async def done() -> bool:
+            return (await q.lifetime_totals())["completed"] >= 800
+
+        assert await run_until(done, timeout=90)
+
+    fields = 0
+    for key in await q.redis.keys(q.keys.base + "metrics:*"):
+        fields += await q.redis.hlen(key)
+    assert fields <= 1100, f"{fields} fields for 800 names"
+    assert (await q.lifetime_totals())["completed"] == 800

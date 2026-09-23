@@ -12,10 +12,36 @@ import inspect
 class Keys:
     """Computes the Redis key names for one queue from its prefix + name."""
 
+    # A name and a prefix both become key segments, and the base joins them with a
+    # colon. A colon in the NAME would make two different pairs one namespace:
+    # ("orders:5", "toro") and ("orders", "toro") differ, but queue `orders`' job
+    # `5:x` and queue `orders:5`' job `x` would share a lock key, and one queue's
+    # worker could expire the other's. With no colon in a name the decomposition of a
+    # base is unique, so a prefix may still carry its own (`app:toro`).
+    MAX_SEGMENT_CHARS = 128
+
     def __init__(self, queue_name: str, prefix: str = "toro") -> None:
+        self._check("queue name", queue_name, colons=False)
+        self._check("prefix", prefix, colons=True)
         self.queue_name = queue_name
         self.prefix = prefix
         self.base = f"{prefix}:{queue_name}:"
+
+    @classmethod
+    def _check(cls, what: str, value: object, *, colons: bool) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > cls.MAX_SEGMENT_CHARS
+            or any(ord(c) < 0x20 for c in value)
+            or (":" in value and not colons)
+        ):
+            allowed = "" if colons else ", no ':'"
+            msg = (
+                f"{what} must be a non-empty string of at most {cls.MAX_SEGMENT_CHARS} "
+                f"characters with no control characters{allowed}: it is a Redis key segment"
+            )
+            raise ValueError(msg)
 
     @property
     def id(self) -> str:

@@ -96,8 +96,8 @@ with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
 
 ## Sizing Redis
 
-A job costs about **43 Redis commands end to end** on the default path: ~11 to
-enqueue it and ~32 to claim, renew, and settle it (`uv run python bench/bench.py`).
+A job costs about **44 Redis commands end to end** on the default path: ~11 to
+enqueue it and ~33 to claim, renew, and settle it (`uv run python bench/bench.py`).
 All of it is scripted, so those commands are not round trips: an enqueue is one, and
 a job's whole lifecycle is a handful.
 
