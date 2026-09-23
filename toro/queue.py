@@ -1402,21 +1402,27 @@ class Queue:
         return bool(await self.redis.exists(self.keys.meta_paused))
 
     async def close(self) -> None:
-        if self._events_task is not None:
-            self._events_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._events_task
-            self._events_task = None
-        if self._events_pubsub is not None:
-            await self._events_pubsub.aclose()
-            self._events_pubsub = None
-        # Fail anyone still awaiting result() fast, rather than leaving them to
-        # sit out their timeout against a closed connection.
-        for waiters in self._result_waiters.values():
-            for fut in waiters:
-                if not fut.done():
-                    fut.set_exception(RuntimeError("queue closed while waiting for a result"))
-        await self.redis.aclose(close_connection_pool=self._owns_connection)
+        # Every step in a finally: a pub/sub close that raises would otherwise skip
+        # the connection close and leak the pool, which is the one thing this method
+        # exists to prevent.
+        try:
+            if self._events_task is not None:
+                self._events_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._events_task
+                self._events_task = None
+            if self._events_pubsub is not None:
+                with contextlib.suppress(Exception):
+                    await self._events_pubsub.aclose()
+                self._events_pubsub = None
+            # Fail anyone still awaiting result() fast, rather than leaving them to
+            # sit out their timeout against a closed connection.
+            for waiters in self._result_waiters.values():
+                for fut in waiters:
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("queue closed while waiting for a result"))
+        finally:
+            await self.redis.aclose(close_connection_pool=self._owns_connection)
 
 
 class PendingJobs:
@@ -1487,6 +1493,10 @@ class PendingJobs:
         Redis has no rollback: if a script fails for one job the others are already
         enqueued. That raises `PartialFlushError`, naming what was sent, and leaves
         exactly what did not send in the buffer, so a retry cannot double anything.
+
+        A flush that never reaches Redis at all (a dead connection) keeps the whole
+        batch, because nothing can say how much of it landed: a retry may duplicate,
+        which is the direction an at-least-once queue errs in.
         """
         calls, self._calls = self._calls, []
         if not calls:
@@ -1497,10 +1507,19 @@ class PendingJobs:
         except BaseException:
             self._calls = calls + self._calls  # nothing was sent; the batch stands
             raise
-        async with self._queue.redis.pipeline(transaction=False) as pipe:
-            for item in staged:
-                await item.script(keys=item.keys, args=item.args, client=pipe)
-            replies = await pipe.execute(raise_on_error=False)
+        try:
+            async with self._queue.redis.pipeline(transaction=False) as pipe:
+                for item in staged:
+                    await item.script(keys=item.keys, args=item.args, client=pipe)
+                replies = await pipe.execute(raise_on_error=False)
+        except BaseException:
+            # The connection died somewhere in there and nothing can say how much of
+            # the batch landed. Keeping it means a retry may duplicate; dropping it
+            # means the jobs are gone with no record of what they were, after the
+            # transaction they belong to has committed. This queue is at-least-once
+            # by design, so duplicating beats losing.
+            self._calls = calls + self._calls
+            raise
         sent: list[Job] = []
         failed: list[tuple[Callable[[], _Staged], BaseException]] = []
         for call, item, reply in zip(calls, staged, replies, strict=True):

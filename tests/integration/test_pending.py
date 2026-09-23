@@ -134,6 +134,36 @@ async def test_a_flush_that_half_lands_keeps_only_what_did_not(q, monkeypatch):
     assert (await q.counts())["wait"] == 3
 
 
+async def test_a_flush_that_never_reached_redis_keeps_the_batch(q, monkeypatch):
+    """EC-007: a connection that dies mid-flush is the case `pending()` exists for -
+    the transaction committed and these are the jobs about it. Emptying the buffer
+    before the round trip meant a transport error lost them with no record of what
+    they were. Some may have been applied, so a retry can duplicate; for a queue that
+    is at-least-once by design, duplicating beats losing."""
+    real_pipeline = q.redis.pipeline
+
+    def failing_pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+
+        async def execute(*a, **k):
+            raise ConnectionError("the connection went away")
+
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(q.redis, "pipeline", failing_pipeline)
+    pending = q.pending()
+    pending.add("welcome", {})
+    pending.add("audit", {})
+
+    with pytest.raises(ConnectionError):
+        await pending.flush()
+
+    assert len(pending) == 2, "the jobs are gone with no record of what they were"
+    monkeypatch.setattr(q.redis, "pipeline", real_pipeline)
+    assert [job.name for job in await pending.flush()] == ["welcome", "audit"]
+
+
 async def test_two_flushes_at_once_do_not_double_the_batch(q):
     """EC-005: the documented hook is fire-and-forget, which is exactly the shape
     that puts two flushes in flight. Taking the batch before the first await is what
