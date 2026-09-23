@@ -18,8 +18,8 @@ is the single most common producer bug in every queue's issue tracker, and the p
 arriving from the sync queues expect their framework to have an answer for it
 (`transaction.on_commit`, or the equivalent).
 
-Outcome: jobs can be collected during a transaction and sent only if it commits, in
-one round trip, with one line in the commit path.
+Outcome: jobs can be collected during a transaction and sent only if it commits, as
+one pipelined write, with one line in the commit path.
 
 ## Design
 
@@ -28,15 +28,20 @@ one round trip, with one line in the commit path.
   and `add_flow` signatures, which records intents; `await pending.flush()` sends
   them. Where the flush is called from is the host app's business, and the docs show
   the hook for SQLAlchemy and for Django.
-- **One round trip.** A flush pipelines every collected add, so collecting ten jobs
-  costs what one costs, not ten. That also makes "flush after commit" cheap enough
+- **One write.** A flush pipelines every collected add, so collecting ten jobs costs
+  what one costs, not ten. (Two round trips, not one: redis-py checks its own script
+  cache before a pipelined EVALSHA.) That makes "flush after commit" cheap enough
   that nobody is tempted to skip it.
 - **Ids are minted at flush, not at collection.** An id is a Redis counter value; a
   job that is never sent must not consume one, and a `job_id=` a caller supplies is
   honored as it is today.
-- **Nothing is sent twice.** A flush empties the buffer, so a second flush sends
-  nothing. A buffer that is discarded, or garbage collected, sends nothing: silence
-  is what a rollback should produce.
+- **Nothing is sent twice.** The batch is taken before the first await, so a second
+  flush, or a second one already in flight, finds nothing. A buffer that is discarded,
+  or garbage collected, sends nothing: silence is what a rollback should produce.
+- **A partial send says so.** Redis has no rollback, so a batch where one script
+  fails leaves the others enqueued. Raising with the batch still in hand would have
+  the caller retry jobs that already landed, so the failure names what was sent and
+  keeps only what was not.
 - **What this does not do**, stated plainly because the gap is the interesting part:
   it does not survive the process dying between the commit and the flush. Closing
   that needs an outbox table and a relay, which is a database integration and a
@@ -48,12 +53,12 @@ one round trip, with one line in the commit path.
 | ID | Behavior | Check |
 |---|---|---|
 | EC-001 | `pending()` collects `add()` calls and enqueues nothing until `flush()`. | `tests/integration/test_pending.py::test_nothing_is_enqueued_until_the_flush` |
-| EC-002 | `flush()` enqueues every collected job, in order, and returns the jobs with their ids. | `::test_a_flush_sends_everything_in_order` |
-| EC-003 | A flush is one round trip whatever the count. | `::test_a_flush_is_one_round_trip` |
+| EC-002 | `flush()` enqueues every collected job, in order, and returns the jobs with their ids. | `::test_nothing_is_enqueued_until_the_flush` |
+| EC-003 | A flush is one pipelined write whatever the count (two round trips: the client checks its script cache first). | `::test_a_flush_costs_the_same_wire_writes_whatever_the_count` |
 | EC-004 | A buffer that is never flushed, or is discarded, enqueues nothing and consumes no job id. | `::test_a_rollback_sends_nothing_and_burns_no_id` |
-| EC-005 | Flushing twice sends nothing the second time. | `::test_a_second_flush_is_a_no_op` |
+| EC-005 | Flushing twice sends nothing the second time, including two flushes in flight at once. | `::test_a_second_flush_is_a_no_op`, `::test_two_flushes_at_once_do_not_double_the_batch` |
 | EC-006 | Options behave exactly as on `add()`: delay, priority, custom ids, dedup, and `add_flow` trees. | `::test_the_options_are_the_same_ones` |
-| EC-007 | A flush that fails leaves the buffer intact, so the caller can retry it. | `::test_a_failed_flush_keeps_what_it_could_not_send` |
+| EC-007 | A flush that cannot stage leaves the whole batch in hand; one that Redis rejects in part raises `PartialFlushError` and leaves exactly what did not send. | `::test_a_failed_flush_keeps_what_it_could_not_send`, `::test_a_flush_that_half_lands_keeps_only_what_did_not` |
 
 ## Out of scope
 

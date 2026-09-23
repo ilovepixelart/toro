@@ -28,28 +28,49 @@ Collect the adds and send them once the commit has returned.
 pending = queue.pending()
 user = User(email=...)
 session.add(user)
+await session.flush()                          # the row gets its id, inside the tx
 pending.add("welcome", {"user_id": user.id})   # nothing sent yet
 
 await session.commit()
-await pending.flush()                          # one round trip, whatever the count
+await pending.flush()                          # one write, whatever the count
 ```
+
+The `session.flush()` matters: `session.add()` does not talk to the database, so a
+server-generated primary key is still `None` until something flushes. Collecting
+`{"user_id": None}` would produce exactly the job this section exists to prevent.
 
 `pending()` gives back a buffer whose `add` and `add_flow` take the same arguments
-they take on the queue. `flush()` sends everything in order and returns the jobs;
-`discard()` throws the batch away. Ids are minted at the flush, so a batch that is
-never sent consumes none, and a flush that raises (a payload that will not encode)
-has sent nothing and left the batch in hand.
+they take on the queue, and copy what they are given: the dict you filled in before
+the commit is the dict that gets sent. `flush()` sends the whole batch as one
+pipelined write (plus the client's own script-cache check, so two round trips, not
+ten), returns the jobs, and empties the buffer; `discard()` throws the batch away.
 
-With a framework hook, the flush moves out of the request code. SQLAlchemy:
+Ids are minted at the flush, so a batch that is never sent consumes none. A flush
+that cannot even stage a job (a payload that will not encode) sends nothing and
+leaves the batch in hand. A flush where Redis rejects *some* of the batch raises
+`PartialFlushError`, which names what was sent: Redis has no rollback, so the rest
+were enqueued, and only what failed stays in the buffer for you to retry.
+
+Flushing on the line after the commit is the whole feature, and it is enough. If you
+would rather hang it off the session, the hook is a **sync** callback, so it has to
+get the coroutine onto a loop itself, keep a reference to the task (the loop does
+not), and log what it swallows:
 
 ```python
+tasks: set[asyncio.Task] = set()
+
 @event.listens_for(session.sync_session, "after_commit")
 def _flush(_):
-    asyncio.create_task(pending.flush())   # keep a reference; log its failures
+    task = asyncio.create_task(pending.flush())   # SQLAlchemy's async session runs
+    tasks.add(task)                               # this on the loop thread
+    task.add_done_callback(tasks.discard)
+    task.add_done_callback(lambda t: t.cancelled() or t.exception() and log.exception(...))
 ```
 
-Django's `transaction.on_commit` is the same shape. Either way the hook runs after
-the commit, which is the point.
+Django's `transaction.on_commit` has the same shape and one difference that matters:
+under ASGI the ORM runs on a worker thread with no loop of its own, so
+`asyncio.create_task` raises there. Capture the loop up front and use
+`asyncio.run_coroutine_threadsafe(pending.flush(), loop)` instead.
 
 **It defers, it does not guarantee.** A process that dies between the commit and the
 flush sends nothing. Closing that needs an outbox table and a relay, which is a

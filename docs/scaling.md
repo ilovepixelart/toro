@@ -48,9 +48,10 @@ computing do not compute four times faster, and a thread cannot be cancelled: a
 either. For CPU-bound work, either hand it out of the process yourself:
 
 ```python
-def handle(job):                                  # a sync processor, in a thread
-    with ProcessPoolExecutor() as pool:           # ...that hands the work to a process
-        return pool.submit(crunch, job.data).result()
+POOL = ProcessPoolExecutor()                  # once, at import: building one per job
+                                              # re-imports your app on every job
+def handle(job):                              # a sync processor, in a thread
+    return POOL.submit(crunch, job.data).result()   # that waits on a process
 ```
 
 or use a queue built for it. toro is an async queue, and it says so.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import math
 import time
@@ -17,7 +18,7 @@ from redis.asyncio.client import PubSub
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
 from .connection import confirm_subscribed, connect
-from .errors import JobCancelledError, JobFailedError
+from .errors import JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
@@ -1384,9 +1385,13 @@ class PendingJobs:
         **opts: Any,
     ) -> None:
         """Collect one job. Same arguments as `Queue.add`; nothing is sent yet."""
+        # A copy, because between collecting a job and sending it is exactly where a
+        # caller fills in an id or scrubs a secret, and `Queue.add` encodes at the
+        # call, so it snapshots. Holding the caller's object would send what it became.
+        snapshot = copy.deepcopy(data)
         self._calls.append(
             lambda: self._queue._stage_add(  # noqa: SLF001 - the queue's own staging
-                name, data, job_id=job_id, deduplication=deduplication, opts=opts
+                name, snapshot, job_id=job_id, deduplication=deduplication, opts=opts
             )
         )
 
@@ -1394,9 +1399,10 @@ class PendingJobs:
         self, name: str, data: Any = None, *, children: list[FlowChild], **opts: Any
     ) -> None:
         """Collect one flow. Same arguments as `Queue.add_flow`; nothing is sent yet."""
+        snapshot, tree = copy.deepcopy(data), copy.deepcopy(children)  # as in `add`
         self._calls.append(
             lambda: self._queue._stage_flow(  # noqa: SLF001 - the queue's own staging
-                name, data, children=children, opts=opts
+                name, snapshot, children=tree, opts=opts
             )
         )
 
@@ -1407,16 +1413,36 @@ class PendingJobs:
     async def flush(self) -> list[Job]:
         """Send everything collected, in order, and return the jobs.
 
-        Staging happens first and for the whole batch, so an option error or a value
-        that will not encode raises with nothing sent and the batch still in hand.
-        Emptied afterwards: a hook that fires twice must not double the work.
+        The batch is taken before the first await, so a hook that fires twice, or two
+        flushes in flight, cannot both send it. Staging happens next and for the whole
+        batch, so an option error or a value that will not encode raises with nothing
+        sent and the batch still in hand.
+
+        Redis has no rollback: if a script fails for one job the others are already
+        enqueued. That raises `PartialFlushError`, naming what was sent, and leaves
+        exactly what did not send in the buffer, so a retry cannot double anything.
         """
-        if not self._calls:
+        calls, self._calls = self._calls, []
+        if not calls:
             return []
-        staged = [stage() for stage in self._calls]
+        try:
+            staged = [stage() for stage in calls]
+        except BaseException:
+            self._calls = calls + self._calls  # nothing was sent; the batch stands
+            raise
         async with self._queue.redis.pipeline(transaction=False) as pipe:
             for item in staged:
                 await item.script(keys=item.keys, args=item.args, client=pipe)
-            replies = await pipe.execute()
-        self._calls.clear()
-        return [item.build(reply) for item, reply in zip(staged, replies, strict=True)]
+            replies = await pipe.execute(raise_on_error=False)
+        sent: list[Job] = []
+        failed: list[tuple[Callable[[], _Staged], BaseException]] = []
+        for call, item, reply in zip(calls, staged, replies, strict=True):
+            if isinstance(reply, BaseException):
+                failed.append((call, reply))
+            else:
+                sent.append(item.build(reply))
+        if failed:
+            # in front, so a batch collected after this one still goes out behind it
+            self._calls = [call for call, _ in failed] + self._calls
+            raise PartialFlushError(sent, [error for _, error in failed])
+        return sent

@@ -5,7 +5,13 @@ The buffer collects the adds and sends them only when the caller says the write 
 through, which is the half of the dual-write problem people actually hit.
 """
 
-from toro import FlowChild
+import asyncio
+from dataclasses import replace
+
+import pytest
+from redis.asyncio.connection import Connection
+
+from toro import FlowChild, PartialFlushError
 
 PREFIX = "torotest"
 
@@ -54,34 +60,30 @@ async def test_a_second_flush_is_a_no_op(q):
     assert (await q.counts())["wait"] == 1
 
 
-async def test_a_flush_is_one_round_trip(q, monkeypatch):
-    """EC-003: collecting ten jobs costs what one costs. A flush that cost a round
-    trip per job would make "flush after commit" the expensive path, and the
-    expensive path is the one people skip."""
-    executes = 0
-    real_pipeline = q.redis.pipeline
+async def test_a_flush_costs_the_same_wire_writes_whatever_the_count(q, monkeypatch):
+    """EC-003: collecting ten jobs costs what one costs. Counted as writes to the
+    socket, which is what a round trip is: counting calls to `pipeline.execute()`
+    would pass however many preamble commands the client sent around it."""
+    writes = 0
+    real_send = Connection.send_packed_command
 
-    def counting_pipeline(*args, **kwargs):
-        pipe = real_pipeline(*args, **kwargs)
-        real_execute = pipe.execute
+    async def counting_send(self, *args, **kwargs):
+        nonlocal writes
+        writes += 1
+        return await real_send(self, *args, **kwargs)
 
-        async def execute(*a, **k):
-            nonlocal executes
-            executes += 1
-            return await real_execute(*a, **k)
-
-        pipe.execute = execute
-        return pipe
-
-    monkeypatch.setattr(q.redis, "pipeline", counting_pipeline)
+    await q.add("warm", {})  # so the scripts are cached server-side, as in a live app
+    monkeypatch.setattr(Connection, "send_packed_command", counting_send)
 
     pending = q.pending()
     for i in range(10):
         pending.add("job", {"i": i})
     await pending.flush()
 
-    assert executes == 1, f"ten jobs cost {executes} round trips"
-    assert (await q.counts())["wait"] == 10
+    # one SCRIPT EXISTS (redis-py checks its own cache before a pipelined EVALSHA),
+    # then the whole batch in one write. A cold script cache adds one SCRIPT LOAD.
+    assert writes == 2, f"ten jobs cost {writes} wire writes"
+    assert (await q.counts())["wait"] == 11
 
 
 async def test_the_options_are_the_same_ones(q):
@@ -101,6 +103,63 @@ async def test_the_options_are_the_same_ones(q):
     assert counts["wait"] == 4  # urgent, mine, and the flow's two children
     assert jobs[2].id == "custom-id"
     assert (await q.get_job("custom-id")).name == "mine"
+
+
+async def test_a_flush_that_half_lands_keeps_only_what_did_not(q, monkeypatch):
+    """EC-007: Redis has no rollback, so a batch where one add fails leaves the rest
+    enqueued. A buffer that kept the whole batch would be retried by the caller the
+    docs tell to retry it, and every job that did land would land twice."""
+    real_stage = q._stage_add  # simulating a failure inside one script call
+
+    def stage_one_broken(name, data, **kw):
+        staged = real_stage(name, data, **kw)
+        # too few arguments: this one script call errors, the others do not
+        return replace(staged, args=staged.args[:3]) if name == "bad" else staged
+
+    monkeypatch.setattr(q, "_stage_add", stage_one_broken)
+    pending = q.pending()
+    pending.add("first", {})
+    pending.add("bad", {})
+    pending.add("third", {})
+
+    with pytest.raises(PartialFlushError) as caught:
+        await pending.flush()
+
+    assert [job.name for job in caught.value.sent] == ["first", "third"]
+    assert len(pending) == 1, "the batch kept jobs it had already sent"
+    assert (await q.counts())["wait"] == 2
+
+    monkeypatch.setattr(q, "_stage_add", real_stage)  # the obstruction is gone
+    assert [job.name for job in await pending.flush()] == ["bad"]
+    assert (await q.counts())["wait"] == 3
+
+
+async def test_two_flushes_at_once_do_not_double_the_batch(q):
+    """EC-005: the documented hook is fire-and-forget, which is exactly the shape
+    that puts two flushes in flight. Taking the batch before the first await is what
+    makes the second one find nothing."""
+    pending = q.pending()
+    pending.add("a", {})
+    pending.add("b", {})
+
+    await asyncio.gather(pending.flush(), pending.flush())
+
+    assert (await q.counts())["wait"] == 2
+
+
+async def test_the_batch_takes_a_copy_of_what_it_was_given(q):
+    """Between collecting a job and sending it is exactly where a caller fills in an
+    id, or scrubs a secret. `Queue.add` encodes at the call, so it snapshots; a buffer
+    that held the caller's dict by reference would send whatever it became."""
+    payload = {"user_id": None}
+    pending = q.pending()
+    pending.add("welcome", payload)
+
+    payload["user_id"] = 42
+    payload["token"] = "leaked"  # noqa: S105
+    [job] = await pending.flush()
+
+    assert (await q.get_job(job.id)).data == {"user_id": None}
 
 
 async def test_a_failed_flush_keeps_what_it_could_not_send(q):

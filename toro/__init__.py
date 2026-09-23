@@ -1,6 +1,6 @@
 """toro - an async-first, Redis-backed job queue for Python."""
 
-from .errors import JobCancelledError, JobFailedError, ToroError
+from .errors import JobCancelledError, JobFailedError, PartialFlushError, ToroError
 from .flow import FlowChild, FlowView, OnFail
 from .job import Backoff, BackoffOpts, Deduplication, Job, JobOptions, JobState, RemoveOption
 from .openmetrics import render_all
@@ -22,6 +22,7 @@ __all__ = [
     "MetricsPoint",
     "NameMetrics",
     "OnFail",
+    "PartialFlushError",
     "PendingJobs",
     "Queue",
     "RateLimit",
