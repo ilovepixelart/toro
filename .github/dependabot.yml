@@ -1,0 +1,12 @@
+# Raises the commit pins in .github/workflows. Pinning an action to a commit is the
+# only way to pin it immutably, and it also freezes that action's own fixes, so the
+# pin needs something to raise it: Dependabot rewrites the hash and the `# vX.Y.Z`
+# comment beside it together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

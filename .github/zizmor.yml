@@ -1,0 +1,10 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Cannot be pinned to a commit: it generates a Docker action at run time
+        # whose image is ghcr.io/<repo>:<the ref it was called with>, and nothing is
+        # published under a bare commit. It stays because it generates the PEP 740
+        # attestations that every published file of this package carries.
+        pypa/gh-action-pypi-publish: ref-pin
+        "*": hash-pin

@@ -23,6 +23,9 @@ jobs:
   check:
     name: Lint, types, tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The suite takes about three minutes; a hosted job that hangs holds a runner
+    # for six hours, once per matrix cell.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -41,13 +44,13 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0          # full history improves Sonar new-code/blame relevancy
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -64,6 +67,12 @@ jobs:
       - name: Type check (ty)
         run: uv run ty check
 
+      # The workflows are code too, and the rules this repo enforces about them in
+      # tests are only the rules somebody thought to write down.
+      - name: Audit workflows (zizmor)
+        if: matrix.python-version == '3.13'
+        run: uv run zizmor --config .github/zizmor.yml .github/workflows
+
       - name: Tests (unit + integration)
         run: uv run pytest -m "unit or integration" --cov=toro --cov-report=xml
 
@@ -78,7 +87,7 @@ jobs:
       # Config is passed inline; there is no sonar-project.properties.
       - name: SonarCloud scan
         if: matrix.python-version == '3.13' && env.SONAR_TOKEN
-        uses: SonarSource/sonarqube-scan-action@v8.2.2
+        uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
