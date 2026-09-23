@@ -51,6 +51,8 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "ruff>=0.6",
+    # the perf matrix measures the loop as an axis; toro itself never imports it
+    "uvloop>=0.21; sys_platform != 'win32'",
     "ty>=0.0.47",
 ]
 
@@ -99,7 +101,7 @@ convention = "pep257"
 asyncio_mode = "auto"
 # The test pyramid, by marker. Run a layer with `pytest -m unit` (fast, no Redis),
 # `-m integration` (needs Redis), or `-m load` (slow). conftest auto-marks by folder.
-addopts = "--strict-markers --import-mode=importlib"
+addopts = "--strict-markers --import-mode=importlib -m 'not perf'"
 # A coroutine nobody awaited is a bug, not a warning: `lambda: counts() == 2` compares
 # a coroutine to an int, which is always false, and a poll on it would never hold.
 filterwarnings = ["error::RuntimeWarning"]
@@ -107,6 +109,7 @@ markers = [
     "unit: pure-logic tests, no I/O - fast and deterministic",
     "integration: Redis-backed tests of real state transitions",
     "load: throughput / scalability tests (slow; opt-in)",
+    "perf: the perf matrix's own guard (slow; opt-in)",
 ]
 
 [tool.coverage.run]

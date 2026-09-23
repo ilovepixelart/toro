@@ -1,0 +1,39 @@
+{
+  "jobs": 2000,
+  "concurrency": 20,
+  "note": "ratios against the plain asyncio cell of the same run",
+  "shape": {
+    "asyncio": {
+      "enqueue_per_s": 1.0,
+      "process_per_s": 1.0
+    },
+    "asyncio+pipelined": {
+      "enqueue_per_s": 13.058056897036355,
+      "process_per_s": 1.0772517077725394
+    },
+    "asyncio+eager": {
+      "enqueue_per_s": 1.0146050115118685,
+      "process_per_s": 0.9357273983991347
+    },
+    "asyncio+eager+pipelined": {
+      "enqueue_per_s": 13.261992724041935,
+      "process_per_s": 0.9545856083523123
+    },
+    "uvloop": {
+      "enqueue_per_s": 1.2460342603100203,
+      "process_per_s": 1.1586650904799896
+    },
+    "uvloop+pipelined": {
+      "enqueue_per_s": 13.219083532318917,
+      "process_per_s": 1.1548147186784208
+    },
+    "uvloop+eager": {
+      "enqueue_per_s": 1.106212634710284,
+      "process_per_s": 1.133884924185565
+    },
+    "uvloop+eager+pipelined": {
+      "enqueue_per_s": 12.975256902217566,
+      "process_per_s": 1.2170881401863365
+    }
+  }
+}

@@ -38,6 +38,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.integration)
         elif "/load/" in path:
             item.add_marker(pytest.mark.load)
+        elif "/perf/" in path:
+            item.add_marker(pytest.mark.perf)
 
 
 _redis_up: bool | None = None
