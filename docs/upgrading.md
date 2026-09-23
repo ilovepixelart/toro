@@ -2,6 +2,23 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 1.0.0
+
+Nothing breaks, and nothing new ships. 1.0 is the promise rather than a feature:
+what is public, what may change under it, and what the stored keys mean. See
+[Versioning](versioning.md).
+
+Two things appear in Redis. A queue gains a `meta` hash holding the data-model
+version, written by the first 1.0 write; `meta` therefore joins the reserved job ids,
+so a job with that id must be removed before upgrading (`await queue.remove_job("meta")`),
+exactly as `totals` did in 0.10.0. And `toro.DATA_MODEL_VERSION` is now exported, so
+a deployment can assert on it.
+
+A 1.0 library refuses a queue whose model is newer than it understands, which is what
+makes a rolling upgrade safe in the direction that matters. An older library ignores
+the marker, so upgrading from 0.11 needs no ordering: producers and workers can move
+in any order, and a mixed fleet is proved (`tests/compat/rolling_upgrade.py`).
+
 ## 0.11.0
 
 Nothing breaks. Three things are new.
