@@ -44,4 +44,4 @@ jobs:
         # run code with. NOT a commit SHA: this is a Docker action and the runner
         # pulls ghcr.io/pypa/gh-action-pypi-publish:<ref>, which has no image for a
         # bare commit ("manifest unknown", verified the hard way).
-        uses: pypa/gh-action-pypi-publish@v1.13.0
+        uses: pypa/gh-action-pypi-publish@v1.14.2
