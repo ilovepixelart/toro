@@ -44,6 +44,24 @@ async def test_a_blocking_processor_is_named(q, run_worker, run_until, caplog):
     assert caplog.text.count(BLOCKED) == 1, "one episode, one warning"
 
 
+async def test_a_run_of_blocking_jobs_still_warns_once(q, run_worker, run_until, caplog):
+    """SS-005: one episode, one warning. A processor that blocks on every job would
+    otherwise repeat the same sentence per job, and a log that repeats itself is a
+    log nobody reads, which is the same as not warning at all."""
+
+    async def proc(job):
+        time.sleep(0.4)  # noqa: ASYNC251 - the defect under test, on purpose
+        return 1
+
+    with caplog.at_level("WARNING"):
+        async with run_worker(q, proc, blocked_warning=0.2, concurrency=1):
+            for _ in range(4):
+                await q.add("blocks", {})
+            assert await run_until(_completed(q, 4), timeout=30)
+
+    assert caplog.text.count(BLOCKED) == 1, "the loop never stopped being blocked"
+
+
 async def test_a_busy_loop_is_not_a_blocked_one(q, run_worker, run_until, caplog):
     """SS-005: a loop with plenty to do is not a stalled one. A detector that cannot
     tell them apart is noise, and noise is ignored."""
