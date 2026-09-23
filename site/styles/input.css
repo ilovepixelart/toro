@@ -92,6 +92,20 @@
   }
 }
 
+/* The type scale, by role. Seven steps, no arbitrary sizes: a new element picks
+   the role it plays, not a number that looks about right.
+
+     text-5xl/6xl  display   the one page headline
+     text-3xl      figure    live counters - data, not prose, so it does not
+                             compete with a heading at the same size
+     text-2xl      title     section headings
+     text-lg       lead      the paragraph under the headline
+     text-base     body      section intros
+     text-sm       ui        blurbs, nav, footer, table text
+     text-xs       meta      eyebrows, labels, chips, code, captions
+
+   matador's own four steps (lg/base/sm/xs) are the bottom half of this, so the
+   product and the page share the smaller sizes exactly. */
 @layer components {
   /* matador's own vocabulary, lifted unchanged so the site and the product share
      one system. These are its components, not ones invented for this page. */
