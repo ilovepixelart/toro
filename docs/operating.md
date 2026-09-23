@@ -14,6 +14,16 @@ from one `/metrics` endpoint. Serve it yourself with any framework: the text is 
 whole response, and the content type is
 `application/openmetrics-text; version=1.0.0; charset=utf-8`.
 
+Several queues go in **one** exposition, never one render per queue concatenated:
+that repeats each family's `# TYPE` line, which a parser may reject outright or use
+to drop every sample after it.
+
+```python
+from toro import render_all
+
+text = render_all({q.name: (await q.lifetime_totals(), await q.counts()) for q in queues})
+```
+
 | Sample | Type | Labels | Meaning |
 |---|---|---|---|
 | `toro_jobs_total` | counter | `queue`, `outcome` | Jobs by outcome since the queue was created. |

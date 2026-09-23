@@ -132,5 +132,16 @@ def test_a_family_is_declared_once_however_many_queues():
     assert text.endswith("# EOF\n")
 
 
+def test_rendering_several_queues_is_public():
+    """The docs describe serving several queues from one endpoint, and concatenating
+    one render per queue produces exactly the duplicate-family document that is not
+    valid exposition. The way to avoid that has to be reachable."""
+    import toro
+
+    text = toro.render_all({"emails": (TOTALS, DEPTHS), "reports": (TOTALS, DEPTHS)})
+
+    assert text == render_all({"emails": (TOTALS, DEPTHS), "reports": (TOTALS, DEPTHS)})
+
+
 def test_one_queue_renders_the_same_either_way():
     assert render("emails", TOTALS, DEPTHS) == render_all({"emails": (TOTALS, DEPTHS)})
