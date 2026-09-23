@@ -73,16 +73,22 @@ app.mount(
 {% macro codepane(label, source) %}
   {# min-w-0: a grid item is min-content wide by default, so a wide <pre> would
      stretch its track instead of scrolling inside it. #}
-  <div class="card min-w-0">
+  <div class="card ring-1 ring-line min-w-0">
     {# the same window chrome the dashboard screenshot wears, so every pane on
        the page reads as the same kind of object #}
-    <div class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
-      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
-      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
-      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+    <div class="flex items-center gap-1.5 px-3 py-2.5 border-b border-line bg-panel2">
+      <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
       <span class="ml-2 font-mono text-xs text-muted">{{ label }}</span>
     </div>
-    <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
+    {# numbers in their own column: the highlighted HTML stays exactly as
+       pygments produced it, and both columns share the font and leading #}
+    <div class="flex min-w-0">
+      <pre class="code shrink-0 select-none py-4 pl-4 pr-3 text-right font-mono text-sm leading-relaxed text-muted/60">{% for i in range(1, source.split('\n') | length + 1) %}{{ i }}{% if not loop.last %}
+{% endif %}{% endfor %}</pre>
+      <pre class="code min-w-0 grow py-4 pr-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
+    </div>
   </div>
 {% endmacro %}
 
@@ -157,10 +163,10 @@ app.mount(
 
 <section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
-    {{ heading('API', 'Pick the problem, see the code',
-       'The options you reach for most often, and the exact call for each. Everything here is in the
-        library: no plugins, no extras to install.') }}
-    <div class="mt-7 card">
+    {{ heading('API', 'Common tasks, and the call for each',
+       'Retries, scheduling, rate limits, deduplication and flows, configured where the job is
+        enqueued or the worker is started.') }}
+    <div class="mt-7 card ring-1 ring-line">
       {% include "partials/example.html" %}
     </div>
   </div>
@@ -230,10 +236,10 @@ app.mount(
       <{{ 'div' if static | default(false) else 'a' }}
          {%- if not static | default(false) %} href="/dashboard"{% endif %}
          class="card ring-1 ring-line block overflow-hidden group{{ ' transition-colors hover:ring-accent/40' if not static | default(false) }}">
-        <span class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
-          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
-          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
-          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+        <span class="flex items-center gap-1.5 px-3 py-2.5 border-b border-line bg-panel2">
+          <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+          <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+          <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
           <span class="ml-2 font-mono text-xs text-muted">/admin/queues</span>
         </span>
         <img src="{{ base | default('') }}/assets/dashboard.png" alt="The matador dashboard showing a queue's jobs, states and throughput"
