@@ -51,7 +51,7 @@ something that fails when it drifts.
 | ON-007 | A migration page maps the sync queues' vocabulary onto toro's, and says what has no equivalent. | `docs/migrating.md` |
 | ON-008 | The "just use Postgres" question has an honest answer, including when the answer is yes. | `docs/faq.md` |
 | ON-009 | A security review of both repos, with findings fixed or written down. | evidence in the PR |
-| ON-010 | A rolling upgrade across the previous minor and this one, against one Redis, in both directions. | proved against the published 0.11.0 package |
+| ON-010 | A rolling upgrade across the previous minor and this one, against one Redis, in both directions. | `tests/compat/rolling_upgrade.py`, run against the published 0.11.0: 50 jobs per direction, every one processed exactly once, none twice, neither side refusing the other. The old side reads no marker (it has none) and the new side reads `1` |
 
 ## Out of scope
 

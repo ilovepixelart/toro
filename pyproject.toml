@@ -91,6 +91,9 @@ ignore = [
 # implicit-namespace (no __init__), composite asserts, lazy imports, module globals.
 "tests/**" = ["S101", "N806", "RUF001", "ANN", "D", "SLF001", "ARG", "PT011",
               "INP001", "PT018", "PT006", "PLC0415", "PLW0603", "T201", "PLW0108", "FBT003"]
+# The compatibility proof exists to run two interpreters against one Redis, so the
+# subprocess rules have nothing to tell it: the executables are ones it just built.
+"tests/compat/**" = ["S603", "S607"]
 "bench/**" = ["ANN", "D", "T201", "S311", "INP001", "PLC0415", "ARG"]
 "examples/**" = ["ANN", "D", "T201", "INP001", "ARG"]
 
