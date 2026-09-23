@@ -217,6 +217,11 @@ refuses one that would land on another key: a queue key's name (`completed`,
 job's aux key (`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`). Colons are
 otherwise fine: `order:123`.
 
+It is also a path segment in every dashboard that shows it, so it may not contain
+`/` or a control character, and stops at 256 characters. A job whose id cannot go in
+a URL is a job nobody can open or remove: the page that would list it is the page
+that breaks.
+
 To enqueue a parent job together with children that must run first
 (fan-out/fan-in, chains), use `add_flow()` - see [Flows](flows.md).
 

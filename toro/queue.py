@@ -26,6 +26,10 @@ from .keys import Keys
 from .openmetrics import OUTCOMES, TOTAL_FIELDS, render
 from .scheduler import next_run, valid_cron
 
+# A job id travels in URLs and log lines, so it is bounded like anything else a
+# stranger writes.
+MAX_JOB_ID_CHARS = 256
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -182,6 +186,15 @@ class Queue:
             raise ValueError(
                 "custom job_id must be a non-empty, non-all-digits string "
                 "(digits collide with auto-generated ids) - try e.g. 'order-123'"
+            )
+        # A job id is a path segment in every dashboard that shows it. One that cannot
+        # be put in a URL is a job nobody can open or remove, because the page that
+        # would list it is the page that breaks; a control character does the same to
+        # a log line. The length cap is the same idea as clipping a payload.
+        if "/" in job_id or any(ord(c) < 0x20 for c in job_id) or len(job_id) > MAX_JOB_ID_CHARS:
+            raise ValueError(
+                f"custom job_id must have no '/' or control characters and be at most "
+                f"{MAX_JOB_ID_CHARS} characters: it is a path segment wherever it is shown"
             )
         conflict = self.keys.job_id_conflict(job_id)
         if conflict:

@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from toro import scripts
+from toro import Queue, scripts
 from toro.keys import Keys
 
 KEYS = Keys("emails", "toro")
@@ -90,3 +90,23 @@ def test_a_property_added_by_a_subclass_is_guarded():
 )
 def test_ordinary_ids_are_free(job_id):
     assert KEYS.job_id_conflict(job_id) is None
+
+
+@pytest.mark.parametrize("job_id", ["orders/42", "a/b", "/", "a\nb", "a b" * 200])
+def test_an_id_that_breaks_a_url_or_a_page_is_refused(job_id):
+    """A job id is a path segment in every dashboard that shows it, and a job whose
+    id cannot be put in a URL is a job nobody can see or remove: the page that would
+    list it is the page that breaks. Long ones are refused for the same reason a
+    payload is clipped.
+    """
+    q = Queue("idtest", prefix="torotest")
+    with pytest.raises(ValueError, match="job_id"):
+        q._custom_job_id(job_id)
+
+
+def test_a_percent_encoded_slash_is_still_a_name():
+    """`orders%2f42` is a string Redis and a URL both carry without complaint: the
+    rule is about what breaks, not about what looks alarming."""
+    q = Queue("idtest", prefix="torotest")
+
+    assert q._custom_job_id("orders%2f42") == "orders%2f42"
