@@ -75,7 +75,7 @@ app.mount(
      stretch its track instead of scrolling inside it. #}
   <div class="card min-w-0">
     <div class="px-4 pt-3 pb-1"><span class="text-xs uppercase tracking-wider text-muted">{{ label }}</span></div>
-    <pre class="code min-w-0 p-4 font-mono text-xs leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
+    <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
   </div>
 {% endmacro %}
 
@@ -144,7 +144,7 @@ app.mount(
       {% endif %}
     </p>
     {% if static | default(false) %}
-      <pre class="code mt-3 rounded-xl p-4 font-mono text-xs leading-relaxed overflow-x-auto max-w-[64ch]"><code>git clone https://github.com/ilovepixelart/toro
+      <pre class="code mt-3 rounded-xl p-4 font-mono text-sm leading-relaxed overflow-x-auto max-w-[64ch]"><code>git clone https://github.com/ilovepixelart/toro
 cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
     {% endif %}
   </div>
