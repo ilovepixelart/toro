@@ -115,17 +115,34 @@ app.mount(
           <span class="absolute inline-flex w-full h-full rounded-full bg-success opacity-60 motion-safe:animate-ping"></span>
           <span class="relative inline-flex w-2 h-2 rounded-full bg-success"></span>
         </span>
-        <span class="text-sm font-medium">A real queue, running on this page</span>
-        <span class="chip">two workers &middot; concurrency 3 &middot; 4s locks</span>
+        {% if static | default(false) %}
+          <span class="text-sm font-medium">A queue that was running, captured when this page was built</span>
+          <span class="chip">run it yourself below</span>
+        {% else %}
+          <span class="text-sm font-medium">A real queue, running on this page</span>
+          <span class="chip">two workers &middot; concurrency 3 &middot; 4s locks</span>
+        {% endif %}
       </div>
       {% include "partials/pulse.html" %}
     </div>
     <p class="mt-3 text-muted max-w-[64ch]">
-      Kill a worker and it dies the way a crashed process dies: no graceful stop, no released locks.
-      Its jobs sit in <span class="font-mono text-xs">active</span> until their locks expire, then
-      toro's stalled sweep hands them to the survivor and they finish. Nothing is simulated; the
-      numbers come from <span class="font-mono text-xs">Queue.counts()</span> against Redis.
+      {% if static | default(false) %}
+        These numbers are real but they are not live: a static page has no Redis behind it. The
+        same page runs as a FastAPI app with real workers, where killing one leaves its jobs in
+        <span class="font-mono text-xs">active</span> until their locks expire and toro's stalled
+        sweep hands them to the survivor. Two commands to see it:
+      {% else %}
+        Kill a worker and it dies the way a crashed process dies: no graceful stop, no released
+        locks. Its jobs sit in <span class="font-mono text-xs">active</span> until their locks
+        expire, then toro's stalled sweep hands them to the survivor and they finish. Nothing is
+        simulated; the numbers come from <span class="font-mono text-xs">Queue.counts()</span>
+        against Redis.
+      {% endif %}
     </p>
+    {% if static | default(false) %}
+      <pre class="code mt-3 rounded-xl p-4 font-mono text-xs leading-relaxed overflow-x-auto max-w-[64ch]"><code>git clone https://github.com/ilovepixelart/toro
+cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
+    {% endif %}
   </div>
 </section>
 
