@@ -28,6 +28,10 @@ Reference docs for how toro works. The [README](../README.md) is the quick start
   dispatch, no string-built commands) and what you own (Redis access, secrets).
 - **[Versioning](versioning.md)** - what is public, what semver means here, and the
   data model's own version.
+- **[Coming from another queue](migrating.md)** - the vocabulary map, and what has
+  no equivalent here.
+- **[FAQ](faq.md)** - the questions with uncomfortable answers, starting with "why
+  not just use Postgres".
 - **[Upgrading](upgrading.md)** - breaking changes by release, each with what to
   do about it.
 
