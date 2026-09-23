@@ -19,8 +19,7 @@
   <div class="border-t border-line px-5 py-3 flex flex-wrap items-center gap-2">
     <span class="label">workers</span>
     {% if static | default(false) %}
-      <span class="chip">worker-1 &middot; worker-2</span>
-      <a class="btn btn-sm btn-ghost" href="{{ demo_url | default('#') }}">Kill one on the live demo &rarr;</a>
+      <span class="chip">worker-1 &middot; worker-2 &middot; not running here</span>
     {% else %}
     {% for name in all_workers %}
       {% if name in workers %}

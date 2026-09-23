@@ -36,7 +36,9 @@ def main() -> None:
     env.globals["asset_v"] = lambda: 1
     env.globals["static"] = True
     env.globals["base"] = BASE
-    env.globals["demo_url"] = "https://demo.example/"  # the deployed instance
+    # No demo instance is deployed yet, so nothing links to one. When there is,
+    # this becomes its URL and the dashboard links point at it.
+    env.globals["demo_url"] = "https://github.com/ilovepixelart/toro#readme"
 
     counts = {"wait": 0, "active": 2, "completed": 128, "failed": 3}
     common = {
