@@ -17,6 +17,7 @@
   <link rel="stylesheet" href="{{ base | default('') }}/assets/app.css?v={{ v }}" />
   <link rel="stylesheet" href="{{ base | default('') }}/assets/code.css?v={{ v }}" />
   <script src="{{ base | default('') }}/assets/js/htmx.min.js?v={{ v }}" defer></script>
+  {% if static | default(false) %}<script src="{{ base | default('') }}/assets/js/replay.js?v={{ v }}" defer></script>{% endif %}
 </head>
 <body class="bg-ink text-fg antialiased selection:bg-accent/25">
   <header class="border-b border-line bg-panel/40 backdrop-blur sticky top-0 z-20">
@@ -52,9 +53,8 @@
       <div>
         <p class="text-sm font-medium">toro <span class="text-muted font-normal">&middot; a job queue for Python</span></p>
         <p class="mt-1 text-sm text-muted max-w-[52ch]">
-          This page is served by FastAPI and htmx, and the queue on it is a real toro queue on a
-          real Redis. Both packages are installed from PyPI, so the page working is a test that
-          the published releases do.
+          An async-first, Redis-backed job queue, and a dashboard you mount into your own
+          application. Both MIT licensed.
         </p>
       </div>
       <nav class="flex flex-wrap gap-x-6 gap-y-2 text-sm">

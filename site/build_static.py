@@ -7,6 +7,7 @@ does a GET for HTML - is written out as files and keeps working.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import shutil
@@ -42,16 +43,13 @@ def main() -> None:
     env.globals["docs_url"] = "https://github.com/ilovepixelart/toro/tree/main/docs"
     env.globals["matador_url"] = "https://github.com/ilovepixelart/matador"
 
-    counts = {"wait": 0, "active": 2, "completed": 128, "failed": 3}
+    # The panel's rendered state is the recording's first frame, so a reader with
+    # JavaScript off sees where the run started rather than invented numbers.
+    replay = json.loads((HERE / "web" / "static" / "replay.json").read_text())
     common = {
         "examples": EXAMPLES,
         "chosen": next(iter(EXAMPLES)),
-        "counts": counts,
-        "workers": ["worker-1", "worker-2"],
-        "all_workers": ["worker-1", "worker-2"],
-        "totals": {"completed": 128, "failed": 3},
-        "flash": None,
-        "request": None,
+        "first": replay["frames"][0],
     }
 
     (DIST / "index.html").write_text(env.get_template("index.html").render(**common))

@@ -36,8 +36,9 @@ await Worker("emails", send, concurrency=20).run()''' %}
 )
 
 async def send_digest(job):
-    parts = await job.children_values()
-    return smtp.send("".join(parts))''' %}
+    # {child_id: returnvalue}
+    parts = await job.children_results()
+    return smtp.send("".join(parts.values()))''' %}
 
 {% set mount = '''from fastapi import FastAPI, Depends
 from matador import create_app
@@ -73,9 +74,16 @@ app.mount(
 {% macro codepane(label, source) %}
   {# min-w-0: a grid item is min-content wide by default, so a wide <pre> would
      stretch its track instead of scrolling inside it. #}
-  <div class="card min-w-0">
-    <div class="px-4 pt-3 pb-1"><span class="text-xs uppercase tracking-wider text-muted">{{ label }}</span></div>
-    <pre class="code min-w-0 p-4 font-mono text-xs leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
+  <div class="card ring-1 ring-line min-w-0">
+    {# the same window chrome the dashboard screenshot wears, so every pane on
+       the page reads as the same kind of object #}
+    <div class="flex items-center gap-1.5 px-3 py-2.5 border-b border-line bg-panel2">
+      <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+      <span class="ml-2 font-mono text-xs text-muted">{{ label }}</span>
+    </div>
+    <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
   </div>
 {% endmacro %}
 
@@ -90,7 +98,7 @@ app.mount(
       <p class="mt-5 text-lg text-muted max-w-[54ch]">
         Every state change is <span class="text-fg font-medium">one atomic Lua script</span>. Every
         running job holds <span class="text-fg font-medium">its own lock</span>. When a worker dies
-        mid-job, a stalled sweep hands the work to another one. At-least-once, and honest about it.
+        mid-job, a stalled sweep hands the work to another worker. Delivery is at-least-once.
       </p>
 
       <div class="mt-8 flex flex-wrap items-center gap-2">
@@ -107,11 +115,30 @@ app.mount(
       </div>
     </div>
 
-    {{ codepane('the whole api, more or less', quickstart) }}
+    {{ codepane('Quick start', quickstart) }}
   </div>
 </section>
 
-<section class="pb-20">
+{% if static | default(false) %}
+<section class="pb-14">
+  <div class="{{ pad }}">
+    {% include "partials/replay.html" %}
+    <p class="mt-3 text-muted max-w-[64ch]">
+      A run against Redis, recorded when this page was built. Twelve seconds in, a worker is
+      stopped without a graceful shutdown, so its locks are never released. Its jobs stay in
+      <span class="font-mono text-sm">active</span> until those locks expire, after which the
+      stalled sweep reassigns them to the surviving worker.
+    </p>
+    <div class="mt-8">
+    {{ codepane('Run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
+    <p class="mt-3 text-muted max-w-[64ch]">
+      The same page with a live queue behind it, where the kill button works.
+    </p>
+    </div>
+  </div>
+</section>
+{% else %}
+<section class="pb-14">
   <div class="{{ pad }}">
     <div class="card ring-1 ring-accent/25 shadow-sm">
       <div class="px-5 py-3 border-b border-line flex items-center gap-2 flex-wrap">
@@ -119,51 +146,35 @@ app.mount(
           <span class="absolute inline-flex w-full h-full rounded-full bg-success opacity-60 motion-safe:animate-ping"></span>
           <span class="relative inline-flex w-2 h-2 rounded-full bg-success"></span>
         </span>
-        {% if static | default(false) %}
-          <span class="text-sm font-medium">A queue that was running, captured when this page was built</span>
-          <span class="chip">run it yourself below</span>
-        {% else %}
-          <span class="text-sm font-medium">A real queue, running on this page</span>
-          <span class="chip">two workers &middot; concurrency 3 &middot; 4s locks</span>
-        {% endif %}
+        <span class="text-sm font-medium">A real queue, running on this page</span>
+        <span class="chip">two workers &middot; concurrency 3 &middot; 4s locks</span>
       </div>
       {% include "partials/pulse.html" %}
     </div>
     <p class="mt-3 text-muted max-w-[64ch]">
-      {% if static | default(false) %}
-        These numbers are real but they are not live: a static page has no Redis behind it. The
-        same page runs as a FastAPI app with real workers, where killing one leaves its jobs in
-        <span class="font-mono text-xs">active</span> until their locks expire and toro's stalled
-        sweep hands them to the survivor. Two commands to see it:
-      {% else %}
-        Kill a worker and it dies the way a crashed process dies: no graceful stop, no released
-        locks. Its jobs sit in <span class="font-mono text-xs">active</span> until their locks
-        expire, then toro's stalled sweep hands them to the survivor and they finish. Nothing is
-        simulated; the numbers come from <span class="font-mono text-xs">Queue.counts()</span>
-        against Redis.
-      {% endif %}
+      The kill buttons stop a worker without a graceful shutdown, so its locks are never
+      released. Its jobs stay in <span class="font-mono text-sm">active</span> until those locks
+      expire, after which the stalled sweep reassigns them to the surviving worker. The counters
+      above read from Redis.
     </p>
-    {% if static | default(false) %}
-      <pre class="code mt-3 rounded-xl p-4 font-mono text-xs leading-relaxed overflow-x-auto max-w-[64ch]"><code>git clone https://github.com/ilovepixelart/toro
-cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
-    {% endif %}
   </div>
 </section>
+{% endif %}
 
-<section class="py-16 sm:py-24 bg-panel">
+<section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
-    {{ heading('The API', 'Pick the problem, see the code',
-       'Every snippet is lifted from the README, so the page cannot advertise an API the library does
-        not have. The tabs are server-rendered: htmx swaps the fragment, nothing runs in the browser.') }}
-    <div class="mt-7 card">
+    {{ heading('API', 'Common tasks, and the call for each',
+       'Retries, scheduling, rate limits, transactional enqueue, cancellation and flows,
+        configured where the job is enqueued or the worker is started.') }}
+    <div class="mt-7 card ring-1 ring-line">
       {% include "partials/example.html" %}
     </div>
   </div>
 </section>
 
-<section class="py-16 sm:py-24">
+<section class="py-14 sm:py-16">
   <div class="{{ pad }}">
-    {{ heading('Scope', 'Everything a queue is expected to have',
+    {{ heading('Features', 'Everything a queue is expected to have',
        'None of this is an add-on or a plugin. It is in the library, documented, and enforced inside
         the same atomic scripts that move jobs between states.') }}
     <div class="mt-10 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-8">
@@ -177,6 +188,9 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
         ('Global concurrency', 'One ceiling on active jobs across every worker, released even when a worker crashes.'),
         ('Flows', 'Parent and child trees with fan-out, fan-in, per-child failure policy and flow-aware retry.'),
         ('Metrics', 'Per-minute counters and lifetime totals in Redis, exported as OpenMetrics for Prometheus.'),
+        ('Sync or async processors', 'A plain def runs in a thread pool the worker owns, sized to its concurrency, so the loop stays free to renew locks.'),
+        ('Transactional enqueue', 'Collect jobs while a database transaction is open and send them in one pipelined write once it commits.'),
+        ('Cancellation', 'cancel_job stops a running job at its next await, so finally blocks run and it lands in cancelled rather than failed.'),
       ] %}
         <div>
           <h3 class="text-sm font-semibold">{{ title }}</h3>
@@ -187,7 +201,7 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
   </div>
 </section>
 
-<section class="py-16 sm:py-24">
+<section class="py-14 sm:py-16">
   <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
     <div class="min-w-0">
       {{ heading('Flows', 'Fan out, fan in, without the plumbing',
@@ -202,19 +216,18 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
         ], 'max-w-[56ch]') }}
       </div>
     </div>
-    <div class="min-w-0">{{ codepane('a parent and three children', flows) }}</div>
+    <div class="min-w-0">{{ codepane('Parent and children', flows) }}</div>
   </div>
 </section>
 
-<section class="py-16 sm:py-24 bg-panel">
+<section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
-    {{ heading('The dashboard', 'Mounted, not run',
+    {{ heading('Dashboard', 'Mounted, not run',
        'matador is a FastAPI app. It goes inside the application you already deploy, behind the auth
-        you already have, so there is no second service to run and no second login to hand out. The
-        dashboard linked above is exactly this mount, reading the queue on this page.') }}
+        you already have, so there is no second service to run and no second login to hand out.') }}
     <div class="mt-7 grid lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-8 items-start">
       <div class="grid gap-6 min-w-0">
-        {{ codepane('mounted into your own app', mount) }}
+        {{ codepane('Mounting', mount) }}
         {{ blurbs([
           ('Read-only is a predicate', 'can_mutate decides per request, and when it says no the controls are never drawn, not merely refused.'),
           ('Scrapeable', '/metrics speaks OpenMetrics, so the queue reaches Prometheus without an exporter.'),
@@ -226,10 +239,10 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
       <{{ 'div' if static | default(false) else 'a' }}
          {%- if not static | default(false) %} href="/dashboard"{% endif %}
          class="card ring-1 ring-line block overflow-hidden group{{ ' transition-colors hover:ring-accent/40' if not static | default(false) }}">
-        <span class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
-          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
-          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
-          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+        <span class="flex items-center gap-1.5 px-3 py-2.5 border-b border-line bg-panel2">
+          <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+          <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
+          <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
           <span class="ml-2 font-mono text-xs text-muted">/admin/queues</span>
         </span>
         <img src="{{ base | default('') }}/assets/dashboard.png" alt="The matador dashboard showing a queue's jobs, states and throughput"
@@ -237,10 +250,10 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
         <span class="flex items-center justify-between px-4 py-3 border-t border-line text-sm">
           {% if static | default(false) %}
             <span class="text-muted">matador, reading a toro queue</span>
-            <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">matador on GitHub &rarr;</a>
+            <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">Source &rarr;</a>
           {% else %}
-            <span class="text-muted">This, but live, with the jobs from this page</span>
-            <span class="text-accent font-medium group-hover:underline">Open the demo &rarr;</span>
+            <span class="text-muted">Reading the queue above</span>
+            <span class="text-accent font-medium group-hover:underline">Open it &rarr;</span>
           {% endif %}
         </span>
       </{{ 'div' if static | default(false) else 'a' }}>
@@ -248,13 +261,13 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
   </div>
 </section>
 
-<section class="py-16 sm:py-24">
+<section class="py-14 sm:py-16">
   <div class="{{ pad }}">
-    {{ heading('The contract', 'What you are depending on', 'No adjectives on this one.') }}
+    {{ heading('Contract', 'What you are depending on', '') }}
     <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
       {% for term, value in [
-          ('Version', '1.0.0, frozen API'), ('Python', '3.10 &ndash; 3.13'),
-          ('Redis', '6.2 and later'), ('Tests', '827, on real Redis'),
+          ('Version', '1.0.0, frozen API'), ('Python', '3.10 to 3.13'),
+          ('Redis', '6.2 and later'), ('Tests', '860+, on real Redis'),
           ('Dependencies', 'redis, croniter'), ('Licence', 'MIT')] %}
         <div>
           <dt class="text-xs uppercase tracking-wider text-muted">{{ term }}</dt>

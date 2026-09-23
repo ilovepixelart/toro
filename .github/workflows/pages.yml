@@ -2,7 +2,8 @@ name: Site
 
 # The website at https://ilovepixelart.github.io/toro/, rendered from the same
 # Jinja templates the live demo serves, so the two cannot drift. The live queue
-# panel has no server here: `build_static.py` swaps it for a labelled snapshot.
+# panel has no server here: `build_static.py` swaps it for a replay of a run
+# `record_demo.py` recorded against Redis, labelled as a recording on the page.
 on:
   push:
     branches: [main]

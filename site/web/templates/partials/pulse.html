@@ -1,8 +1,8 @@
 {# The live strip: one server-rendered fragment, re-fetched by htmx. No client
    state, no JSON, no rendering in the browser. #}
-{# No server on a static host: the panel becomes a snapshot that is honest about
-   being one, and points at the instance where it is live. #}
-<div id="pulse"{% if not static | default(false) %} hx-get="{{ base | default('') }}/pulse" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+{# Live only: the static build omits this panel rather than showing counters
+   that cannot move. #}
+<div id="pulse" hx-get="{{ base | default('') }}/pulse" hx-trigger="every 2s" hx-swap="outerHTML">
   <div class="grid grid-cols-2 sm:grid-cols-4">
     {% for key, label, tone in [
         ('wait', 'waiting', 'muted'), ('active', 'active', 'warning'),
@@ -18,9 +18,6 @@
 
   <div class="border-t border-line px-5 py-3 flex flex-wrap items-center gap-2">
     <span class="label">workers</span>
-    {% if static | default(false) %}
-      <span class="chip">worker-1 &middot; worker-2 &middot; not running here</span>
-    {% else %}
     {% for name in all_workers %}
       {% if name in workers %}
         <button class="btn btn-sm btn-danger" hx-post="{{ base | default('') }}/demo/crash/{{ name }}"
@@ -34,7 +31,6 @@
         </button>
       {% endif %}
     {% endfor %}
-    {% endif %}
     <span class="chip ml-auto font-mono">
       {{ totals.completed }} completed &middot; {{ totals.failed }} failed since boot
     </span>
