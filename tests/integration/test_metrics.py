@@ -438,8 +438,10 @@ async def test_the_per_name_breakdown_stops_taking_new_names(q, run_worker, run_
 
         assert await run_until(done, timeout=90)
 
-    fields = 0
-    for key in await q.redis.keys(q.keys.base + "metrics:*"):
-        fields += await q.redis.hlen(key)
-    assert fields <= 1100, f"{fields} fields for 800 names"
+    # Per bucket, which is what the guard is: it reads the bucket it is about to
+    # write. Summing every bucket instead asserts a ceiling nothing promises, and
+    # passes only while the run happens to fit inside one minute.
+    sizes = [await q.redis.hlen(key) for key in await q.redis.keys(q.keys.base + "metrics:*")]
+    assert sizes, "no metrics buckets were written"
+    assert max(sizes) <= 1100, f"{max(sizes)} fields in one bucket for 800 names"
     assert (await q.lifetime_totals())["completed"] == 800
