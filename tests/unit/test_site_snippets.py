@@ -21,13 +21,13 @@ from typing import Any
 import pytest
 
 import toro
-from toro import FlowChild, Job, JobOptions, Queue, Worker
+from toro import FlowChild, Job, JobOptions, PendingJobs, Queue, Worker
 
 SITE = pathlib.Path(__file__).resolve().parents[2] / "site"
 INDEX = SITE / "web" / "templates" / "index.html"
 
 # Receiver name in the snippets -> the class it stands for.
-RECEIVERS: dict[str, type] = {"queue": Queue, "job": Job, "worker": Worker}
+RECEIVERS: dict[str, type] = {"queue": Queue, "job": Job, "worker": Worker, "pending": PendingJobs}
 # Constructors the snippets call directly.
 CONSTRUCTORS: dict[str, Any] = {"Queue": Queue, "Worker": Worker, "FlowChild": FlowChild}
 

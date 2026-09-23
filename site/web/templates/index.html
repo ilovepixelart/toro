@@ -164,8 +164,8 @@ app.mount(
 <section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
     {{ heading('API', 'Common tasks, and the call for each',
-       'Retries, scheduling, rate limits, deduplication and flows, configured where the job is
-        enqueued or the worker is started.') }}
+       'Retries, scheduling, rate limits, transactional enqueue, cancellation and flows,
+        configured where the job is enqueued or the worker is started.') }}
     <div class="mt-7 card ring-1 ring-line">
       {% include "partials/example.html" %}
     </div>
@@ -188,6 +188,9 @@ app.mount(
         ('Global concurrency', 'One ceiling on active jobs across every worker, released even when a worker crashes.'),
         ('Flows', 'Parent and child trees with fan-out, fan-in, per-child failure policy and flow-aware retry.'),
         ('Metrics', 'Per-minute counters and lifetime totals in Redis, exported as OpenMetrics for Prometheus.'),
+        ('Sync or async processors', 'A plain def runs in a thread pool the worker owns, sized to its concurrency, so the loop stays free to renew locks.'),
+        ('Transactional enqueue', 'Collect jobs while a database transaction is open and send them in one pipelined write once it commits.'),
+        ('Cancellation', 'cancel_job stops a running job at its next await, so finally blocks run and it lands in cancelled rather than failed.'),
       ] %}
         <div>
           <h3 class="text-sm font-semibold">{{ title }}</h3>

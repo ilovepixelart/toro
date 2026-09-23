@@ -112,6 +112,52 @@ EXAMPLES: dict[str, tuple[str, str]] = {
                 rate_limit={"max": 100, "duration": 1000},
             )"""),
     ),
+    "transaction": (
+        "Enqueue with a transaction",
+        dedent("""\
+            # a job enqueued before its transaction commits points at a row a
+            # rollback may take away
+            pending = queue.pending()
+
+            session.add(user)
+            await session.flush()                           # the row gets its id
+            pending.add("welcome", {"user_id": user.id})    # nothing sent yet
+
+            await session.commit()
+            await pending.flush()                           # one pipelined write"""),
+    ),
+    "sync": (
+        "Sync processor",
+        dedent("""\
+            # a plain def is a processor too: it runs in the worker's own threads,
+            # so the loop stays free to renew locks and answer heartbeats
+            def handle(job):
+                return requests.get(job.data["url"]).json()
+
+            await Worker("fetch", handle, concurrency=8).run()"""),
+    ),
+    "cancel": (
+        "Cancel a running job",
+        dedent("""\
+            async def process(job):
+                upload = await open_upload(job.data["path"])
+                try:
+                    await upload.stream()    # cancellation is raised here
+                finally:
+                    await upload.abort()     # and this still runs
+
+            # from anywhere: the job ends in `cancelled`, not `failed`
+            await queue.cancel_job(job_id, reason="user closed the tab")"""),
+    ),
+    "progress": (
+        "Progress and logs",
+        dedent("""\
+            async def process(job):
+                for i, row in enumerate(rows):
+                    await job.update_progress(round(i / len(rows) * 100))
+                    await job.log(f"imported {row.id}")
+                return {"rows": len(rows)}"""),
+    ),
     "flows": (
         "Flows",
         dedent("""\
