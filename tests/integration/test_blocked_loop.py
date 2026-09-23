@@ -115,12 +115,23 @@ async def test_a_watched_loop_reports_the_lag_to_a_handler(q, run_worker, run_un
     assert jobs, "the jobs in flight are the shortlist of suspects"
 
 
-@pytest.mark.parametrize("value", [-1, -0.5])
-async def test_a_negative_threshold_is_rejected(q, value):
-    """A threshold below zero would warn on every tick, which is the same as not
-    having one."""
+@pytest.mark.parametrize("value", [-1, -0.5, 0.002, 0.009])
+async def test_a_threshold_smaller_than_the_loops_own_jitter_is_rejected(q, value):
+    """Below zero would warn on every tick. Below the loop's own jitter is the same
+    thing more politely: a sleep that overshoots by a millisecond is not a blocked
+    loop, and a warning that fires on an idle worker is noise with a scary name."""
     with pytest.raises(ValueError, match="blocked_warning"):
         Worker(q.name, lambda job: 1, prefix=PREFIX, connection=q.redis, blocked_warning=value)
+
+
+async def test_an_idle_worker_never_warns(q, run_worker, caplog):
+    """The smallest threshold a caller can ask for still has to survive doing
+    nothing at all."""
+    with caplog.at_level("WARNING"):
+        async with run_worker(q, lambda job: 1, blocked_warning=0.01):
+            await asyncio.sleep(1.0)
+
+    assert BLOCKED not in caplog.text
 
 
 async def test_the_default_threshold_follows_the_lock(q):

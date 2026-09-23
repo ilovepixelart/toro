@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import inspect
 import json
 import logging
@@ -49,6 +50,11 @@ Processor = Callable[[Job], Awaitable[Any] | Any]
 logger = logging.getLogger(__name__)
 
 
+# Below this, a threshold is smaller than the jitter of the sleep that measures it:
+# an ordinary overshoot would read as a blocked loop and an idle worker would warn.
+MIN_BLOCKED_WARNING = 0.01
+
+
 def _blocked_threshold(blocked_warning: float | None, lock_renew_time: int) -> float:
     """How long the loop may be unable to run anything before that is worth saying.
 
@@ -58,8 +64,11 @@ def _blocked_threshold(blocked_warning: float | None, lock_renew_time: int) -> f
     """
     if blocked_warning is None:
         return lock_renew_time / 1000 / 2
-    if blocked_warning < 0:
-        raise ValueError("blocked_warning is seconds, 0 to disable, never negative")
+    if blocked_warning < 0 or 0 < blocked_warning < MIN_BLOCKED_WARNING:
+        raise ValueError(
+            f"blocked_warning is seconds: 0 to disable, otherwise at least "
+            f"{MIN_BLOCKED_WARNING} (below that is the loop's own jitter)"
+        )
     return float(blocked_warning)
 
 
@@ -71,9 +80,14 @@ def _is_async(processor: Processor) -> bool:
     thread exists to avoid. `asyncio.iscoroutinefunction` sees through a
     `functools.partial`; a class-based processor answers for its `__call__`.
     """
-    if asyncio.iscoroutinefunction(processor):
+    target = processor
+    while isinstance(target, functools.partial):
+        # unwrapped by hand: iscoroutinefunction sees through a partial to what it
+        # wraps, but then asks the wrong object about __call__ (the partial's own)
+        target = target.func
+    if asyncio.iscoroutinefunction(target):
         return True
-    call = getattr(processor, "__call__", None)  # noqa: B004
+    call = getattr(target, "__call__", None)  # noqa: B004
     return call is not None and bool(asyncio.iscoroutinefunction(call))
 
 
@@ -351,7 +365,7 @@ class Worker:
         cause, including causes inside a dependency. One warning per episode, because
         the point is to name the processor, not to fill the log.
         """
-        interval = min(1.0, self.blocked_warning / 2)
+        interval = max(MIN_BLOCKED_WARNING / 2, min(1.0, self.blocked_warning / 2))
         warned = False
         while self._running:
             before = time.monotonic()

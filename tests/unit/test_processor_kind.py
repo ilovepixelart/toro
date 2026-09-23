@@ -39,6 +39,12 @@ class SyncCallable:
         (SyncCallable(), False),
         (functools.partial(_async_job), True),  # partials are the common wrapper
         (functools.partial(_sync_job), False),
+        # a partial AROUND a callable object: iscoroutinefunction unwraps to the
+        # instance, which is not a coroutine function, and the __call__ it then sees
+        # is the partial's own
+        (functools.partial(AsyncCallable()), True),
+        (functools.partial(functools.partial(AsyncCallable())), True),
+        (functools.partial(SyncCallable()), False),
         (lambda job: 1, False),
     ],
 )
