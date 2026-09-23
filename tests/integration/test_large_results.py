@@ -13,6 +13,7 @@ completed with nobody told.
 
 import asyncio
 import contextlib
+import sys
 
 BIG = 2 * 1024 * 1024  # bigger than anything that belongs in an event
 PREFIX = "torotest"
@@ -61,10 +62,18 @@ async def test_a_huge_result_does_not_travel_in_the_event(q, run_worker, run_unt
 
 async def test_a_deeply_nested_result_still_reaches_its_waiter(q, run_worker, run_until):
     """1000 levels is the limit cjson decodes, and the event adds one. The job used
-    to complete in Redis while the waiter timed out and the worker logged a hiccup."""
+    to complete in Redis while the waiter timed out and the worker logged a hiccup.
+
+    The recursion limit is raised for the duration: json.dumps recurses per level and
+    runs out of stack at this depth before 3.12, so without it the test would only
+    exercise the bug on the newest Pythons.
+    """
+    depth = 1000
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth * 20)
     deep: list = []
     node = deep
-    for _ in range(999):
+    for _ in range(depth - 1):
         child: list = []
         node.append(child)
         node = child
@@ -72,9 +81,12 @@ async def test_a_deeply_nested_result_still_reaches_its_waiter(q, run_worker, ru
     async def proc(job):
         return deep
 
-    async with run_worker(q, proc):
-        job = await q.add("deep", {})
-        assert await q.result(job.id, timeout=20) == deep
+    try:
+        async with run_worker(q, proc):
+            job = await q.add("deep", {})
+            assert await q.result(job.id, timeout=20) == deep
+    finally:
+        sys.setrecursionlimit(limit)
 
 
 async def test_a_small_result_still_travels_with_its_event(q, run_worker, run_until):
