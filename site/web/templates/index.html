@@ -36,8 +36,9 @@ await Worker("emails", send, concurrency=20).run()''' %}
 )
 
 async def send_digest(job):
-    parts = await job.children_values()
-    return smtp.send("".join(parts))''' %}
+    # {child_id: returnvalue}
+    parts = await job.children_results()
+    return smtp.send("".join(parts.values()))''' %}
 
 {% set mount = '''from fastapi import FastAPI, Depends
 from matador import create_app
@@ -82,13 +83,7 @@ app.mount(
       <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
       <span class="ml-2 font-mono text-xs text-muted">{{ label }}</span>
     </div>
-    {# numbers in their own column: the highlighted HTML stays exactly as
-       pygments produced it, and both columns share the font and leading #}
-    <div class="flex min-w-0">
-      <pre class="code shrink-0 select-none py-4 pl-4 pr-3 text-right font-mono text-sm leading-relaxed text-muted/60">{% for i in range(1, source.split('\n') | length + 1) %}{{ i }}{% if not loop.last %}
-{% endif %}{% endfor %}</pre>
-      <pre class="code min-w-0 grow py-4 pr-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
-    </div>
+    <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
   </div>
 {% endmacro %}
 
@@ -103,7 +98,7 @@ app.mount(
       <p class="mt-5 text-lg text-muted max-w-[54ch]">
         Every state change is <span class="text-fg font-medium">one atomic Lua script</span>. Every
         running job holds <span class="text-fg font-medium">its own lock</span>. When a worker dies
-        mid-job, a stalled sweep hands the work to another one. At-least-once, and honest about it.
+        mid-job, a stalled sweep hands the work to another worker. Delivery is at-least-once.
       </p>
 
       <div class="mt-8 flex flex-wrap items-center gap-2">
@@ -127,14 +122,19 @@ app.mount(
 {% if static | default(false) %}
 <section class="pb-14">
   <div class="{{ pad }}">
-    {{ codepane('Run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
+    {% include "partials/replay.html" %}
     <p class="mt-3 text-muted max-w-[64ch]">
-      These commands start this page with a working queue behind it: two workers, a continuous
-      stream of jobs, and the dashboard mounted at
-      <span class="font-mono text-sm">/dashboard</span>. Stopping a worker leaves its jobs in
-      <span class="font-mono text-sm">active</span> until their locks expire, after which the
+      A run against Redis, recorded when this page was built. Twelve seconds in, a worker is
+      stopped without a graceful shutdown, so its locks are never released. Its jobs stay in
+      <span class="font-mono text-sm">active</span> until those locks expire, after which the
       stalled sweep reassigns them to the surviving worker.
     </p>
+    <div class="mt-8">
+    {{ codepane('Run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
+    <p class="mt-3 text-muted max-w-[64ch]">
+      The same page with a live queue behind it, where the kill button works.
+    </p>
+    </div>
   </div>
 </section>
 {% else %}
@@ -152,10 +152,10 @@ app.mount(
       {% include "partials/pulse.html" %}
     </div>
     <p class="mt-3 text-muted max-w-[64ch]">
-      Kill a worker above and it dies the way a crashed process does: no graceful stop, no
-      released locks. Its jobs stay in <span class="font-mono text-sm">active</span> until their
-      locks expire, then toro's stalled sweep hands them to the surviving worker and they finish.
-      These are live counts from Redis, not a recording.
+      The kill buttons stop a worker without a graceful shutdown, so its locks are never
+      released. Its jobs stay in <span class="font-mono text-sm">active</span> until those locks
+      expire, after which the stalled sweep reassigns them to the surviving worker. The counters
+      above read from Redis.
     </p>
   </div>
 </section>
@@ -260,11 +260,11 @@ app.mount(
 
 <section class="py-14 sm:py-16">
   <div class="{{ pad }}">
-    {{ heading('Contract', 'What you are depending on', 'No adjectives on this one.') }}
+    {{ heading('Contract', 'What you are depending on', '') }}
     <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
       {% for term, value in [
           ('Version', '1.0.0, frozen API'), ('Python', '3.10 &ndash; 3.13'),
-          ('Redis', '6.2 and later'), ('Tests', '827, on real Redis'),
+          ('Redis', '6.2 and later'), ('Tests', '860+, on real Redis'),
           ('Dependencies', 'redis, croniter'), ('Licence', 'MIT')] %}
         <div>
           <dt class="text-xs uppercase tracking-wider text-muted">{{ term }}</dt>

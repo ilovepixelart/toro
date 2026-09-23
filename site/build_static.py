@@ -7,6 +7,7 @@ does a GET for HTML - is written out as files and keeps working.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import shutil
@@ -42,7 +43,8 @@ def main() -> None:
     env.globals["docs_url"] = "https://github.com/ilovepixelart/toro/tree/main/docs"
     env.globals["matador_url"] = "https://github.com/ilovepixelart/matador"
 
-    counts = {"wait": 0, "active": 2, "completed": 128, "failed": 3}
+    replay = json.loads((HERE / "web" / "static" / "replay.json").read_text())
+    counts = replay["frames"][0]["counts"]
     common = {
         "examples": EXAMPLES,
         "chosen": next(iter(EXAMPLES)),
@@ -51,6 +53,7 @@ def main() -> None:
         "all_workers": ["worker-1", "worker-2"],
         "totals": {"completed": 128, "failed": 3},
         "flash": None,
+        "first": counts,
         "request": None,
     }
 

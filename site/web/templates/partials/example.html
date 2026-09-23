@@ -21,10 +21,6 @@
         </button>
       {% endfor %}
     </nav>
-    <div class="flex min-w-0">
-      <pre class="code shrink-0 select-none py-4 pl-4 pr-3 text-right font-mono text-sm leading-relaxed text-muted/60">{% for i in range(1, examples[chosen][1].split('\n') | length + 1) %}{{ i }}{% if not loop.last %}
-{% endif %}{% endfor %}</pre>
-      <pre class="code min-w-0 grow py-4 pr-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ examples[chosen][1] | py | safe }}</code></pre>
-    </div>
+    <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ examples[chosen][1] | py | safe }}</code></pre>
   </div>
 </div>
