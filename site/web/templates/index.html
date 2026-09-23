@@ -111,7 +111,7 @@ app.mount(
   </div>
 </section>
 
-<section class="pb-20">
+<section class="pb-14">
   <div class="{{ pad }}">
     <div class="card ring-1 ring-accent/25 shadow-sm">
       <div class="px-5 py-3 border-b border-line flex items-center gap-2 flex-wrap">
@@ -131,16 +131,14 @@ app.mount(
     </div>
     <p class="mt-3 text-muted max-w-[64ch]">
       {% if static | default(false) %}
-        These numbers are real but they are not live: a static page has no Redis behind it. The
-        same page runs as a FastAPI app with real workers, where killing one leaves its jobs in
-        <span class="font-mono text-xs">active</span> until their locks expire and toro's stalled
-        sweep hands them to the survivor. Two commands to see it:
+        A snapshot, taken while the queue was running. Run it yourself and the counters move:
+        kill a worker and its jobs stay in <span class="font-mono text-xs">active</span> until their
+        locks expire, then toro's stalled sweep hands them to the surviving worker and they finish.
       {% else %}
-        Kill a worker and it dies the way a crashed process dies: no graceful stop, no released
-        locks. Its jobs sit in <span class="font-mono text-xs">active</span> until their locks
-        expire, then toro's stalled sweep hands them to the survivor and they finish. Nothing is
-        simulated; the numbers come from <span class="font-mono text-xs">Queue.counts()</span>
-        against Redis.
+        Kill a worker above and it dies the way a crashed process does: no graceful stop, no
+        released locks. Its jobs stay in <span class="font-mono text-xs">active</span> until their
+        locks expire, then toro's stalled sweep hands them to the surviving worker and they finish.
+        These are live counts from Redis, not a recording.
       {% endif %}
     </p>
     {% if static | default(false) %}
@@ -150,18 +148,18 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
   </div>
 </section>
 
-<section class="py-16 sm:py-24 bg-panel">
+<section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
     {{ heading('The API', 'Pick the problem, see the code',
-       'Every snippet is lifted from the README, so the page cannot advertise an API the library does
-        not have. The tabs are server-rendered: htmx swaps the fragment, nothing runs in the browser.') }}
+       'The options you reach for most often, and the exact call for each. Everything here is in the
+        library: no plugins, no extras to install.') }}
     <div class="mt-7 card">
       {% include "partials/example.html" %}
     </div>
   </div>
 </section>
 
-<section class="py-16 sm:py-24">
+<section class="py-14 sm:py-16">
   <div class="{{ pad }}">
     {{ heading('Scope', 'Everything a queue is expected to have',
        'None of this is an add-on or a plugin. It is in the library, documented, and enforced inside
@@ -187,7 +185,7 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
   </div>
 </section>
 
-<section class="py-16 sm:py-24">
+<section class="py-14 sm:py-16">
   <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
     <div class="min-w-0">
       {{ heading('Flows', 'Fan out, fan in, without the plumbing',
@@ -206,12 +204,11 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
   </div>
 </section>
 
-<section class="py-16 sm:py-24 bg-panel">
+<section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
     {{ heading('The dashboard', 'Mounted, not run',
        'matador is a FastAPI app. It goes inside the application you already deploy, behind the auth
-        you already have, so there is no second service to run and no second login to hand out. The
-        dashboard linked above is exactly this mount, reading the queue on this page.') }}
+        you already have, so there is no second service to run and no second login to hand out.') }}
     <div class="mt-7 grid lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-8 items-start">
       <div class="grid gap-6 min-w-0">
         {{ codepane('mounted into your own app', mount) }}
@@ -237,10 +234,10 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
         <span class="flex items-center justify-between px-4 py-3 border-t border-line text-sm">
           {% if static | default(false) %}
             <span class="text-muted">matador, reading a toro queue</span>
-            <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">matador on GitHub &rarr;</a>
+            <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">Source &rarr;</a>
           {% else %}
-            <span class="text-muted">This, but live, with the jobs from this page</span>
-            <span class="text-accent font-medium group-hover:underline">Open the demo &rarr;</span>
+            <span class="text-muted">Reading the queue above</span>
+            <span class="text-accent font-medium group-hover:underline">Open it &rarr;</span>
           {% endif %}
         </span>
       </{{ 'div' if static | default(false) else 'a' }}>
@@ -248,7 +245,7 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
   </div>
 </section>
 
-<section class="py-16 sm:py-24">
+<section class="py-14 sm:py-16">
   <div class="{{ pad }}">
     {{ heading('The contract', 'What you are depending on', 'No adjectives on this one.') }}
     <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
