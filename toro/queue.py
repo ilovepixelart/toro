@@ -7,7 +7,8 @@ import contextlib
 import json
 import math
 import time
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
@@ -27,6 +28,21 @@ from .scheduler import next_run, valid_cron
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+@dataclass(frozen=True)
+class _Staged:
+    """One enqueue, prepared but not sent.
+
+    Staging is where validation, option merging and JSON encoding happen, so a caller
+    that stages a batch and then sends it knows that nothing reached Redis if any of
+    it was wrong.
+    """
+
+    script: Any
+    keys: list[str]
+    args: list[Any]
+    build: Callable[[Any], Job]
 
 
 class MetricsPoint(TypedDict):
@@ -182,6 +198,21 @@ class Queue:
         ttl is live, repeat adds with the same dedup id are ignored and the
         already-queued job's id is returned. Self-expiring; independent of job_id.
         """
+        staged = self._stage_add(name, data, job_id=job_id, deduplication=deduplication, opts=opts)
+        return staged.build(await staged.script(keys=staged.keys, args=staged.args))
+
+    def _stage_add(
+        self,
+        name: str,
+        data: Any,
+        *,
+        job_id: str | None,
+        deduplication: Deduplication | None,
+        opts: dict[str, Any],
+    ) -> _Staged:
+        """Everything `add()` does except the round trip. Shared with `pending()`,
+        which stages a batch and sends it in one.
+        """
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
         if job_id is not None:
@@ -201,44 +232,48 @@ class Queue:
                     "(it is used as a Redis key segment)"
                 )
         now = _now_ms()
-        new_id, state = _str_list(
-            await self._add_job(
-                keys=[
-                    self.keys.id,
-                    self.keys.prioritized,
-                    self.keys.marker,
-                    self.keys.delayed,
-                    self.keys.base,
-                    self.keys.pc,
-                    self.keys.events,
-                ],
-                args=scripts.add_job_args(
-                    name=name,
-                    data=json.dumps(data),
-                    opts=json.dumps(options.to_dict()),
-                    now=now,
-                    delay=options.delay,
-                    priority=options.priority,
-                    job_id=job_id or "",
-                    dedup_id=dedup_id,
-                    dedup_ttl=dedup_ttl,
-                    concurrency_key=options.concurrency_key or "",
-                ),
+
+        def build(reply: Any) -> Job:
+            new_id, state = _str_list(reply)
+            # The "added" event publishes from inside ADD_JOB (so a live dashboard
+            # refreshes on enqueue without a second round trip here).
+            return Job(
+                id=new_id,
+                name=name,
+                data=data,
+                opts=options,
+                timestamp=now,
+                # The script's answer, not a guess: an add that found the key taken
+                # parks the job in `held`, and one that hit a dedup window or replayed
+                # an id answers for the job already there, in whatever state it is in.
+                state=cast("JobState", state) if state else None,
+                _queue=self,
             )
-        )
-        # The "added" event publishes from inside ADD_JOB (so a live dashboard
-        # refreshes on enqueue without a second round trip here).
-        return Job(
-            id=new_id,
-            name=name,
-            data=data,
-            opts=options,
-            timestamp=now,
-            # The script's answer, not a guess: an add that found the key taken parks
-            # the job in `held`, and one that hit a dedup window or replayed an id
-            # answers for the job already there, in whatever state that job is in.
-            state=cast("JobState", state) if state else None,
-            _queue=self,
+
+        return _Staged(
+            script=self._add_job,
+            keys=[
+                self.keys.id,
+                self.keys.prioritized,
+                self.keys.marker,
+                self.keys.delayed,
+                self.keys.base,
+                self.keys.pc,
+                self.keys.events,
+            ],
+            args=scripts.add_job_args(
+                name=name,
+                data=json.dumps(data),
+                opts=json.dumps(options.to_dict()),
+                now=now,
+                delay=options.delay,
+                priority=options.priority,
+                job_id=job_id or "",
+                dedup_id=dedup_id,
+                dedup_ttl=dedup_ttl,
+                concurrency_key=options.concurrency_key or "",
+            ),
+            build=build,
         )
 
     async def add_flow(
@@ -258,6 +293,13 @@ class Queue:
         parent fails immediately). Returns the parent Job; `await job.result()`
         resolves when the whole flow does. See docs/flows-design.md.
         """
+        staged = self._stage_flow(name, data, children=children, opts=opts)
+        return staged.build(await staged.script(keys=staged.keys, args=staged.args))
+
+    def _stage_flow(
+        self, name: str, data: Any, *, children: list[FlowChild], opts: dict[str, Any]
+    ) -> _Staged:
+        """Everything `add_flow()` does except the round trip."""
         if not children:
             raise ValueError("a flow needs at least one child - use add() for a single job")
         # The root is a FlowChild too: same validation (incl. "no delay on a
@@ -270,21 +312,43 @@ class Queue:
         options = node_options(root, self.default_job_options)
         now = _now_ms()
         tree = to_tree(root, self.default_job_options)
-        parent_id = str(
-            await self._add_flow_script(
-                keys=[self.keys.id, self.keys.base],
-                args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
+
+        def build(reply: Any) -> Job:
+            return Job(
+                id=str(reply),
+                name=name,
+                data=data,
+                opts=options,
+                timestamp=now,
+                state="waiting-children",
+                _queue=self,
             )
+
+        return _Staged(
+            script=self._add_flow_script,
+            keys=[self.keys.id, self.keys.base],
+            args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
+            build=build,
         )
-        return Job(
-            id=parent_id,
-            name=name,
-            data=data,
-            opts=options,
-            timestamp=now,
-            state="waiting-children",
-            _queue=self,
-        )
+
+    def pending(self) -> PendingJobs:
+        """Collect jobs now; send them when the write they belong to has committed.
+
+        A job enqueued before its transaction commits refers to a row that a rollback
+        may take away, and the worker then fails on a row that never existed. Collect
+        the adds instead and flush them once the commit returns:
+
+            pending = queue.pending()
+            pending.add("welcome", {"user_id": user.id})
+            await session.commit()
+            await pending.flush()
+
+        It defers; it does not guarantee. A process that dies between the commit and
+        the flush sends nothing, and closing that needs an outbox table and a relay.
+        What this closes is the half people hit: a job about a row that was rolled
+        back. See docs/producing.md.
+        """
+        return PendingJobs(self)
 
     @staticmethod
     def _hydrate_level(
@@ -1286,3 +1350,73 @@ class Queue:
                 if not fut.done():
                     fut.set_exception(RuntimeError("queue closed while waiting for a result"))
         await self.redis.aclose(close_connection_pool=self._owns_connection)
+
+
+class PendingJobs:
+    """Jobs collected during a transaction, sent only once it has committed.
+
+    Built by `Queue.pending()`. The adds have the same signatures they have on the
+    queue and record what to send; `flush()` sends the batch in one round trip.
+
+    It defers, it does not guarantee: a process that dies between the commit and the
+    flush sends nothing. Closing that needs an outbox table and a relay, which is a
+    database integration and a different product. What this closes is the common half,
+    a job about a row that was rolled back.
+    """
+
+    def __init__(self, queue: Queue) -> None:
+        self._queue = queue
+        # Staged at flush, not here: an id is a counter value, and a job that is never
+        # sent must not consume one. Held as the call, so nothing is encoded until the
+        # caller says the write went through.
+        self._calls: list[Callable[[], _Staged]] = []
+
+    def __len__(self) -> int:
+        return len(self._calls)
+
+    def add(
+        self,
+        name: str,
+        data: Any = None,
+        *,
+        job_id: str | None = None,
+        deduplication: Deduplication | None = None,
+        **opts: Any,
+    ) -> None:
+        """Collect one job. Same arguments as `Queue.add`; nothing is sent yet."""
+        self._calls.append(
+            lambda: self._queue._stage_add(  # noqa: SLF001 - the queue's own staging
+                name, data, job_id=job_id, deduplication=deduplication, opts=opts
+            )
+        )
+
+    def add_flow(
+        self, name: str, data: Any = None, *, children: list[FlowChild], **opts: Any
+    ) -> None:
+        """Collect one flow. Same arguments as `Queue.add_flow`; nothing is sent yet."""
+        self._calls.append(
+            lambda: self._queue._stage_flow(  # noqa: SLF001 - the queue's own staging
+                name, data, children=children, opts=opts
+            )
+        )
+
+    def discard(self) -> None:
+        """Throw the batch away: the transaction rolled back, so nothing happened."""
+        self._calls.clear()
+
+    async def flush(self) -> list[Job]:
+        """Send everything collected, in order, and return the jobs.
+
+        Staging happens first and for the whole batch, so an option error or a value
+        that will not encode raises with nothing sent and the batch still in hand.
+        Emptied afterwards: a hook that fires twice must not double the work.
+        """
+        if not self._calls:
+            return []
+        staged = [stage() for stage in self._calls]
+        async with self._queue.redis.pipeline(transaction=False) as pipe:
+            for item in staged:
+                await item.script(keys=item.keys, args=item.args, client=pipe)
+            replies = await pipe.execute()
+        self._calls.clear()
+        return [item.build(reply) for item, reply in zip(staged, replies, strict=True)]

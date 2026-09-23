@@ -4,7 +4,7 @@ from .errors import JobCancelledError, JobFailedError, ToroError
 from .flow import FlowChild, FlowView, OnFail
 from .job import Backoff, BackoffOpts, Deduplication, Job, JobOptions, JobState, RemoveOption
 from .openmetrics import render_all
-from .queue import FlowMetricsPoint, MetricsPoint, NameMetrics, Queue
+from .queue import FlowMetricsPoint, MetricsPoint, NameMetrics, PendingJobs, Queue
 from .worker import RateLimit, Worker
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "MetricsPoint",
     "NameMetrics",
     "OnFail",
+    "PendingJobs",
     "Queue",
     "RateLimit",
     "RemoveOption",
