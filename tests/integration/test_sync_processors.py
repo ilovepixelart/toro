@@ -151,11 +151,11 @@ async def test_a_processor_whose_kind_was_misread_still_returns_its_value(q, run
         assert await q.result(job.id, timeout=15) == {"ok": "hidden"}
 
 
-async def test_cancelling_a_sync_job_cannot_stop_the_thread(q, run_worker, run_until):
-    """SS-004: a thread is not a task. The job is cancelled at once, because the
-    worker decides the outcome by what it asked for, and the work carries on to its
-    own end: Python cannot interrupt a thread, and a queue that implied otherwise
-    would be lying about the one thing people cancel jobs for."""
+async def test_cancelling_a_sync_job_ends_it_when_its_thread_does(q, run_worker, run_until):
+    """SS-004: a thread is not a task. The request lands at once and the outcome waits
+    for the work, because Python cannot interrupt a thread. The job still ends
+    `cancelled` rather than `completed`, whatever its processor returned: the worker
+    decides the outcome by what it asked for."""
     started = threading.Event()
     finished = threading.Event()
 
@@ -171,9 +171,71 @@ async def test_cancelling_a_sync_job_cannot_stop_the_thread(q, run_worker, run_u
 
         assert await q.cancel_job(job.id) is True
 
-        assert await run_until(_cancelled(q, 1), timeout=15)
-        assert not finished.is_set(), "the thread stopped, which Python cannot do"
+        # recorded at once, and still running: the state is what is true
+        assert await q.redis.hget(q.keys.job(job.id), "cancel") == "1"
+        assert not finished.is_set()
+        assert (await q.get_job(job.id)).state == "active"
+
         assert await asyncio.to_thread(finished.wait, 15)  # it runs to its own end
+        assert await run_until(_cancelled(q, 1), timeout=15)
+
+
+async def test_a_cancelled_sync_job_keeps_the_slot_its_thread_still_holds(q, run_worker, run_until):
+    """SS-004: a slot and a thread are the same capacity counted twice, so freeing one
+    while the other is still busy hands the next job to a pool with no thread for it:
+    claimed, locked, renewed, and not running. At `concurrency` cancellations the
+    worker stops running anything at all and nothing says so."""
+    started = threading.Event()
+    done: list[str] = []
+
+    def proc(job):
+        if job.name == "long":
+            started.set()
+            time.sleep(1.0)
+        done.append(job.name)
+        return 1
+
+    async with run_worker(q, proc, concurrency=1):
+        long_job = await q.add("long", {})
+        assert await asyncio.to_thread(started.wait, 15)
+        assert await q.cancel_job(long_job.id) is True
+
+        after = await q.add("after", {})
+        await asyncio.sleep(0.3)  # ample time for a free slot to claim it
+        state = (await q.get_job(after.id)).state
+        assert state == "wait", f"claimed with no thread to run it: {state}"
+
+        assert await run_until(lambda: "after" in done, timeout=20)
+
+
+async def test_cancelling_a_sync_job_does_not_hand_its_key_on_early(q, run_worker, run_until):
+    """SS-004, CN-006: `concurrency_key` means one at a time, and a terminal state
+    hands the key to the next job. A thread that is still running has not finished
+    with the key, whatever the job's state says."""
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+    started = threading.Event()
+
+    def proc(job):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        started.set()
+        time.sleep(0.8 if job.name == "first" else 0.05)
+        with lock:
+            running -= 1
+        return 1
+
+    async with run_worker(q, proc, concurrency=2):
+        first = await q.add("first", {}, concurrency_key="acct-7")
+        assert await asyncio.to_thread(started.wait, 15)
+        await q.add("second", {}, concurrency_key="acct-7")
+        assert await q.cancel_job(first.id) is True
+        assert await run_until(_completed(q, 1), timeout=20)
+
+    assert peak == 1, f"two jobs ran at once on one key (peak {peak})"
 
 
 def _cancelled(q, n: int):

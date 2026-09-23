@@ -628,6 +628,8 @@ class Worker:
         Nothing to do either if the task is finished, though a cancellation that lands
         between the processor returning and the task being marked done still wins:
         CPython discards the result and the job commits `cancelled`.
+
+        A SYNC processor is recorded and not interrupted: see the comment below.
         """
         if job_id in self._cancelling:
             return
@@ -638,6 +640,14 @@ class Worker:
         if task.done() or (claim is not None and claim != mine):
             return
         self._cancelling.add(job_id)
+        if not self._async_processor:
+            # A thread cannot be interrupted, so cancelling the await would free this
+            # slot and commit a terminal state that hands on the concurrency key,
+            # while the work itself carried on: the pool would have one thread fewer
+            # than the worker has slots, and the next job on that key would start
+            # beside work that never stopped. The request stands, and the job ends
+            # `cancelled` when its thread returns.
+            return
         task.cancel()
 
     async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
