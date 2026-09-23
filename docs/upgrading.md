@@ -14,6 +14,12 @@ from then on and the absolute totals are not history.
 `metrics_text()` renders OpenMetrics for a scraper, and matador serves every queue
 it watches from `/metrics`. See [Operating](operating.md).
 
+One id is now reserved: `totals`, the key the counters live on, alongside the other
+reserved ids. A job created before this release with that id is sitting on that key,
+so remove it (`await queue.remove_job("totals")`) and the counters start clean. Left
+there, the counter writes land in its hash; a scrape reads only its own five fields,
+so it keeps working, and retention removing that job would take the counters with it.
+
 ## 0.9.0
 
 ### Upgrade every worker before you cancel anything

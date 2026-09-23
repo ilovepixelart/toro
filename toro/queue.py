@@ -21,7 +21,7 @@ from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
-from .openmetrics import OUTCOMES, render
+from .openmetrics import OUTCOMES, TOTAL_FIELDS, render
 from .scheduler import next_run, valid_cron
 
 
@@ -670,7 +670,7 @@ class Queue:
         """
         raw = _str_dict(await self.redis.hgetall(self.keys.totals))
         totals = dict.fromkeys(OUTCOMES, 0)
-        totals.update({k: int(v) for k, v in raw.items()})
+        totals.update({k: int(v) for k, v in raw.items() if k in TOTAL_FIELDS})
         return totals
 
     async def metrics_text(self) -> str:

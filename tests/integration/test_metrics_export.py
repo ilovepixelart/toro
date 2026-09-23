@@ -84,6 +84,21 @@ async def test_a_scheduled_occurrence_is_counted_as_added(q, run_worker, run_unt
     assert (await _totals(q))["added"] >= 2, "the occurrence a worker minted was not counted"
 
 
+async def test_a_leftover_job_on_the_counters_key_cannot_break_a_scrape(q):
+    """`totals` is a reserved job id from 0.10 on, but a queue upgraded from 0.9 can
+    already hold a job with that id, sitting on the key the counters now use. A scrape
+    reads the five fields it owns and ignores the rest, so one stale job cannot take
+    the exporter down for good."""
+    await q.redis.hset(q.keys.totals, mapping={"id": "totals", "name": "leftover", "state": "wait"})
+    await q.add("j", {})
+
+    totals = await q.lifetime_totals()
+
+    assert totals["added"] == 1
+    assert "name" not in totals
+    assert await q.metrics_text()  # and the exposition still renders
+
+
 async def test_totals_never_expire(q):
     """OP-002: `rate()` reads a counter across restarts, so the key it reads from
     cannot be one that quietly disappears after eight hours."""

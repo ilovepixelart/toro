@@ -12,6 +12,9 @@ from collections.abc import Mapping
 # Counters are declared even at zero. A family that appears only once a job has
 # failed makes `rate()` start at a cliff, which reads as a spike that never happened.
 OUTCOMES = ("added", "completed", "failed", "cancelled")
+# Everything the totals hash holds. Read by field rather than wholesale: a queue
+# upgraded from before the key existed can have a job hash sitting on it.
+TOTAL_FIELDS = (*OUTCOMES, "ms")
 
 # A counter's FAMILY carries no suffix and its SAMPLE ends in `_total`: a family
 # declared as `toro_jobs_total` would need a `toro_jobs_total_total` sample, and a
