@@ -266,7 +266,7 @@ app.mount(
     {{ heading('Contract', 'What you are depending on', '') }}
     <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
       {% for term, value in [
-          ('Version', '1.0.0, frozen API'), ('Python', '3.10 &ndash; 3.13'),
+          ('Version', '1.0.0, frozen API'), ('Python', '3.10 to 3.13'),
           ('Redis', '6.2 and later'), ('Tests', '860+, on real Redis'),
           ('Dependencies', 'redis, croniter'), ('Licence', 'MIT')] %}
         <div>
