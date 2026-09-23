@@ -49,12 +49,22 @@ def _escaped(css: str) -> str:
     return css.replace("\\", "")
 
 
+def _defines(css: str, name: str) -> bool:
+    """Whether the stylesheet defines this class, not merely one that starts with
+    its name: `.w-2.5` is present in every build and must not answer for `w-2`.
+
+    A class name continues through letters, digits, `_`, `-`, and the characters
+    Tailwind escapes into a selector (`.` `/` `%` `[`), so anything else ends it.
+    """
+    return re.search(re.escape(f".{name}") + r"(?![\w./%\[-])", css) is not None
+
+
 @pytest.mark.skipif(not CSS.exists(), reason="the site's stylesheet is not built")
 def test_every_layout_utility_the_markup_uses_exists_in_the_stylesheet():
     css = _escaped(CSS.read_text())
     used = _classes()
     assert used, "found no layout classes in the templates"
-    missing = sorted(c for c in used if f".{c}" not in css)
+    missing = sorted(c for c in used if not _defines(css, c))
     assert missing == [], (
         f"{len(missing)} utilities are used but absent from app.css, so they do nothing: "
         f"{missing}. Rebuild with ./tailwindcss -i styles/input.css -o web/static/app.css --minify"

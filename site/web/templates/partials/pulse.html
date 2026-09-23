@@ -2,7 +2,7 @@
    state, no JSON, no rendering in the browser. #}
 {# Live only: the static build omits this panel rather than showing counters
    that cannot move. #}
-<div id="pulse" hx-get="/pulse" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="pulse" hx-get="{{ base | default('') }}/pulse" hx-trigger="every 2s" hx-swap="outerHTML">
   <div class="grid grid-cols-2 sm:grid-cols-4">
     {% for key, label, tone in [
         ('wait', 'waiting', 'muted'), ('active', 'active', 'warning'),
