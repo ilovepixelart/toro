@@ -58,6 +58,27 @@ def test_the_current_version_has_an_upgrading_entry():
     assert _version() in headings, f"no entry for {_version()} among {headings[:3]}"
 
 
+def test_the_version_is_written_down_once():
+    """The manifest is the one copy. `uv version --bump patch` edits it and the
+    lockfile in a single command, which only works on a static version, and the
+    module asks the installed metadata rather than repeating the number: a second
+    copy cannot drift when there is no second copy. textual and litestar do this.
+    """
+    module = (ROOT / "toro" / "__init__.py").read_text()
+    assert re.search(r'^__version__ = "', module, re.MULTILINE) is None, (
+        "toro/__init__.py carries a second copy of the version"
+    )
+    assert 'version("toro-queue")' in module, "the module should derive it, not omit it"
+
+
+def test_the_module_reports_the_version_the_manifest_declares():
+    """The derivation is only as good as what it reads: an install that went stale
+    reports the old number from a manifest that says otherwise."""
+    import toro
+
+    assert toro.__version__ == _version()
+
+
 def test_the_readme_and_the_docs_agree_on_what_this_is():
     """The README is the first page anyone reads and the only one that ships to PyPI:
     it points at the docs, and the docs point back."""

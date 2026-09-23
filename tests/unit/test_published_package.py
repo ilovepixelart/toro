@@ -11,8 +11,11 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 
 import pytest
+
+import toro
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Not shipped: they describe how this repository is worked on, not how the package is
@@ -21,6 +24,30 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 NOT_SHIPPED = (".github", ".vscode", ".pre-commit-config.yaml")
 # Shipped: the package, and enough to build it and check it for yourself.
 SHIPPED = ("toro", "tests", "pyproject.toml", "README.md", "LICENSE")
+
+
+@pytest.fixture(scope="module")
+def wheel_metadata() -> str:
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv builds the wheel")
+    with tempfile.TemporaryDirectory() as out:
+        # the command is a fixed list of literals and a resolved executable path
+        subprocess.run(  # noqa: S603
+            [uv, "build", "--wheel", "--out-dir", out], cwd=ROOT, check=True, capture_output=True
+        )
+        with zipfile.ZipFile(next(pathlib.Path(out).glob("*.whl"))) as wheel:
+            name = next(n for n in wheel.namelist() if n.endswith("METADATA"))
+            return wheel.read(name).decode()
+
+
+def test_the_wheel_takes_its_version_from_the_module(wheel_metadata: str):
+    """The version is written down once, in `toro/__init__.py`, and the build backend
+    derives the package's from it. This asserts that wiring against the real archive:
+    the two agreed by hand-editing in step for five releases, and now they cannot
+    disagree because there is only one of them.
+    """
+    assert f"Version: {toro.__version__}" in wheel_metadata
 
 
 @pytest.fixture(scope="module")
