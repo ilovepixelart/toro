@@ -21,7 +21,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Not shipped: they describe how this repository is worked on, not how the package is
 # built, installed or verified. (`.gitignore` is not on this list: hatchling ships it
 # on purpose, because it is how the sdist reproduces its own file selection.)
-NOT_SHIPPED = (".github", ".vscode", ".pre-commit-config.yaml")
+# `site` is the website: it has its own dependencies (FastAPI, Jinja, matador)
+# and no business inside a queue library's distribution.
+NOT_SHIPPED = (".github", ".vscode", ".pre-commit-config.yaml", "site")
 # Shipped: the package, and enough to build it and check it for yourself.
 SHIPPED = ("toro", "tests", "pyproject.toml", "README.md", "LICENSE")
 

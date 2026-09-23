@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+
+{#
+  Utilities live in the markup. Where a shape repeats, a macro or a loop writes
+  it once, which is what Tailwind's docs prescribe for duplication rather than
+  bundling utilities into CSS classes with @apply.
+#}
+
+{# Centred with a generous cap, the way most developer sites do it: wide enough
+   that a laptop is effectively full-bleed, capped so a wide monitor centres
+   rather than stretching. One number to change. #}
+{% set pad = "w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24" %}
+
+{% set quickstart = '''from toro import Queue, Worker
+
+queue = Queue("emails", url="redis://localhost:6379")
+
+await queue.add(
+    "welcome",
+    {"to": "ada@example.com"},
+    attempts=3,
+)
+
+async def send(job):
+    return await smtp.send(job.data["to"])
+
+await Worker("emails", send, concurrency=20).run()''' %}
+
+{% set flows = '''parent = await queue.add_flow(
+    "send-digest", {"user": 42},
+    children=[
+        FlowChild("render-header", {}),
+        FlowChild("render-body", {}),
+        FlowChild("render-footer", {}, on_fail="continue"),
+    ],
+)
+
+async def send_digest(job):
+    parts = await job.children_values()
+    return smtp.send("".join(parts))''' %}
+
+{% set mount = '''from fastapi import FastAPI, Depends
+from matador import create_app
+
+app = FastAPI()
+app.mount(
+    "/admin/queues",
+    create_app(
+        ["emails", "billing"],
+        url="redis://localhost:6379",
+        dependencies=[Depends(admin)],
+        can_mutate=lambda r: r.user.is_staff,
+    ),
+)''' %}
+
+{% macro heading(eyebrow, title, intro) %}
+  <p class="text-xs uppercase tracking-wider text-accent">{{ eyebrow }}</p>
+  <h2 class="font-display mt-2 text-2xl font-semibold tracking-tight text-balance">{{ title }}</h2>
+  {% if intro %}<p class="mt-2 text-muted max-w-[64ch]">{{ intro | safe }}</p>{% endif %}
+{% endmacro %}
+
+{% macro blurbs(items, measure='') %}
+  <dl class="grid gap-4">
+    {% for term, body in items %}
+      <div>
+        <dt class="text-sm font-semibold">{{ term }}</dt>
+        <dd class="mt-1 text-sm text-muted {{ measure }}">{{ body }}</dd>
+      </div>
+    {% endfor %}
+  </dl>
+{% endmacro %}
+
+{% macro codepane(label, source) %}
+  {# min-w-0: a grid item is min-content wide by default, so a wide <pre> would
+     stretch its track instead of scrolling inside it. #}
+  <div class="card min-w-0">
+    <div class="px-4 pt-3 pb-1"><span class="text-xs uppercase tracking-wider text-muted">{{ label }}</span></div>
+    <pre class="code min-w-0 p-4 font-mono text-xs leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
+  </div>
+{% endmacro %}
+
+{% block body %}
+<section class="gridded pt-16 pb-14">
+  <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
+    <div class="min-w-0">
+      <p class="text-xs uppercase tracking-wider text-accent">Python job queue &middot; Redis &middot; asyncio</p>
+      <h1 class="font-display mt-3 text-[2.6rem] sm:text-6xl font-semibold tracking-[-0.04em] leading-[0.98] text-balance">
+        Jobs that survive the worker running them.
+      </h1>
+      <p class="mt-5 text-lg text-muted max-w-[54ch]">
+        Every state change is <span class="text-fg font-medium">one atomic Lua script</span>. Every
+        running job holds <span class="text-fg font-medium">its own lock</span>. When a worker dies
+        mid-job, a stalled sweep hands the work to another one. At-least-once, and honest about it.
+      </p>
+
+      <div class="mt-8 flex flex-wrap items-center gap-2">
+        <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">View on GitHub</a>
+        <a class="btn btn-ghost" href="{{ demo_url | default('/dashboard') }}">Open the live dashboard</a>
+      </div>
+      <div class="mt-3 flex items-center gap-3 font-mono text-sm text-muted">
+        <span class="select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
+        <span class="chip">MIT &middot; 1.0.0</span>
+      </div>
+    </div>
+
+    {{ codepane('the whole api, more or less', quickstart) }}
+  </div>
+</section>
+
+<section class="pb-20">
+  <div class="{{ pad }}">
+    <div class="card ring-1 ring-accent/25 shadow-sm">
+      <div class="px-5 py-3 border-b border-line flex items-center gap-2 flex-wrap">
+        <span class="relative flex w-2 h-2">
+          <span class="absolute inline-flex w-full h-full rounded-full bg-success opacity-60 motion-safe:animate-ping"></span>
+          <span class="relative inline-flex w-2 h-2 rounded-full bg-success"></span>
+        </span>
+        <span class="text-sm font-medium">A real queue, running on this page</span>
+        <span class="chip">two workers &middot; concurrency 3 &middot; 4s locks</span>
+      </div>
+      {% include "partials/pulse.html" %}
+    </div>
+    <p class="mt-3 text-muted max-w-[64ch]">
+      Kill a worker and it dies the way a crashed process dies: no graceful stop, no released locks.
+      Its jobs sit in <span class="font-mono text-xs">active</span> until their locks expire, then
+      toro's stalled sweep hands them to the survivor and they finish. Nothing is simulated; the
+      numbers come from <span class="font-mono text-xs">Queue.counts()</span> against Redis.
+    </p>
+  </div>
+</section>
+
+<section class="py-16 sm:py-24 bg-panel">
+  <div class="{{ pad }}">
+    {{ heading('The API', 'Pick the problem, see the code',
+       'Every snippet is lifted from the README, so the page cannot advertise an API the library does
+        not have. The tabs are server-rendered: htmx swaps the fragment, nothing runs in the browser.') }}
+    <div class="mt-7 card">
+      {% include "partials/example.html" %}
+    </div>
+  </div>
+</section>
+
+<section class="py-16 sm:py-24">
+  <div class="{{ pad }}">
+    {{ heading('Scope', 'Everything a queue is expected to have',
+       'None of this is an add-on or a plugin. It is in the library, documented, and enforced inside
+        the same atomic scripts that move jobs between states.') }}
+    <div class="mt-10 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-8">
+      {% for title, body in [
+        ('Retries with backoff', 'Fixed or exponential, per job, with a ceiling. A failed attempt goes back with its history intact.'),
+        ('Priorities and delays', 'Enqueue ahead of the queue, or for later. Delayed jobs promote themselves when due.'),
+        ('Cron and repeatable', 'Every occurrence schedules the next, so a missed tick cannot compound into a storm.'),
+        ('Deduplication', 'A custom id makes add() idempotent: the second one is ignored rather than queued twice.'),
+        ('Rate limits', 'A cap across every worker on the queue, not per process, spent only once a job is actually claimed.'),
+        ('Concurrency keys', 'Serialise jobs that touch the same thing while everything else keeps flowing.'),
+        ('Global concurrency', 'One ceiling on active jobs across every worker, released even when a worker crashes.'),
+        ('Flows', 'Parent and child trees with fan-out, fan-in, per-child failure policy and flow-aware retry.'),
+        ('Metrics', 'Per-minute counters and lifetime totals in Redis, exported as OpenMetrics for Prometheus.'),
+      ] %}
+        <div>
+          <h3 class="text-sm font-semibold">{{ title }}</h3>
+          <p class="mt-1 text-sm text-muted max-w-[42ch]">{{ body }}</p>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<section class="py-16 sm:py-24">
+  <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
+    <div class="min-w-0">
+      {{ heading('Flows', 'Fan out, fan in, without the plumbing',
+         'A flow is a parent job whose children run first. The parent waits in
+          <span class="font-mono text-xs">waiting-children</span> until they finish, then runs with
+          their results.') }}
+      <div class="mt-6">
+        {{ blurbs([
+          ('The tree is the unit', 'Retry a parent and the failed branch re-runs, not the work that already succeeded.'),
+          ('Failure is a policy', 'on_fail decides per child: fail the parent, or carry on without it.'),
+          ('Children stay out of the way', 'Listings show root jobs, so a flow reads as one thing and opens into its tree.'),
+        ], 'max-w-[56ch]') }}
+      </div>
+    </div>
+    <div class="min-w-0">{{ codepane('a parent and three children', flows) }}</div>
+  </div>
+</section>
+
+<section class="py-16 sm:py-24 bg-panel">
+  <div class="{{ pad }}">
+    {{ heading('The dashboard', 'Mounted, not run',
+       'matador is a FastAPI app. It goes inside the application you already deploy, behind the auth
+        you already have, so there is no second service to run and no second login to hand out. The
+        dashboard linked above is exactly this mount, reading the queue on this page.') }}
+    <div class="mt-7 grid lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-8 items-start">
+      <div class="grid gap-6 min-w-0">
+        {{ codepane('mounted into your own app', mount) }}
+        {{ blurbs([
+          ('Read-only is a predicate', 'can_mutate decides per request, and when it says no the controls are never drawn, not merely refused.'),
+          ('Scrapeable', '/metrics speaks OpenMetrics, so the queue reaches Prometheus without an exporter.'),
+          ('Live without a socket', 'Server-sent events from one shared Redis subscription, released when the last viewer leaves.'),
+        ], 'max-w-[60ch]') }}
+      </div>
+      <a href="{{ demo_url | default('/dashboard') }}"
+         class="card ring-1 ring-line block overflow-hidden group transition-colors hover:ring-accent/40">
+        <span class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
+          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+          <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+          <span class="ml-2 font-mono text-xs text-muted">/admin/queues</span>
+        </span>
+        <img src="{{ base | default('') }}/assets/dashboard.png" alt="The matador dashboard showing a queue's jobs, states and throughput"
+             class="w-full block" loading="lazy" />
+        <span class="flex items-center justify-between px-4 py-3 border-t border-line text-sm">
+          <span class="text-muted">This, but live, with the jobs from this page</span>
+          <span class="text-accent font-medium group-hover:underline">Open it &rarr;</span>
+        </span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="py-16 sm:py-24">
+  <div class="{{ pad }}">
+    {{ heading('The contract', 'What you are depending on', 'No adjectives on this one.') }}
+    <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
+      {% for term, value in [
+          ('Version', '1.0.0, frozen API'), ('Python', '3.10 &ndash; 3.13'),
+          ('Redis', '6.2 and later'), ('Tests', '827, on real Redis'),
+          ('Dependencies', 'redis, croniter'), ('Licence', 'MIT')] %}
+        <div>
+          <dt class="text-xs uppercase tracking-wider text-muted">{{ term }}</dt>
+          <dd class="mt-1 text-sm font-medium">{{ value | safe }}</dd>
+        </div>
+      {% endfor %}
+    </dl>
+    <div class="mt-10 flex flex-wrap items-center gap-3">
+      <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">Read the source</a>
+      <span class="font-mono text-sm text-muted select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
+    </div>
+  </div>
+</section>
+{% endblock %}

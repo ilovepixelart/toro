@@ -1,0 +1,15 @@
+{# The use-case browser: the tabs and the code are one fragment, so htmx swaps
+   both at once and the server owns which one is selected. No client state. #}
+<div id="examples" class="grid sm:grid-cols-[minmax(0,190px)_minmax(0,1fr)] min-w-0">
+  <nav class="border-b sm:border-b-0 sm:border-r border-line bg-panel2/40 p-2 flex sm:block gap-1 overflow-x-auto">
+    {% for key, (title, _) in examples.items() %}
+      <button type="button"
+              hx-get="{{ base | default('') }}/examples/{{ key }}{{ '.html' if static | default(false) }}" hx-target="#examples" hx-swap="outerHTML"
+              class="btn btn-sm w-auto sm:w-full justify-start whitespace-nowrap
+                     {{ 'bg-accent/10 text-accent' if key == chosen else 'btn-ghost bg-transparent' }}">
+        {{ title }}
+      </button>
+    {% endfor %}
+  </nav>
+  <pre class="code min-w-0 p-4 font-mono text-xs leading-relaxed overflow-x-auto"><code>{{ examples[chosen][1] | py | safe }}</code></pre>
+</div>

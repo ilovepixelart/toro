@@ -1,0 +1,47 @@
+{# The live strip: one server-rendered fragment, re-fetched by htmx. No client
+   state, no JSON, no rendering in the browser. #}
+{# No server on a static host: the panel becomes a snapshot that is honest about
+   being one, and points at the instance where it is live. #}
+<div id="pulse"{% if not static | default(false) %} hx-get="{{ base | default('') }}/pulse" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  <div class="grid grid-cols-2 sm:grid-cols-4">
+    {% for key, label, tone in [
+        ('wait', 'waiting', 'muted'), ('active', 'active', 'warning'),
+        ('completed', 'completed', 'success'), ('failed', 'failed', 'danger')] %}
+      <div class="p-5 sm:border-r border-line last:border-r-0">
+        <div class="label flex items-center gap-2">
+          <span class="inline-block w-1.5 h-1.5 rounded-full bg-{{ tone }}"></span>{{ label }}
+        </div>
+        <div class="text-3xl font-semibold tabular-nums mt-1.5 text-{{ tone }}">{{ counts[key] }}</div>
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="border-t border-line px-5 py-3 flex flex-wrap items-center gap-2">
+    <span class="label">workers</span>
+    {% if static | default(false) %}
+      <span class="chip">worker-1 &middot; worker-2</span>
+      <a class="btn btn-sm btn-ghost" href="{{ demo_url | default('#') }}">Kill one on the live demo &rarr;</a>
+    {% else %}
+    {% for name in all_workers %}
+      {% if name in workers %}
+        <button class="btn btn-sm btn-danger" hx-post="{{ base | default('') }}/demo/crash/{{ name }}"
+                hx-target="#pulse" hx-swap="outerHTML">
+          Kill {{ name }}
+        </button>
+      {% else %}
+        <button class="btn btn-sm btn-ghost" hx-post="{{ base | default('') }}/demo/revive/{{ name }}"
+                hx-target="#pulse" hx-swap="outerHTML">
+          Restart {{ name }}
+        </button>
+      {% endif %}
+    {% endfor %}
+    {% endif %}
+    <span class="chip ml-auto font-mono">
+      {{ totals.completed }} completed &middot; {{ totals.failed }} failed since boot
+    </span>
+  </div>
+
+  {% if flash %}
+    <div class="border-t border-line px-4 py-2 font-mono text-xs text-accent">{{ flash }}</div>
+  {% endif %}
+</div>

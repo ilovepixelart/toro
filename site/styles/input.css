@@ -1,0 +1,132 @@
+/* The same design system matador ships, because the site is built on matador.
+   Tokens, type scale and component classes are lifted from its styles/input.css
+   so the marketing page and the product cannot drift apart visually. */
+@import "tailwindcss" source("../web/templates");
+
+/* The status colours are built in Jinja (`text-{{ tone }}`), which the scanner
+   cannot see, so pin exactly those utilities. matador documents this same trap;
+   copying its tokens without copying this is what dropped every state colour. */
+@source inline("{text,bg}-{info,success,warning,danger,muted}");
+@source inline("bg-{info,success,warning,danger,muted}/10");
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* woff2 only, variable weight axes, and `swap` so text is never invisible while
+   a face loads. `unicode-range` keeps each file to the Latin block it actually
+   contains, so the browser will not download one for text it cannot render. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/inter.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+/* Display only: headings want more character than a UI face carries, and this
+   stays in the same grotesk family so the page reads as one voice. */
+@font-face {
+  font-family: 'Archivo';
+  font-style: normal;
+  font-weight: 500 700;
+  font-display: swap;
+  src: url('/assets/fonts/archivo.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+/* Code, which was the OS default before: SF Mono here, Consolas on Windows,
+   DejaVu on Linux. A page whose argument is made in code should not render it
+   in three different typefaces. */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/assets/fonts/jetbrains-mono.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@theme inline {
+  --color-ink: var(--ink);
+  --color-panel: var(--panel);
+  --color-panel2: var(--panel2);
+  --color-line: var(--line);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-info: var(--info);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  /* v4 generates a font-display utility from this token. */
+  --font-display: 'Archivo', 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  :root {
+    --ink: rgb(248 250 252); --panel: rgb(255 255 255); --panel2: rgb(241 245 249);
+    --line: rgb(226 232 240); --fg: rgb(15 23 42); --muted: rgb(100 116 139);
+    --accent: rgb(226 59 59);
+    --info: rgb(2 132 199); --success: rgb(5 150 105);
+    --warning: rgb(202 110 8); --danger: rgb(225 29 72);
+  }
+  html.dark {
+    --ink: rgb(14 16 20); --panel: rgb(22 25 34); --panel2: rgb(28 32 41);
+    --line: rgb(39 44 56); --fg: rgb(226 232 240); --muted: rgb(148 163 184);
+    --accent: rgb(240 82 82);
+    --info: rgb(56 189 248); --success: rgb(52 211 153);
+    --warning: rgb(251 191 36); --danger: rgb(251 113 133);
+  }
+  body { font-feature-settings: 'tnum'; }
+  button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--accent) 50%, transparent);
+    outline-offset: 1px;
+    border-radius: var(--radius-md);
+  }
+}
+
+@layer components {
+  /* matador's own vocabulary, lifted unchanged so the site and the product share
+     one system. These are its components, not ones invented for this page. */
+  .label { @apply text-xs uppercase tracking-wider text-muted; }
+  .btn { @apply inline-flex items-center gap-1.5 rounded-lg text-sm font-medium transition-colors
+                px-3 py-1.5 focus:outline-hidden
+                focus-visible:outline-2 focus-visible:outline-accent/50 focus-visible:outline-offset-1
+                disabled:cursor-not-allowed; }
+  .btn-sm { @apply text-xs px-2 py-1 gap-1 rounded-md min-h-6; }
+  .btn-ghost { @apply bg-panel2 text-fg hover:bg-line; }
+  .btn-solid { @apply bg-fg text-ink hover:opacity-90; }
+  .btn-danger { @apply bg-danger/10 text-danger hover:bg-danger/20; }
+  .card { @apply rounded-xl bg-panel overflow-hidden shadow-xs; }
+  .chip { @apply inline-flex items-center gap-1.5 text-xs text-muted; }
+}
+
+/* Not utility bundles: real CSS that utilities cannot express. */
+
+/* Pygments writes its own token classes inside this hook. */
+.code { background-color: var(--panel2); color: var(--fg); }
+html.dark .code { background-color: var(--ink); }
+
+/* A faint engineering grid behind the hero, on its own layer because a mask
+   clips an element's content as well as its background. */
+.gridded { position: relative; isolation: isolate; }
+.gridded::before {
+  content: "";
+  position: absolute;
+  inset: -1rem 0 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--line) 60%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--line) 60%, transparent) 1px, transparent 1px);
+  background-size: 32px 32px;
+  -webkit-mask-image: radial-gradient(ellipse 70% 70% at 25% 10%, #000 10%, transparent 70%);
+  mask-image: radial-gradient(ellipse 70% 70% at 25% 10%, #000 10%, transparent 70%);
+}
