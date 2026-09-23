@@ -19,10 +19,10 @@ LINK = re.compile(r"\[[^\]]+\]\((?P<target>[^)#]+)(?:#[^)]*)?\)")
 
 
 def _version() -> str:
-    # read, not parsed: tomllib is 3.11+ and this package supports 3.10
-    project = (ROOT / "pyproject.toml").read_text()
-    match = re.search(r'^version = "(?P<v>[^"]+)"', project, re.MULTILINE)
-    assert match, "pyproject has no version"
+    # the module is where the version lives; packaging derives its own from here
+    module = (ROOT / "toro" / "__init__.py").read_text()
+    match = re.search(r'^__version__ = "(?P<v>[^"]+)"', module, re.MULTILINE)
+    assert match, "toro/__init__.py has no __version__"
     return match.group("v")
 
 
@@ -56,6 +56,19 @@ def test_the_current_version_has_an_upgrading_entry():
     """
     headings = re.findall(r"^## (.+)$", (DOCS / "upgrading.md").read_text(), re.MULTILINE)
     assert _version() in headings, f"no entry for {_version()} among {headings[:3]}"
+
+
+def test_the_version_is_written_down_once():
+    """Five releases, each needing the same string edited in two files, kept in step
+    by a test that runs after the edit rather than instead of it. Packaging reads the
+    version from the module, so `pyproject.toml` declares it dynamic and carries no
+    literal of its own: a second copy cannot drift if there is no second copy.
+    """
+    project = (ROOT / "pyproject.toml").read_text()
+    assert re.search(r'^version = "', project, re.MULTILINE) is None, (
+        "pyproject.toml carries a second copy of the version"
+    )
+    assert 'dynamic = ["version"]' in project
 
 
 def test_the_readme_and_the_docs_agree_on_what_this_is():
