@@ -69,3 +69,27 @@ async def test_concurrency_runs_jobs_in_parallel(q, run_worker, run_until):
 
 async def _completed(q, n: int = 1) -> bool:
     return (await q.counts())["completed"] >= n
+
+
+async def test_a_result_that_will_not_encode_fails_the_job(q, run_worker, run_until):
+    """A return value that is not JSON is a bug in the processor, and it has to end
+    the job like any other. Left to escape the commit, the job stayed `active` with
+    its lock held until the stalled sweep re-ran it, burning an attempt on work that
+    would fail the same way every time, with nothing but a "hiccup" in the log.
+    """
+
+    async def proc(job):
+        return object()  # a result the queue cannot store
+
+    async with run_worker(q, proc, stalled_interval=0) as w:
+        w.on("failed", lambda *a, **k: None)
+        job = await q.add("weird", {}, attempts=1)
+
+        async def failed() -> bool:
+            return (await q.counts())["failed"] >= 1
+
+        assert await run_until(failed, timeout=15)
+
+    settled = await q.get_job(job.id)
+    assert settled.state == "failed"
+    assert "JSON serializable" in (settled.failed_reason or "")

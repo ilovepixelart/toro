@@ -610,8 +610,18 @@ class Worker:
             return await self._finish_failed(job, exc)
         if job.id in self._cancelling:
             return await self._finish_cancelled(job)
+        try:
+            committed = await self._finish_completed(job, result)
+        except (TypeError, ValueError) as exc:
+            # A result the queue cannot store is the processor's bug, and it has to
+            # end the job like any other error would. Left to escape the commit, the
+            # job stays `active` holding its lock until the stalled sweep re-runs it,
+            # burning an attempt on work that fails the same way every time.
+            await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
+            self._failed += 1
+            return await self._finish_failed(job, exc)
         self._processed += 1
-        return await self._finish_completed(job, result)
+        return committed
 
     def _request_cancel(self, job_id: str, claim: str | None = None) -> None:
         """Stop a job this worker is running, once.
