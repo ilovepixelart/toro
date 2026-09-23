@@ -8,32 +8,32 @@
       "process_per_s": 1.0
     },
     "asyncio+pipelined": {
-      "enqueue_per_s": 13.058056897036355,
-      "process_per_s": 1.0772517077725394
+      "enqueue_per_s": 12.030604551532615,
+      "process_per_s": 1.0184355589068677
     },
     "asyncio+eager": {
-      "enqueue_per_s": 1.0146050115118685,
-      "process_per_s": 0.9357273983991347
+      "enqueue_per_s": 1.152201328979648,
+      "process_per_s": 0.945706873684345
     },
     "asyncio+eager+pipelined": {
-      "enqueue_per_s": 13.261992724041935,
-      "process_per_s": 0.9545856083523123
+      "enqueue_per_s": 12.101518361570927,
+      "process_per_s": 0.9472344870643269
     },
     "uvloop": {
-      "enqueue_per_s": 1.2460342603100203,
-      "process_per_s": 1.1586650904799896
+      "enqueue_per_s": 1.2012629355024347,
+      "process_per_s": 1.1506859067255537
     },
     "uvloop+pipelined": {
-      "enqueue_per_s": 13.219083532318917,
-      "process_per_s": 1.1548147186784208
+      "enqueue_per_s": 11.965816689757402,
+      "process_per_s": 1.0935968454723486
     },
     "uvloop+eager": {
-      "enqueue_per_s": 1.106212634710284,
-      "process_per_s": 1.133884924185565
+      "enqueue_per_s": 1.1059893673466876,
+      "process_per_s": 1.1774002555433014
     },
     "uvloop+eager+pipelined": {
-      "enqueue_per_s": 12.975256902217566,
-      "process_per_s": 1.2170881401863365
+      "enqueue_per_s": 12.070704340189737,
+      "process_per_s": 1.1704159808129893
     }
   }
 }

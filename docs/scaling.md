@@ -58,27 +58,32 @@ or use a queue built for it. toro is an async queue, and it says so.
 
 ## What the levers are worth
 
-The matrix, on a developer laptop against a local Redis, 2,000 jobs, `concurrency=20`
+The matrix, on a developer laptop against a local Redis, 2,000 jobs,
+`concurrency=20`, median of three runs per cell
 (`uv run python tests/perf/harness.py`):
 
 | Cell | Enqueue/s | Process/s | vs plain asyncio |
 |---|---|---|---|
-| asyncio | 3,086 | 9,257 | 1.00x |
-| asyncio + pipelined enqueue | 39,465 | 8,869 | 0.96x |
-| asyncio + eager tasks | 3,143 | 8,212 | 0.89x |
-| uvloop | 3,901 | 10,165 | 1.10x |
-| uvloop + eager tasks | 3,367 | 10,444 | 1.13x |
+| asyncio | 3,157 | 8,727 | 1.00x |
+| asyncio + pipelined enqueue | 37,985 | 8,888 | 1.02x |
+| asyncio + eager tasks | 3,638 | 8,254 | 0.95x |
+| uvloop | 3,793 | 10,042 | 1.15x |
+| uvloop + eager tasks | 3,492 | 10,276 | 1.18x |
 
-Read in order of what it buys:
+The same cell run three times spread 2% on this machine, and the uvloop cells as much
+as 7%, so read the table with that in mind: a difference smaller than a cell's own
+spread is the machine, not the code.
 
-- **Pipelining the enqueue is worth about 13x** and is the only order-of-magnitude
-  lever here. `Queue.pending()` sends a batch in one round trip; see
+- **Pipelining the enqueue is worth about 12x**, and it is the only lever here that
+  is not a rounding error. `Queue.pending()` sends a batch as one write; see
   [Producing](producing.md). If you enqueue in a loop, this is the change to make.
-- **uvloop is worth about 1.1x** on the processing side. Real, and not the difference
-  between a system that works and one that does not. toro bundles it for nobody: it
-  is a dependency you choose, and the recipe is three lines.
-- **An eager task factory costs about 6%** on plain asyncio and adds nothing on
-  uvloop, which is the opposite of the folklore. Measure before adopting it.
+- **uvloop is worth about 1.15x** on the processing side, against a 7% spread, so
+  call it "real but small". toro bundles it for nobody: it is a dependency you
+  choose, and the recipe is three lines.
+- **An eager task factory costs about 5% of processing throughput** on plain asyncio
+  and adds nothing on uvloop, which is the opposite of the folklore. It does make the
+  un-pipelined enqueue about 1.15x faster, which is the path you should be pipelining
+  anyway. Measure it on your own workload before adopting it.
 
 To run under another loop, build it yourself; the stdlib has the API and toro has no
 opinion:

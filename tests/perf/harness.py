@@ -44,6 +44,10 @@ CONCURRENCY = 20
 # How far a ratio may drift before it means something. A wall-clock benchmark on a
 # working machine is noisy; a shape that moves more than this is a real change.
 TOLERANCE = 0.25
+# Each cell is run this many times and the median kept. One run of a cell cannot tell
+# a 6% effect from a 6% spread, and reporting it as though it could is how folklore
+# gets published.
+REPEATS = 3
 # A cell that is not finishing is a bug in the harness or the queue, not a slow
 # machine: say so rather than hanging the run.
 STUCK_AFTER = 120.0
@@ -140,15 +144,37 @@ def run_cell(*, loop_factory: Any, eager: bool, pipelined: bool) -> dict[str, fl
         loop.close()
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
 def matrix() -> dict[str, dict[str, float]]:
-    """Every runnable cell, named `<loop>[+eager][+pipelined]`."""
+    """Every runnable cell, named `<loop>[+eager][+pipelined]`, run `REPEATS` times.
+
+    The median is what is reported, and the spread (widest run over narrowest) rides
+    along under `<metric>_spread`: a claim smaller than its own cell's spread is a
+    claim about the machine, not about the code.
+    """
     eager_available = hasattr(asyncio, "eager_task_factory")
     out: dict[str, dict[str, float]] = {}
     for loop_name, factory in _loops().items():
         for eager in (False, True) if eager_available else (False,):
             for pipelined in (False, True):
                 name = loop_name + ("+eager" if eager else "") + ("+pipelined" if pipelined else "")
-                out[name] = run_cell(loop_factory=factory, eager=eager, pipelined=pipelined)
+                runs = [
+                    run_cell(loop_factory=factory, eager=eager, pipelined=pipelined)
+                    for _ in range(REPEATS)
+                ]
+                cell = {}
+                for metric in runs[0]:
+                    values = [run[metric] for run in runs]
+                    cell[metric] = _median(values)
+                    cell[f"{metric}_spread"] = max(values) / min(values) - 1
+                out[name] = cell
     return out
 
 
@@ -161,20 +187,28 @@ def _shape(results: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     """
     base = results[BASE_CELL]
     return {
-        name: {metric: value / base[metric] for metric, value in cell.items()}
+        name: {
+            metric: value / base[metric]
+            for metric, value in cell.items()
+            if not metric.endswith("_spread")
+        }
         for name, cell in results.items()
     }
 
 
 def _report(results: dict[str, dict[str, float]]) -> None:
     shape = _shape(results)
-    print(f"{'cell':24} {'enqueue/s':>12} {'process/s':>12} {'vs asyncio':>12}")
+    noise = results[BASE_CELL]["process_per_s_spread"]
+    print(f"{'cell':24} {'enqueue/s':>12} {'process/s':>12} {'vs asyncio':>12} {'spread':>8}")
     for name, cell in results.items():
-        ratio = shape[name]["process_per_s"]
         print(
             f"{name:24} {cell['enqueue_per_s']:12,.0f} {cell['process_per_s']:12,.0f} "
-            f"{ratio:11.2f}x"
+            f"{shape[name]['process_per_s']:11.2f}x {cell['process_per_s_spread']:7.1%}"
         )
+    print(
+        f"\nmedian of {REPEATS} runs per cell. The plain asyncio cell's own spread is "
+        f"{noise:.1%}: anything smaller than that is the machine, not the code."
+    )
 
 
 def _check(results: dict[str, dict[str, float]]) -> int:
