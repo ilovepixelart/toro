@@ -40,6 +40,19 @@ def test_the_publish_action_is_pinned_to_a_release():
     )
 
 
+def test_the_build_refuses_a_tag_that_does_not_match_what_it_built():
+    """The tag starts the release and the manifest supplies the version, and nothing
+    made them agree. Tagging `v1.0.3` while the manifest still says 1.0.2 publishes
+    1.0.2 under a 1.0.3 tag, and a PyPI upload cannot be taken back: the wrong file
+    is the release from then on. The build job compares the two before anything is
+    uploaded, so a mismatch fails while it is still free to fail.
+    """
+    text = WORKFLOW.read_text()
+    assert "github.ref_name" in text, "nothing in the release reads the tag it was given"
+    build = text.split("publish:")[0]
+    assert "github.ref_name" in build, "the tag is checked after the build, not before"
+
+
 def test_the_workflows_are_linted_by_something():
     """Everything above is a rule about these files that only this suite enforces,
     and this suite only knows the rules it was told. zizmor knows the ones nobody

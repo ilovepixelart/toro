@@ -1,5 +1,7 @@
 """toro - an async-first, Redis-backed job queue for Python."""
 
+from importlib.metadata import version
+
 from .errors import (
     IncompatibleDataModelError,
     JobCancelledError,
@@ -40,4 +42,6 @@ __all__ = [
     "Worker",
     "render_all",
 ]
-__version__ = "1.0.0"
+# Asked, not repeated: `pyproject.toml` holds the number and `uv version --bump`
+# edits it there, so this module has nothing to keep in step.
+__version__ = version("toro-queue")
