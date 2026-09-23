@@ -40,6 +40,19 @@ def test_the_publish_action_is_pinned_to_a_release():
     )
 
 
+def test_something_keeps_the_pinned_commits_current():
+    """A commit pin freezes the action at that commit, including its unfixed bugs and
+    its unfixed vulnerabilities. Pinning without anything to raise the pins trades a
+    moving reference for a stale one, so the two belong together: Dependabot rewrites
+    the hash and the version comment beside it.
+    """
+    config = WORKFLOWS[0].parent.parent / "dependabot.yml"
+    assert config.exists(), "nothing raises the commit pins this repo now requires"
+    text = config.read_text()
+    assert "github-actions" in text
+    assert "interval" in text
+
+
 def test_the_publish_job_asks_for_the_token_it_needs_and_no_more():
     """The workflow's default permissions are the repository's, which is more than a
     release needs; the publish job asks for id-token itself."""
