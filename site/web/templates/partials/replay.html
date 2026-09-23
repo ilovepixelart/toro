@@ -19,15 +19,15 @@
           <span class="inline-block w-1.5 h-1.5 rounded-full bg-{{ tone }}"></span>{{ label }}
         </div>
         <div class="text-3xl font-semibold tabular-nums mt-1.5 text-{{ tone }}"
-             data-r="{{ key }}">{{ first[key] }}</div>
+             data-r="{{ key }}">{{ first.counts[key] }}</div>
       </div>
     {% endfor %}
   </div>
 
   <div class="border-t border-line px-5 py-3 flex flex-wrap items-center gap-2">
     <span class="label">workers</span>
-    <span class="chip" data-r="workers">worker-1 &middot; worker-2</span>
-    <span class="chip ml-auto font-mono" data-r="totals">0 completed &middot; 0 failed</span>
+    <span class="chip" data-r="workers">{{ first.workers | join(' · ') }}</span>
+    <span class="chip ml-auto font-mono" data-r="totals">{{ first.totals.completed }} completed &middot; {{ first.totals.failed }} failed</span>
   </div>
   <div class="border-t border-line px-5 py-2 font-mono text-xs text-accent" data-r="note" hidden></div>
 </div>
