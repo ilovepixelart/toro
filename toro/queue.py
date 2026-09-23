@@ -678,10 +678,15 @@ class Queue:
 
         A reader, not a collector: both halves come from Redis at scrape time, so N
         replicas scraped independently report the same numbers and no background task
-        has to be running for the figures to be right. The depth half is `counts()`,
-        so a scraper and a dashboard can never disagree about what a state holds.
+        has to be running for the figures to be right. The depth half is `counts()`:
+        every job in the state it is in, which is not what a dashboard's tab badges
+        count (those are flow roots, with parked parents folded into active).
         """
-        return render(self.name, await self.lifetime_totals(), await self.counts())
+        # Depth first, counters second: the two reads have an await between them, and
+        # a job that finishes in the gap must show in the counter rather than only in
+        # the gauge. Depth above its own counter is impossible in the data.
+        depths = await self.counts()
+        return render(self.name, await self.lifetime_totals(), depths)
 
     async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
         """Fetch the last `minutes` per-minute metric buckets, oldest first, in

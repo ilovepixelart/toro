@@ -220,6 +220,37 @@ async def test_metrics_text_reports_the_queue_a_scraper_would_see(q, run_worker,
     assert text.endswith("# EOF\n")
 
 
+async def test_a_scrape_never_shows_depth_its_counters_have_not_caught_up_to(
+    q, run_worker, monkeypatch
+):
+    """The two halves of a scrape are two reads with an await between them, so a job
+    can finish inside the gap. Depth is read first, which makes the counter the
+    fresher of the two: the other order publishes one completed job in the gauge and
+    a zero beside it in the counter, which is impossible in the data."""
+
+    async def proc(job):
+        return job.name
+
+    real_counts = q.counts
+
+    async def counts_then_finish_a_job():
+        depths = await real_counts()
+        async with run_worker(q, proc):  # the gap between the two reads
+            await q.add("late", {})
+            for _ in range(500):  # polled through the real method: the patched one is us
+                if (await real_counts())["completed"] >= 1:
+                    break
+                await asyncio.sleep(0.02)
+        return depths
+
+    monkeypatch.setattr(q, "counts", counts_then_finish_a_job)
+
+    text = await q.metrics_text()
+
+    assert f'toro_jobs_total{{queue="{q.name}",outcome="completed"}} 1' in text
+    assert f'toro_queue_depth{{queue="{q.name}",state="completed"}} 0' in text
+
+
 async def test_lifetime_totals_are_readable_on_their_own(q):
     """A dashboard serving several queues needs the numbers, not one queue's rendered
     text: concatenating renders would declare every family twice. So the totals are
