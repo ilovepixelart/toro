@@ -61,11 +61,25 @@ executor is shared process-wide and sized `min(32, cpu + 4)`, so a worker with m
 slots than that would queue sync jobs behind a pool it does not control, each waiting
 job holding its lock while it waits.
 
-Two things a thread cannot do. It cannot be cancelled: `cancel_job()` on a running
-sync job ends the **job** at once, and the work carries on to its own end, so a sync
-processor should check `job.id` against something it can act on if that matters.
-And it cannot be interrupted at shutdown: `stop()` drops sync jobs that have not
-started and lets the running ones finish.
+**A thread cannot be interrupted**, and everything else follows from that.
+
+`cancel_job()` on a running sync job records the request and the job ends `cancelled`
+when its processor returns, not before. The alternative would be worse than the wait:
+freeing the slot while the thread ran on would leave the worker with more slots than
+its pool has threads (the next job claimed, locked, renewed, and not running), and the
+terminal state would hand on the job's `concurrency_key` while the work holding it
+carried on. So a sync processor that must stop early has to check something itself.
+
+`stop()` is the same story. In-flight sync jobs get the grace period like any other,
+and one that outlasts it is left to the stalled sweep, because its thread cannot be
+taken back. **The process cannot exit while that thread runs**: Python joins pool
+threads at interpreter exit, so a 10-minute sync job means a 10-minute exit, whatever
+the container's termination grace says. Bound the work, or make it interruptible.
+
+**The `Job` runtime API is async**, so `await job.update_progress(...)`,
+`job.log(...)` and the flow helpers are not available inside a sync processor: a flow
+parent needs an `async def`. Everything the queue itself does (retries, failure,
+metrics, retention) is identical for both kinds.
 
 A processor that is neither a plain `def` nor an `async def` (a decorated one, a
 callable object) is read off its `__call__`. If that reading is wrong and the call

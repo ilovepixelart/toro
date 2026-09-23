@@ -67,6 +67,12 @@ jobs:
       - name: Tests (unit + integration)
         run: uv run pytest -m "unit or integration" --cov=toro --cov-report=xml
 
+      # The perf matrix is not run here (wall-clock numbers from a shared runner say
+      # nothing), but its own guard is: it is one small cell, and it is what stops the
+      # harness rotting into a measurement of nothing.
+      - name: Perf harness guard
+        run: uv run pytest -m perf
+
       # Runs only when SONAR_TOKEN is set (skipped on forks / before setup, so the
       # check stays green), and only once per matrix - one coverage upload.
       # Config is passed inline; there is no sonar-project.properties.

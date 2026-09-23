@@ -8,7 +8,14 @@ Nothing breaks. Three things are new.
 
 A plain `def` processor now runs in a thread instead of raising `TypeError` after
 running inside the event loop. If you were relying on that error, you were relying on
-a bug. See [Processing](processing.md).
+a bug. Two consequences worth knowing before you switch a processor over: cancelling
+a sync job waits for its thread (the job ends `cancelled` when the work does), and the
+process cannot exit while a sync job is running. See [Processing](processing.md).
+
+A processor whose return value is not JSON now fails its job, with the encoder's
+message as the reason. It used to escape the commit and leave the job `active` until
+the stalled sweep re-ran it, which mattered most for test suites using mock
+processors.
 
 A watchdog warns when a processor blocks the event loop for longer than half the lock
 renewal interval, naming the jobs in flight. It is on by default, because the failure

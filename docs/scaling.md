@@ -43,9 +43,9 @@ is the right answer for a library with no async version: the thread blocks, the 
 does not.
 
 It is the wrong answer for CPU-bound work. Threads share the GIL, so four threads
-computing do not compute four times faster, and a thread cannot be cancelled: a
-`cancel_job()` ends the job while the work runs on, and `stop()` cannot interrupt it
-either. For CPU-bound work, either hand it out of the process yourself:
+computing do not compute four times faster, and a thread cannot be taken back: a
+`cancel_job()` waits for it, `stop()` cannot interrupt it, and the process cannot even
+exit until it returns. For CPU-bound work, either hand it out of the process yourself:
 
 ```python
 POOL = ProcessPoolExecutor()                  # once, at import: building one per job

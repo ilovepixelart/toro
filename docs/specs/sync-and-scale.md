@@ -20,8 +20,10 @@ that blocks the loop anyway is reported, by name, before the lock it holds expir
 ## Design
 
 - **Decide by inspection, once, at construction.** `asyncio.iscoroutinefunction`
-  (which sees through `functools.partial`) picks the arm, plus the same question of
-  `__call__` for a callable object, which is the shape a class-based processor takes.
+  picks the arm, plus the same question of `__call__` for a callable object, which is
+  the shape a class-based processor takes. A `functools.partial` is unwrapped by hand
+  first: `iscoroutinefunction` sees through one, but the `__call__` fallback would
+  then ask the partial about its own.
   Calling the processor to find out what it returns would run a sync one inside the
   loop, which is the thing being avoided.
 - **An awaitable result is awaited anyway.** If the inspection is wrong (a decorator
@@ -35,12 +37,16 @@ that blocks the loop anyway is reported, by name, before the lock it holds expir
   waiting for a thread holds its lock while waiting. The worker owns a
   `ThreadPoolExecutor(max_workers=concurrency)`, created on the first sync job so an
   all-async worker pays nothing, and shut down in `stop()`.
-- **A sync processor cannot be cancelled.** A thread is not a task: `cancel()` raises
-  in the awaiting coroutine and the thread runs on. Cancelling a sync job therefore
-  commits `cancelled` while the work continues, and a thread still running at
-  interpreter exit holds it open (executor threads are joined at exit). Inherent, the
-  same reason a CPU-bound processor was out of scope in `cancel.md`; pinned by a test
-  and documented where people meet it rather than papered over.
+- **A sync processor cannot be cancelled, so cancelling one waits for it.** A thread
+  is not a task: cancelling the await would raise in the coroutine and leave the
+  thread running. That frees the worker's slot while the pool has one thread fewer
+  than it has slots (the next job is then claimed, locked and renewed while sitting
+  unstarted), and commits a terminal state that hands on the job's concurrency key
+  while the work that holds it carries on. A sync cancellation is therefore recorded
+  and not interrupted: the job ends `cancelled` when its thread returns, which is the
+  only moment at which capacity and keys are honestly free. A thread still running at
+  interpreter exit holds the process open (executor threads are joined at exit), which
+  is inherent and documented where people meet it.
 - **The detector measures the loop, not the processor.** A watchdog task sleeps a
   known interval and compares elapsed wall clock against it: the difference is how
   long the loop could not run anything. Nothing needs instrumenting, and it sees every
@@ -59,12 +65,12 @@ that blocks the loop anyway is reported, by name, before the lock it holds expir
 |---|---|---|
 | SS-001 | A sync processor runs to completion and its return value is the job's result, with the loop free throughout: a concurrent heartbeat keeps its cadence while a sync job sleeps. | `tests/integration/test_sync_processors.py::test_a_sync_processor_does_not_block_the_loop` |
 | SS-002 | Sync and async processors are the same everywhere else: retries, failure, cancellation state, flow settling, metrics. | `::test_a_sync_processor_is_a_processor` |
-| SS-003 | The threads are bounded by `concurrency` and owned by the worker: `stop()` leaves none running, and an all-async worker never creates a pool. | `::test_the_pool_is_the_workers_and_bounded`, `::test_an_async_worker_starts_no_threads` |
-| SS-004 | Cancelling a sync job commits `cancelled`, and the test says plainly that the thread keeps running. | `::test_cancelling_a_sync_job_cannot_stop_the_thread` |
-| SS-005 | A processor that blocks the loop past the threshold warns once, naming the jobs in flight, and a merely busy loop does not warn. | `tests/integration/test_blocked_loop.py::test_a_blocking_processor_is_named`, `::test_a_busy_loop_is_not_a_blocked_one` |
-| SS-006 | The detector is one timer per worker and costs nothing measurable when nothing blocks. | measured, as commands and wall clock |
-| SS-007 | A processor that is neither (a callable object with an async `__call__`, a partial) is detected correctly, and a misdetected one still produces the right result. | `tests/unit/test_processor_kind.py` |
-| SS-008 | A perf suite axis with checked-in baselines: loop choice against task factory against pipelining. | `tests/perf/`, baselines committed |
+| SS-003 | The threads are bounded by `concurrency` and owned by the worker: `stop()` leaves none running, and an all-async worker never creates a pool. | `::test_a_sync_worker_reports_its_concurrency`, `::test_sync_jobs_run_side_by_side`, `::test_the_pool_is_given_back_when_the_worker_stops`, `::test_an_async_worker_starts_no_threads` |
+| SS-004 | Cancelling a sync job records the request and ends the job `cancelled` when its thread returns, keeping its slot and its concurrency key until then. | `::test_cancelling_a_sync_job_ends_it_when_its_thread_does`, `::test_a_cancelled_sync_job_keeps_the_slot_its_thread_still_holds`, `::test_cancelling_a_sync_job_does_not_hand_its_key_on_early` |
+| SS-005 | A processor that blocks the loop past the threshold warns once, naming the jobs in flight; a merely busy loop, and an idle one, do not. | `tests/integration/test_blocked_loop.py::test_a_blocking_processor_is_named`, `::test_a_run_of_blocking_jobs_still_warns_once`, `::test_a_busy_loop_is_not_a_blocked_one`, `::test_an_idle_worker_never_warns` |
+| SS-006 | The detector is one timer per worker and costs nothing measurable when nothing blocks. | measured: one `asyncio.sleep` per tick, at most one per second, and no Redis command at all. The same 2,000-job cell, median of three runs each: 8,703 jobs/s with it off, 8,710 with it on (1.001x), against a run-to-run spread of 8%. |
+| SS-007 | A processor that is neither (a callable object with an async `__call__`, a partial, a partial around one) is detected correctly, and a misdetected one still produces the right result. | `tests/unit/test_processor_kind.py`, `tests/integration/test_sync_processors.py::test_a_processor_whose_kind_was_misread_still_returns_its_value` |
+| SS-008 | A perf suite axis with checked-in baselines: loop choice against task factory against pipelining, each cell the median of three runs with its spread beside it. | `tests/perf/harness.py`, `tests/perf/baselines.json`, guarded by `tests/perf/test_harness.py` |
 
 ## Out of scope
 
