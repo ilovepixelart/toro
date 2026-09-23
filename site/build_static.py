@@ -8,6 +8,7 @@ does a GET for HTML - is written out as files and keeps working.
 from __future__ import annotations
 
 import pathlib
+import re
 import shutil
 import sys
 
@@ -36,9 +37,10 @@ def main() -> None:
     env.globals["asset_v"] = lambda: 1
     env.globals["static"] = True
     env.globals["base"] = BASE
-    # No demo instance is deployed yet, so nothing links to one. When there is,
-    # this becomes its URL and the dashboard links point at it.
-    env.globals["demo_url"] = "https://github.com/ilovepixelart/toro#readme"
+    # Nothing links to a demo until one is deployed: a dead link is worse than no
+    # link. The static page sends people to the docs instead.
+    env.globals["docs_url"] = "https://github.com/ilovepixelart/toro/tree/main/docs"
+    env.globals["matador_url"] = "https://github.com/ilovepixelart/matador"
 
     counts = {"wait": 0, "active": 2, "completed": 128, "failed": 3}
     common = {
@@ -60,8 +62,36 @@ def main() -> None:
     shutil.copytree(HERE / "web" / "static", DIST / "assets")
     files = sorted(p.relative_to(DIST).as_posix() for p in DIST.rglob("*") if p.is_file())
     print(f"wrote {len(files)} files to dist/")
-    for f in files[:12]:
-        print("  ", f)
+    _verify(files)
+
+
+def _verify(files: list[str]) -> None:
+    """Fail the build on a link that goes nowhere.
+
+    A static site has no server to notice a 404, and the one thing worse than a
+    missing page is a published page that quietly points at one. This runs on
+    every build so nobody has to remember to check.
+    """
+    known = {f"{BASE}/{f}" for f in files} | {f"/{f}" for f in files}
+    broken: list[str] = []
+    placeholders: list[str] = []
+    for page in DIST.rglob("*.html"):
+        html = page.read_text()
+        for url in re.findall(r'(?:href|src|hx-get|hx-post)="([^"]+)"', html):
+            if url.startswith(("http://", "https://", "data:", "#", "mailto:")):
+                if "example.com" in url or "demo.example" in url:
+                    placeholders.append(f"{page.name}: {url}")
+                continue
+            if url.split("?")[0] not in known:
+                broken.append(f"{page.name}: {url}")
+    for label, found in (("broken local links", broken), ("placeholder URLs", placeholders)):
+        if found:
+            print(f"\n{label}:")
+            for item in sorted(set(found)):
+                print("   ", item)
+    if broken or placeholders:
+        raise SystemExit(1)
+    print(f"verified: every local link resolves, no placeholder URLs ({len(files)} files)")
 
 
 main()
