@@ -1036,7 +1036,11 @@ local function removeTree(jobId)
     for _, cid in ipairs(cjson.decode(meta[1])) do removeTree(cid) end
   end
 end
-local existed = redis.call("EXISTS", base .. ARGV[1])
+-- What a key IS, not what it is called: a job id arrives from a URL and a job hash
+-- lives beside the queue's own keys, so `totals`, `meta` or `worker:<token>` would
+-- otherwise be removable by asking to remove a job. Every job carries its options.
+local existed = redis.call("HEXISTS", base .. ARGV[1], "opts")
+if existed == 0 then return 0 end
 local parentId = redis.call("HGET", base .. ARGV[1], "parentId")
 removeTree(ARGV[1])
 if parentId then
