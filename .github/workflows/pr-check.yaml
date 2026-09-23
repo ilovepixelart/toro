@@ -67,6 +67,12 @@ jobs:
       - name: Type check (ty)
         run: uv run ty check
 
+      # The workflows are code too, and the rules this repo enforces about them in
+      # tests are only the rules somebody thought to write down.
+      - name: Audit workflows (zizmor)
+        if: matrix.python-version == '3.13'
+        run: uv run zizmor --config .github/zizmor.yml .github/workflows
+
       - name: Tests (unit + integration)
         run: uv run pytest -m "unit or integration" --cov=toro --cov-report=xml
 

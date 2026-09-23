@@ -63,6 +63,7 @@ dev = [
     # the perf matrix measures the loop as an axis; toro itself never imports it
     "uvloop>=0.21; sys_platform != 'win32'",
     "ty>=0.0.47",
+    "zizmor>=1.30",        # audits the workflows themselves
 ]
 
 [tool.uv]
