@@ -116,10 +116,11 @@ app.mount(
   <div class="{{ pad }}">
     {{ codepane('run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
     <p class="mt-3 text-muted max-w-[64ch]">
-      This page with a live queue behind it: two workers, jobs arriving continuously, and the
-      dashboard mounted at <span class="font-mono text-sm">/dashboard</span>. Stop a worker and its
-      jobs stay in <span class="font-mono text-sm">active</span> until their locks expire, then
-      toro's stalled sweep hands them to the surviving worker and they finish.
+      These commands start this page with a working queue behind it: two workers, a continuous
+      stream of jobs, and the dashboard mounted at
+      <span class="font-mono text-sm">/dashboard</span>. Stopping a worker leaves its jobs in
+      <span class="font-mono text-sm">active</span> until their locks expire, after which the
+      stalled sweep reassigns them to the surviving worker.
     </p>
   </div>
 </section>
