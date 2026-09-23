@@ -95,7 +95,11 @@ app.mount(
 
       <div class="mt-8 flex flex-wrap items-center gap-2">
         <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">View on GitHub</a>
-        <a class="btn btn-ghost" href="{{ demo_url | default('/dashboard') }}">Open the live demo</a>
+        {% if static | default(false) %}
+          <a class="btn btn-ghost" href="{{ docs_url }}">Read the docs</a>
+        {% else %}
+          <a class="btn btn-ghost" href="/dashboard">Open the live demo</a>
+        {% endif %}
       </div>
       <div class="mt-3 flex items-center gap-3 font-mono text-sm text-muted">
         <span class="select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
@@ -217,8 +221,11 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
           ('Live without a socket', 'Server-sent events from one shared Redis subscription, released when the last viewer leaves.'),
         ], 'max-w-[60ch]') }}
       </div>
-      <a href="{{ demo_url | default('/dashboard') }}"
-         class="card ring-1 ring-line block overflow-hidden group transition-colors hover:ring-accent/40">
+      {# A link only when there is something to open: on the static page this is a
+         picture of the dashboard, not a door to one. #}
+      <{{ 'div' if static | default(false) else 'a' }}
+         {%- if not static | default(false) %} href="/dashboard"{% endif %}
+         class="card ring-1 ring-line block overflow-hidden group{{ ' transition-colors hover:ring-accent/40' if not static | default(false) }}">
         <span class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
           <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
           <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
@@ -228,10 +235,15 @@ cd toro/site &amp;&amp; uv run uvicorn web.app:app --port 8100</code></pre>
         <img src="{{ base | default('') }}/assets/dashboard.png" alt="The matador dashboard showing a queue's jobs, states and throughput"
              class="w-full block" loading="lazy" />
         <span class="flex items-center justify-between px-4 py-3 border-t border-line text-sm">
-          <span class="text-muted">This, but live, with the jobs from this page</span>
-          <span class="text-accent font-medium group-hover:underline">Open the demo &rarr;</span>
+          {% if static | default(false) %}
+            <span class="text-muted">matador, reading a toro queue</span>
+            <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">matador on GitHub &rarr;</a>
+          {% else %}
+            <span class="text-muted">This, but live, with the jobs from this page</span>
+            <span class="text-accent font-medium group-hover:underline">Open the demo &rarr;</span>
+          {% endif %}
         </span>
-      </a>
+      </{{ 'div' if static | default(false) else 'a' }}>
     </div>
   </div>
 </section>

@@ -24,7 +24,11 @@
       <span class="text-accent font-semibold tracking-tight text-base">toro</span>
       <span class="chip border border-line rounded px-1.5 py-px font-mono">1.0.0</span>
       <nav class="ml-auto flex items-center gap-6 text-sm">
-        <a class="text-muted hover:text-fg transition-colors" href="{{ demo_url | default('/dashboard') }}">Demo</a>
+        {% if static | default(false) %}
+          <a class="text-muted hover:text-fg transition-colors" href="{{ docs_url }}">Docs</a>
+        {% else %}
+          <a class="text-muted hover:text-fg transition-colors" href="/dashboard">Demo</a>
+        {% endif %}
         <a class="text-muted hover:text-fg transition-colors" href="https://github.com/ilovepixelart/toro">GitHub</a>
         <a class="text-muted hover:text-fg transition-colors" href="https://pypi.org/project/toro-queue/">PyPI</a>
         <button type="button" title="Toggle theme"
@@ -56,7 +60,7 @@
       <nav class="flex flex-wrap gap-x-6 gap-y-2 text-sm">
         <a class="text-muted hover:text-fg" href="https://github.com/ilovepixelart/toro">toro</a>
         <a class="text-muted hover:text-fg" href="https://github.com/ilovepixelart/matador">matador</a>
-        <a class="text-muted hover:text-fg" href="{{ demo_url | default('/dashboard') }}">Demo</a>
+        <a class="text-muted hover:text-fg" href="{{ docs_url if static | default(false) else '/dashboard' }}">{{ 'Docs' if static | default(false) else 'Demo' }}</a>
         <a class="text-muted hover:text-fg" href="https://pypi.org/project/toro-queue/">PyPI</a>
       </nav>
     </div>
