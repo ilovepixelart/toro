@@ -57,8 +57,8 @@ def test_the_workflows_are_linted_by_something():
     """Everything above is a rule about these files that only this suite enforces,
     and this suite only knows the rules it was told. zizmor knows the ones nobody
     here has thought of yet, so it runs where the other checks run."""
-    ci = next(w for w in WORKFLOWS if w.name != "release.yml")
-    assert "zizmor" in ci.read_text(), "nothing audits the workflows themselves"
+    audited = [w.name for w in WORKFLOWS if "zizmor" in w.read_text()]
+    assert audited, "nothing audits the workflows themselves"
 
 
 def _jobs(workflow: pathlib.Path) -> dict[str, str]:

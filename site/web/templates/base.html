@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en" class="[color-scheme:light] [&.dark]:[color-scheme:dark]">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="htmx-config" content='{"selfRequestsOnly": true, "historyCacheSize": 0, "allowEval": false, "allowScriptTags": false}' />
+  <title>{% block title %}toro{% endblock %}</title>
+  <meta name="description" content="An async-first, Redis-backed job queue for Python. Atomic Lua state changes, per-job locks, and a dashboard you mount into your own app." />
+  {# theme before paint, the same rule matador uses #}
+  {# Dark unless the visitor has chosen otherwise. Applied before paint so the
+     page never flashes light first. #}
+  <script>(function () {
+    if (localStorage.toroTheme !== 'light') document.documentElement.classList.add('dark');
+  })();</script>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><text y=%2213%22 font-size=%2213%22>%F0%9F%90%82</text></svg>" />
+  {% set v = asset_v() %}
+  <link rel="stylesheet" href="{{ base | default('') }}/assets/app.css?v={{ v }}" />
+  <link rel="stylesheet" href="{{ base | default('') }}/assets/code.css?v={{ v }}" />
+  <script src="{{ base | default('') }}/assets/js/htmx.min.js?v={{ v }}" defer></script>
+</head>
+<body class="bg-ink text-fg antialiased selection:bg-accent/25">
+  <header class="border-b border-line bg-panel/40 backdrop-blur sticky top-0 z-20">
+    <div class="w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24 h-14 flex items-center gap-3">
+      <span class="text-accent font-semibold tracking-tight text-base">toro</span>
+      <span class="chip border border-line rounded px-1.5 py-px font-mono">1.0.0</span>
+      <nav class="ml-auto flex items-center gap-6 text-sm">
+        <a class="text-muted hover:text-fg transition-colors" href="{{ demo_url | default('/dashboard') }}">Dashboard</a>
+        <a class="text-muted hover:text-fg transition-colors" href="https://github.com/ilovepixelart/toro">GitHub</a>
+        <a class="text-muted hover:text-fg transition-colors" href="https://pypi.org/project/toro-queue/">PyPI</a>
+        <button type="button" title="Toggle theme"
+                class="btn btn-ghost p-2 text-muted hover:text-fg"
+                onclick="document.documentElement.classList.toggle('dark');localStorage.toroTheme=document.documentElement.classList.contains('dark')?'dark':'light'">
+          {# the same two Heroicons matador uses, swapped by the dark variant #}
+          <svg class="w-4 h-4 hidden dark:block" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z"/>
+          </svg>
+          <svg class="w-4 h-4 dark:hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.72 9.72 0 0 1 18 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 0 0 3 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 0 0 9.002-5.998Z"/>
+          </svg>
+          <span class="sr-only">Toggle theme</span>
+        </button>
+      </nav>
+    </div>
+  </header>
+  <main>{% block body %}{% endblock %}</main>
+  <footer class="border-t border-line">
+    <div class="w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24 py-12 grid sm:grid-cols-[minmax(0,1fr)_auto] gap-6 items-start">
+      <div>
+        <p class="text-sm font-medium">toro <span class="text-muted font-normal">&middot; a job queue for Python</span></p>
+        <p class="mt-1 text-sm text-muted max-w-[52ch]">
+          This page is served by FastAPI and htmx, and the queue on it is a real toro queue on a
+          real Redis. Both packages are installed from PyPI, so the page working is a test that
+          the published releases do.
+        </p>
+      </div>
+      <nav class="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+        <a class="text-muted hover:text-fg" href="https://github.com/ilovepixelart/toro">toro</a>
+        <a class="text-muted hover:text-fg" href="https://github.com/ilovepixelart/matador">matador</a>
+        <a class="text-muted hover:text-fg" href="{{ demo_url | default('/dashboard') }}">Dashboard</a>
+        <a class="text-muted hover:text-fg" href="https://pypi.org/project/toro-queue/">PyPI</a>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>

@@ -44,7 +44,7 @@ build-backend = "hatchling.build"
 # gets, and it is published forever. It carries the package, its tests, its docs and
 # its benchmarks - enough to build it and check it. It does not carry how this
 # repository is worked on.
-exclude = [".github", ".vscode", ".pre-commit-config.yaml"]
+exclude = [".github", ".vscode", ".pre-commit-config.yaml", "site"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["toro"]
