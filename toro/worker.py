@@ -40,9 +40,25 @@ from .job import Backoff, Job, JobContext
 from .keys import Keys
 from .scheduler import next_run
 
-Processor = Callable[[Job], Awaitable[Any]]
+# A processor is awaited when it is a coroutine function and run in a thread when it
+# is not, so both shapes are the public contract.
+Processor = Callable[[Job], Awaitable[Any] | Any]
 
 logger = logging.getLogger(__name__)
+
+
+def _is_async(processor: Processor) -> bool:
+    """Whether this processor is awaited or handed to a thread.
+
+    Asked by inspection rather than by calling it: calling a sync processor to see
+    what comes back would run it inside the event loop, which is what running it in a
+    thread exists to avoid. `asyncio.iscoroutinefunction` sees through a
+    `functools.partial`; a class-based processor answers for its `__call__`.
+    """
+    if asyncio.iscoroutinefunction(processor):
+        return True
+    call = getattr(processor, "__call__", None)  # noqa: B004
+    return call is not None and bool(asyncio.iscoroutinefunction(call))
 
 
 class RateLimit(TypedDict):
