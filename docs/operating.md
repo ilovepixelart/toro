@@ -26,8 +26,8 @@ text = render_all({q.name: (await q.lifetime_totals(), await q.counts()) for q i
 
 | Sample | Type | Labels | Meaning |
 |---|---|---|---|
-| `toro_jobs_total` | counter | `queue`, `outcome` | Jobs by outcome since the queue was created. |
-| `toro_job_duration_ms_total` | counter | `queue` | Processing time of finished jobs, in ms. |
+| `toro_jobs_total` | counter | `queue`, `outcome` | Jobs by outcome since the queue was created. Counted when a job is done with, not per attempt: a job that fails three times and gives up is one `failed`. |
+| `toro_job_duration_ms_total` | counter | `queue` | Processing time of finished jobs, in ms. The attempt that ended the job; time spent on attempts that were retried is not in it. |
 | `toro_queue_depth` | gauge | `queue`, `state` | Jobs currently in each state. |
 
 Those are the names you query. The counter *families* are `toro_jobs` and
@@ -52,13 +52,19 @@ when a job fails makes `rate()` start from nothing at that instant.
 ## What it costs
 
 The totals are written in the same atomic step as the transition they count, so a
-scraped counter can never disagree with the state change. That is two more Redis
-commands per job (30.4 to 32.5 measured over 2,000 jobs), all of them inside scripts
-that already run, so there are no extra round trips.
+counter can never disagree with the state change that produced it. That is three more
+Redis commands per job: one when it is added, two when it finishes (the outcome and
+its duration). Measured over 2,000 jobs: 10.0 to 11.0 commands per enqueue, 30.1 to
+32.1 per job processed, with throughput unchanged either side. All of them run inside
+scripts that already run, so none is a round trip.
 
 Scraping itself reads Redis at scrape time and keeps no state in the process, so N
 replicas scraped independently report the same numbers and none of them has to be
-running for the figures to be right.
+running for the figures to be right. The two halves are two reads: depth first, then
+the counters, so a job finishing between them shows in the counter rather than only
+in the gauge. A gauge can therefore sit one job behind its own counter for the length
+of a scrape; the other order would publish depth a counter had never seen, which is
+impossible in the data.
 
 ## A read-only dashboard
 
@@ -67,7 +73,7 @@ the dashboard has no identity of its own and whatever the host app authenticates
 is what arrives:
 
 ```python
-app.mount("/queues", create_app(["emails"], can_mutate=lambda r: r.user.is_admin))
+app.mount("/queues", create_app(["emails"], can_mutate=lambda r: r.state.role == "admin"))
 ```
 
 Every state-changing request is refused, and the controls are not drawn at all: a
