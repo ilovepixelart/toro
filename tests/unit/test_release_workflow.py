@@ -40,6 +40,38 @@ def test_the_publish_action_is_pinned_to_a_release():
     )
 
 
+def _jobs(workflow: pathlib.Path) -> dict[str, str]:
+    """Split a workflow into its jobs. Regex rather than a YAML parser because that
+    is one more dependency than this check is worth, and the indentation here is not
+    in question."""
+    text = workflow.read_text()
+    body = text[text.index("\njobs:") :]
+    chunks = re.split(r"\n  (?=[\w-]+:\n)", body)
+    return {chunk.split(":", 1)[0].strip(): chunk for chunk in chunks[1:]}
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_every_job_gives_up_eventually(workflow: pathlib.Path):
+    """A hosted job runs for six hours before GitHub stops it, and these finish in
+    about three minutes. A wedged service container or a deadlocked test would
+    otherwise hold a runner all afternoon, once per matrix cell."""
+    jobs = _jobs(workflow)
+    assert jobs, f"found no jobs in {workflow.name}"
+    forever = [name for name, body in jobs.items() if "timeout-minutes:" not in body]
+    assert forever == [], f"these run until GitHub stops them: {forever}"
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_no_checkout_leaves_its_credentials_in_the_workspace(workflow: pathlib.Path):
+    """actions/checkout writes a token into .git/config and leaves it there for the
+    rest of the job, where anything that packages the directory can carry it out."""
+    text = workflow.read_text()
+    checkouts = text.count("uses: actions/checkout@")
+    assert checkouts == text.count("persist-credentials: false"), (
+        f"{workflow.name}: a checkout keeps its credentials"
+    )
+
+
 def test_something_keeps_the_pinned_commits_current():
     """A commit pin freezes the action at that commit, including its unfixed bugs and
     its unfixed vulnerabilities. Pinning without anything to raise the pins trades a

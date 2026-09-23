@@ -23,6 +23,9 @@ jobs:
   check:
     name: Lint, types, tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The suite takes about three minutes; a hosted job that hangs holds a runner
+    # for six hours, once per matrix cell.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
