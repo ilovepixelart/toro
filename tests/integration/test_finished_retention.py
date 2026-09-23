@@ -42,10 +42,15 @@ async def _seed_finished(q: Queue, state: str, n: int) -> None:
 async def _finish_one(q: Queue, **opts) -> None:
     """One real claim and completion, straight through the scripts, of a job added
     with the given options - one finish at a time, so each trim can be counted."""
+    job = await q.add("bench", {}, **opts)
+    await _claim_and_complete(q, job.id)
+
+
+async def _claim_and_complete(q: Queue, job_id: str) -> None:
+    """Claim and complete a job that already exists, whatever its stored options."""
     token = uuid.uuid4().hex
     acquire = q.redis.register_script(scripts.MOVE_TO_ACTIVE)
     complete = q.redis.register_script(scripts.MOVE_TO_COMPLETED)
-    job = await q.add("bench", {}, **opts)
     now = int(time.time() * 1000)
     res = await acquire(
         keys=[
@@ -60,13 +65,13 @@ async def _finish_one(q: Queue, **opts) -> None:
         ],
         args=[token, 30_000, now, 0, 0, 0],
     )
-    assert res and res[1] == job.id
+    assert res and res[1] == job_id
     out = await complete(
         keys=[
             q.keys.active,
             q.keys.completed,
-            q.keys.job(job.id),
-            q.keys.lock(job.id),
+            q.keys.job(job_id),
+            q.keys.lock(job_id),
             q.keys.prioritized,
             q.keys.marker,
             q.keys.stalled,
@@ -77,7 +82,7 @@ async def _finish_one(q: Queue, **opts) -> None:
             q.keys.limiter,
         ],
         args=scripts.completed_args(
-            job_id=job.id,
+            job_id=job_id,
             returnvalue="null",
             now=now,
             token=token,
@@ -329,13 +334,25 @@ async def _stall_out(q: Queue, w: Worker, **opts) -> str:
 
 
 @pytest.mark.parametrize("option", [2.9, {"count": 2.9}, {"count": 2.9, "age": 86_400 * 2}])
-async def test_a_fractional_count_is_a_whole_rank(q, option):
-    """A rank command takes integers only. A count that reached ZREMRANGEBYRANK as
-    2.9 raised inside the finish script, after the finish had committed: no event,
-    no metrics, no trim, and a flow child would never settle its parent."""
-    await _seed_finished(q, "completed", 5)
+async def test_a_fractional_count_is_refused_at_the_door(q, option):
+    """A rank command takes integers only, so 2.9 is not a bound anyone can enforce.
+    It used to reach ZREMRANGEBYRANK and raise INSIDE the finish script, after the
+    finish had committed: no event, no metrics, no trim, and a flow child that never
+    settled its parent. Now it never gets that far."""
+    with pytest.raises(ValueError, match="remove_on_complete"):
+        await q.add("j", {}, remove_on_complete=option)
 
-    await _finish_one(q, remove_on_complete=option)
+
+async def test_a_fractional_count_already_in_redis_is_a_whole_rank(q):
+    """The guard inside the script stays, because a job enqueued by an older version
+    can still be holding 2.9 when this one finishes it."""
+    await _seed_finished(q, "completed", 5)
+    job = await q.add("bench", {})
+    opts = json.loads(await q.redis.hget(q.keys.job(job.id), "opts"))
+    opts["removeOnComplete"] = 2.9  # what 0.x would have written
+    await q.redis.hset(q.keys.job(job.id), "opts", json.dumps(opts))
+
+    await _claim_and_complete(q, job.id)
 
     assert await q.redis.zcard(q.keys.completed) == 2
 

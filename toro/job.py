@@ -72,6 +72,57 @@ def key_segment(value: object, what: str) -> str | None:
     return value
 
 
+def _whole(value: object, what: str, *, minimum: int = 0) -> int:
+    """Return a count of milliseconds, attempts or priority as a whole number.
+
+    The Lua `tonumber()`s these after it has already written, so a value that is not
+    a number aborts a script mid-way and leaves a job no API can reach. bool is an
+    int subclass and is rejected by name: `attempts=True` would silently mean 1.
+    """
+    if isinstance(value, bool):  # an int subclass: `attempts=True` would mean 1
+        msg = f"{what} must be a whole number >= {minimum}, not {value!r}"
+        raise ValueError(msg)  # noqa: TRY004 - an option's shape is a value error here,
+        # as it is for every other option: a caller catching ValueError catches them all
+    # A float that IS whole is a config value that came through arithmetic
+    # (`86_400 / 2`), and refusing it teaches nothing. A fractional one is a mistake
+    # the scripts cannot carry out: a rank is an integer.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if not isinstance(value, int) or value < minimum:
+        msg = f"{what} must be a whole number >= {minimum}, not {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _backoff(value: Backoff) -> Backoff:
+    """`None`, milliseconds, or `{"type": "fixed"|"exponential", "delay": ms}`."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if kind not in ("fixed", "exponential"):
+            msg = f"backoff type must be 'fixed' or 'exponential', not {kind!r}"
+            raise ValueError(msg)
+        return {**value, "delay": _whole(value.get("delay"), "backoff delay")}
+    return _whole(value, "backoff")
+
+
+def _retention(value: RemoveOption, what: str) -> RemoveOption:
+    """`None` (the bounded default), a bool, a count, or `{"count": N, "age": s}`.
+
+    A string here used to mean "keep everything": the Lua reads a number or gives up,
+    so `remove_on_complete="2"` silently disabled the bound it was asking for.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        if not value or set(value) - {"count", "age"}:
+            msg = f"{what} dict takes 'count' and/or 'age', not {sorted(value)}"
+            raise ValueError(msg)
+        return {field: _whole(number, f"{what} {field}") for field, number in value.items()}
+    return _whole(value, what)
+
+
 @dataclass
 class JobOptions:
     """Per-job options (delay, attempts, backoff, priority, auto-removal)."""
@@ -89,6 +140,12 @@ class JobOptions:
         # Validated here rather than in Queue.add, so every way of enqueuing - a job,
         # a flow node, a scheduler template - is covered by construction.
         self.concurrency_key = key_segment(self.concurrency_key, "concurrency_key")
+        self.delay = _whole(self.delay, "delay")
+        self.attempts = _whole(self.attempts, "attempts", minimum=1)
+        self.priority = _whole(self.priority, "priority")
+        self.backoff = _backoff(self.backoff)
+        self.remove_on_complete = _retention(self.remove_on_complete, "remove_on_complete")
+        self.remove_on_fail = _retention(self.remove_on_fail, "remove_on_fail")
 
     def to_dict(self) -> dict[str, Any]:
         return {
