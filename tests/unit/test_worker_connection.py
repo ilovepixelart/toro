@@ -60,6 +60,20 @@ def test_a_caller_provided_connection_on_library_defaults_is_clamped():
         assert w._pop_timeout < library_default
 
 
+def test_a_socket_timeout_that_arrived_as_text_still_sizes_the_pop():
+    """redis-py stores `socket_timeout` exactly as it is handed over, so a client
+    built from configuration carries whatever the config layer produced, and a
+    timeout read from an environment variable is a string. The arithmetic that sizes
+    the blocking pop raises TypeError on one, which is a Worker that cannot be
+    constructed at all: `'5' - 1.0` is not a number.
+    """
+    conn = aioredis.from_url("redis://localhost:6379", decode_responses=True, socket_timeout="5")
+    assert read_timeout(conn) == 5.0
+
+    w = Worker("q", _noop, connection=conn, block_timeout=5.0)
+    assert w._pop_timeout == 4.0
+
+
 def test_a_queue_built_connection_hosts_a_default_worker_quietly(caplog):
     """Sharing the Queue's connection with a Worker is an ordinary setup. At the
     default block_timeout it must neither shorten the pop nor log a warning: a
