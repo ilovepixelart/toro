@@ -538,7 +538,9 @@ local function settleChildGone(base, jobId, parentId, onFail, reason, now, reten
     if state == "cancelled" then
       recordFinished(base .. "cancelled", base .. pid, base, pid, now,
         "cancel", "1", "cancelled")
-      recordMetrics(base, "cancelled", now, 0, retentionMs, pmeta[3])
+      -- no name: the other two cancel paths pass none, and a per-name breakdown
+      -- that only one path fills is read as a breakdown, not as a gap
+      recordMetrics(base, "cancelled", now, 0, retentionMs)
       redis.call("PUBLISH", base .. "events",
         cjson.encode({jobId = tostring(pid), event = "cancelled"}))
     else

@@ -140,6 +140,29 @@ async def test_the_counters_cost_three_commands_a_job(q, run_worker, run_until):
     assert [command.split()[2] for command in seen] == ["added", "completed", "ms"]
 
 
+async def _bucket_fields(q: Queue) -> set[str]:
+    fields: set[str] = set()
+    for key in await q.redis.keys(q.keys.base + "metrics:*"):
+        fields |= set(await q.redis.hkeys(key))
+    return fields
+
+
+async def test_a_cancellation_records_the_same_fields_whichever_path_took_it(q):
+    """Three scripts cancel a job, and the one that cascades a stop upward also wrote
+    a per-name field the other two do not and nothing reads. Partial data is worse
+    than none: a name breakdown missing most of its jobs reads as a breakdown rather
+    than as a gap."""
+    root = await q.add_flow("report", {}, children=[FlowChild("leaf", {}, delay=60_000)])
+    leaf = (await q.get_flow(root.id))["children"][0]["job"].id
+
+    assert await q.cancel_job(leaf) is True  # the stop cascades up to the root
+    solo = await q.add("alone", {})
+    assert await q.cancel_job(solo.id) is True
+
+    per_name = {field for field in await _bucket_fields(q) if field.startswith("cancelled:")}
+    assert per_name == set(), f"one cancel path writes what no other does: {per_name}"
+
+
 async def test_totals_never_expire(q):
     """OP-002: `rate()` reads a counter across restarts, so the key it reads from
     cannot be one that quietly disappears after eight hours."""
