@@ -135,3 +135,69 @@ async def test_a_reader_does_not_stamp_a_queue_it_only_reads(q):
     await reader.get_jobs("wait", 0, 10)
 
     assert await q.redis.hget(q.keys.meta, "model") is None
+
+
+# Everything that only READS. Anything else on the public surface writes, and a write
+# against a data model this library does not understand is the thing the marker
+# exists to stop. A new method has to be classified in one of these two places.
+READS = {
+    "children_results",
+    "counts",
+    "departed_workers",
+    "failed_children",
+    "flow_metrics",
+    "flow_percentiles",
+    "flow_progress",
+    "flow_view",
+    "get_flow",
+    "get_job",
+    "get_jobs",
+    "get_jobs_roots",
+    "get_logs",
+    "is_paused",
+    "latency",
+    "lifetime_totals",
+    "metrics",
+    "metrics_by_name",
+    "metrics_text",
+    "pending",
+    "percentiles",
+    "result",
+    "roots_counts",
+    "schedulers",
+    "search",
+    "close",
+    "workers",  # prunes expired presence records, which is housekeeping, not a write
+}
+
+
+def test_every_write_path_checks_the_data_model():
+    """ON-003: the check covered `add`, `add_flow`, `flush` and `Worker.run`, so
+    `add_scheduler` (a full enqueue path), `clean`, `pause`, `cancel_job` and every
+    other admin write went into a queue whose model they had not read."""
+    import inspect
+
+    unguarded = [
+        name
+        for name, member in inspect.getmembers(Queue, inspect.iscoroutinefunction)
+        if not name.startswith("_")
+        and name not in READS
+        and not getattr(member, "__toro_writes__", False)
+    ]
+    assert unguarded == [], f"these write without checking the model: {unguarded}"
+
+
+async def test_an_admin_write_against_a_newer_model_is_refused(q):
+    await q.add("j", {})  # stamp it while we still can
+    await q.redis.hset(q.keys.meta, "model", "99")
+    fresh = Queue(q.name, prefix=PREFIX, connection=q.redis)
+
+    for call in (
+        fresh.pause(),
+        fresh.clean("wait"),
+        fresh.add_scheduler("nightly", every=60_000, name="rollup"),
+        fresh.cancel_job("1"),
+        fresh.remove_job("1"),
+    ):
+        with pytest.raises(IncompatibleDataModelError):
+            await call

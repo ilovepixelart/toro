@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import functools
 import json
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass
-from typing import Any, TypedDict, cast
+from typing import Any, ParamSpec, TypedDict, TypeVar, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
@@ -32,6 +33,28 @@ MAX_JOB_ID_CHARS = 256
 # A job name is a LABEL: it is rendered on every row, and the per-minute metrics keep
 # a field per distinct value for eight hours. Bounded for the same reasons.
 MAX_JOB_NAME_CHARS = 128
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _writes(method: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Coroutine[Any, Any, _R]]:
+    """Mark an entry point that writes, and check the data model before it does.
+
+    Once per process, not once per call: the version changes during an upgrade, not
+    during a call. The mark is what a test reads to find a write path that forgot.
+    Typed through, because the package ships `py.typed` and a decorator that erased
+    `add`'s signature would take every caller's type checking with it.
+    """
+
+    @functools.wraps(method)
+    async def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        await cast("Queue", args[0])._stamp_model()  # noqa: SLF001 - its own method
+        return await method(*args, **kwargs)
+
+    guarded.__toro_writes__ = True  # ty: ignore[unresolved-attribute]
+    return guarded
 
 
 def _job_name(name: object) -> str:
@@ -228,6 +251,7 @@ class Queue:
             )
         return job_id
 
+    @_writes
     async def add(
         self,
         name: str,
@@ -253,7 +277,6 @@ class Queue:
         already-queued job's id is returned. Self-expiring; independent of job_id.
         """
         staged = self._stage_add(name, data, job_id=job_id, deduplication=deduplication, opts=opts)
-        await self._stamp_model()
         return staged.build(await staged.script(keys=staged.keys, args=staged.args))
 
     def _stage_add(
@@ -332,6 +355,7 @@ class Queue:
             build=build,
         )
 
+    @_writes
     async def add_flow(
         self,
         name: str,
@@ -350,7 +374,6 @@ class Queue:
         resolves when the whole flow does. See docs/flows-design.md.
         """
         staged = self._stage_flow(name, data, children=children, opts=opts)
-        await self._stamp_model()
         return staged.build(await staged.script(keys=staged.keys, args=staged.args))
 
     def _stage_flow(
@@ -639,6 +662,7 @@ class Queue:
 
     # ---- schedulers (cron / repeatable) -----------------------------------
 
+    @_writes
     async def add_scheduler(
         self,
         scheduler_id: str,
@@ -717,6 +741,7 @@ class Queue:
             ],
         )
 
+    @_writes
     async def remove_scheduler(self, scheduler_id: str) -> None:
         """Stop a schedule and drop its pending occurrence."""
         score = await self.redis.zscore(self.keys.repeat, scheduler_id)
@@ -725,6 +750,7 @@ class Queue:
         if score is not None:
             await self.remove_job(f"repeat:{scheduler_id}:{int(score)}")
 
+    @_writes
     async def trigger_scheduler(self, scheduler_id: str) -> bool:
         """Enqueue one immediate occurrence of a scheduler (a manual 'run now').
 
@@ -1045,6 +1071,7 @@ class Queue:
         raw = _str_list(await self.redis.lrange(self.keys.departed, 0, limit - 1))
         return [json.loads(r) for r in raw]
 
+    @_writes
     async def clear_departed(self) -> int:
         """Drop the recorded worker departures (the post-mortem log). Returns the count
         cleared. Live workers re-appear via their heartbeats; this only clears history.
@@ -1173,6 +1200,7 @@ class Queue:
             self.keys.base,
         ]
 
+    @_writes
     async def retry_job(self, job_id: str) -> bool:
         """Move a failed job back to the queue for another attempt.
 
@@ -1215,6 +1243,7 @@ class Queue:
             self.keys.cancel,
         ]
 
+    @_writes
     async def remove_job(self, job_id: str) -> bool:
         """Delete a job from every state and drop its hash.
 
@@ -1225,6 +1254,7 @@ class Queue:
         res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id, _now_ms()])
         return bool(res)
 
+    @_writes
     async def cancel_job(self, job_id: str, *, reason: str | None = None) -> bool:
         """Stop a job wherever it is. True when there was something to stop.
 
@@ -1253,6 +1283,7 @@ class Queue:
         )
         return bool(res)
 
+    @_writes
     async def promote_job(self, job_id: str) -> bool:
         """Move a delayed job into the queue to run now."""
         res = await self._promote_job(
@@ -1326,6 +1357,7 @@ class Queue:
                 out.append(Job.from_hash(job_id, h))
         return out
 
+    @_writes
     async def retry_all_failed(self, limit: int = 1000) -> int:
         """Re-queue every failed job. Returns how many were retried.
 
@@ -1363,6 +1395,7 @@ class Queue:
             ]
         return ids
 
+    @_writes
     async def retry_flow(self, parent_id: str) -> int:
         """Re-drive a whole failed flow: retry every failed job in the parent's
         subtree (the parent and all its descendants) in one call. Returns how
@@ -1386,6 +1419,7 @@ class Queue:
         res = await pipe.execute()
         return sum(1 for r in res if r)
 
+    @_writes
     async def clean(self, state: JobState, limit: int = 1000) -> int:
         """Remove every job in a state (up to `limit`, oldest first - when the
         limit truncates, old history goes before recent results). Returns how
@@ -1412,10 +1446,12 @@ class Queue:
 
     # ---- queue control ----------------------------------------------------
 
+    @_writes
     async def pause(self) -> None:
         """Stop workers from claiming new jobs (in-flight jobs still finish)."""
         await self.redis.set(self.keys.meta_paused, "1")
 
+    @_writes
     async def resume(self) -> None:
         """Resume claiming, and wake idle workers."""
         await self.redis.delete(self.keys.meta_paused)
