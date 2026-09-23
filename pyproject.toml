@@ -2,9 +2,7 @@
 # PyPI distribution name - plain `toro` is taken (abandoned). The import package
 # stays `toro` (e.g. `pip install toro-queue` then `import toro`).
 name = "toro-queue"
-# One source of truth: hatchling reads it from `toro/__init__.py` (see
-# [tool.hatch.version]), so a release edits the version in exactly one place.
-dynamic = ["version"]
+version = "1.0.0"
 description = "An async-first, Redis-backed job queue for Python."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,9 +38,6 @@ Issues = "https://github.com/ilovepixelart/toro/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.version]
-path = "toro/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 # The sdist is what a distro packager, an auditor, or anyone building from source

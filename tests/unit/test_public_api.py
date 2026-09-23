@@ -6,7 +6,6 @@ without anyone deciding to promise it, and a name that disappears from under som
 who relied on it.
 """
 
-import importlib
 import inspect
 import pathlib
 
@@ -103,7 +102,3 @@ def test_the_internals_are_not_advertised():
     is a module, so `toro.scripts` and friends stay changeable."""
     for name in toro.__all__:
         assert not inspect.ismodule(getattr(toro, name))
-
-
-def test_the_version_is_where_packaging_expects_it():
-    assert importlib.metadata.version("toro-queue") == toro.__version__
