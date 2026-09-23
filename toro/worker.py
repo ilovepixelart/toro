@@ -673,6 +673,7 @@ class Worker:
                 opts.get("priority", 0),
                 scheduler_id,
                 opts.get("concurrencyKey") or "",
+                scripts.METRICS_RETENTION_MS,
             ],
         )
 

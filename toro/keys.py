@@ -147,6 +147,14 @@ class Keys:
         # lost heartbeat ("lost" = crashed/killed). Gives the dashboard death history.
         return f"{self.base}departed"
 
+    @property
+    def totals(self) -> str:
+        # HASH of lifetime counters, one field per outcome. The per-minute buckets
+        # self-expire, which is right for charting and useless for `rate()`: a counter
+        # that resets cannot answer "how many since forever". This one never expires,
+        # and is bounded by its field list rather than by traffic.
+        return f"{self.base}totals"
+
     def metrics_bucket(self, minute_ms: int) -> str:
         # HASH of per-minute counters: added/completed/failed/ms at queue level
         # plus per-name fields ("completed:<name>", ...). Written inside the

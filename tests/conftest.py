@@ -144,6 +144,12 @@ def run_until():
             res = predicate()
             if asyncio.iscoroutine(res):
                 res = await res
+            if callable(res):
+                # `run_until(lambda: _count_is(q, "held", 1))` hands us a closure that
+                # RETURNS the predicate. A function object is truthy, so the poll would
+                # pass on its first turn having checked nothing. Pass the predicate.
+                msg = f"predicate returned {res!r}: pass the predicate, not a lambda round it"
+                raise TypeError(msg)
             if res:
                 return True
             await asyncio.sleep(interval)

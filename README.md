@@ -55,6 +55,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Bounded history** | keeps the newest 1000 completed / 5000 failed by default; or the last N, an age, or everything |
 | **Reliability** | per-job locks, lock renewal, stalled-job recovery |
 | **Observability** | progress, per-job logs, lifecycle events, `await result()` |
+| **Metrics** | `metrics_text()`: OpenMetrics for any scraper, backed by counters that survive a restart |
 | **Lifecycle** | pause / resume, graceful shutdown that drains in-flight jobs |
 | **Dashboard** | [matador](https://github.com/ilovepixelart/matador) - a live web UI |
 

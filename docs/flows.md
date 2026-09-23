@@ -201,7 +201,8 @@ increments it again - so one leaf failure in a deep `fail_parent` chain
 produces several `failed` increments and events. That counter is about *jobs*.
 
 A cancelled flow is counted in neither: a deliberate stop is not a completion and
-not a failure, and the queue's per-minute metrics record outcomes, not intentions.
+not a failure. Its jobs are still counted at the queue level, under `cancelled`,
+which is what keeps them out of the failure rate.
 Whole flows are counted in their own right, one unit per **root** flow as it
 settles (nested sub-flows don't double count):
 

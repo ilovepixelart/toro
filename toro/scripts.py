@@ -284,6 +284,11 @@ end
 local function recordMetrics(base, field, now, durMs, retentionMs, name, count)
   local bucket = base .. "metrics:" .. tostring(math.floor(now / 60000) * 60000)
   redis.call("HINCRBY", bucket, field, count or 1)
+  -- The same increment on the lifetime total, in the same atomic step, so a scraped
+  -- counter can never disagree with the transition it counts. No PEXPIRE: `rate()`
+  -- reads across restarts and a counter that resets breaks it.
+  redis.call("HINCRBY", base .. "totals", field, count or 1)
+  if durMs > 0 then redis.call("HINCRBY", base .. "totals", "ms", durMs) end
   if durMs > 0 then redis.call("HINCRBY", bucket, "ms", durMs) end
   if name then
     redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
@@ -533,6 +538,9 @@ local function settleChildGone(base, jobId, parentId, onFail, reason, now, reten
     if state == "cancelled" then
       recordFinished(base .. "cancelled", base .. pid, base, pid, now,
         "cancel", "1", "cancelled")
+      -- no name: the other two cancel paths pass none, and a per-name breakdown
+      -- that only one path fills is read as a breakdown, not as a gap
+      recordMetrics(base, "cancelled", now, 0, retentionMs)
       redis.call("PUBLISH", base .. "events",
         cjson.encode({jobId = tostring(pid), event = "cancelled"}))
     else
@@ -874,7 +882,7 @@ return {outcome}
 # KEYS[1] delayed  KEYS[2] key base
 # ARGV[1] jobId  ARGV[2] name  ARGV[3] data(json)  ARGV[4] opts(json)
 # ARGV[5] now(ms)  ARGV[6] processAt(ms)  ARGV[7] priority  ARGV[8] schedulerId
-# ARGV[9] concurrency key ("" = none)
+# ARGV[9] concurrency key ("" = none)  ARGV[10] metrics retention(ms)
 ADD_SCHEDULED = (
     _LIB
     + """
@@ -892,6 +900,8 @@ if takeKey(base, jobKey, ARGV[1], ARGV[9], tonumber(ARGV[7]), base .. "pc", now)
   redis.call("HSET", jobKey, "state", "delayed")
   redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
 end
+-- an occurrence is a job: counted where it is created, like every other enqueue
+recordMetrics(base, "added", now, 0, tonumber(ARGV[10]))
 return 1
 """
 )
@@ -1048,6 +1058,7 @@ local now = tonumber(ARGV[2])
 -- read BEFORE recordFinished (retention may DEL the hash)
 local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail", "cancelReason")
 recordFinished(KEYS[2], KEYS[3], base, ARGV[1], now, "cancel", "1", "cancelled")
+recordMetrics(base, "cancelled", now, 0, tonumber(ARGV[4]))
 local msg = {jobId = ARGV[1], event = "cancelled"}
 if meta[3] then msg.reason = meta[3] end
 redis.call("PUBLISH", KEYS[8], cjson.encode(msg))
@@ -1117,6 +1128,7 @@ local function cancelOne(jobId)
   unkey(base, jobId, state, meta[3], now)
   saveReason(jobKey)
   recordFinished(KEYS[5], jobKey, base, jobId, now, "cancel", "1", "cancelled")
+  recordMetrics(base, "cancelled", now, 0, tonumber(ARGV[3]))
   announceCancelled(jobId)
   return meta[2]
 end

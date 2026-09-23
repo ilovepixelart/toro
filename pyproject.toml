@@ -44,6 +44,9 @@ packages = ["toro"]
 [dependency-groups]
 dev = [
     "hdrhistogram>=0.10.3",
+    # the reference OpenMetrics parser: the exposition is checked against it, not
+    # against our own reading of the spec
+    "prometheus-client>=0.21",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",

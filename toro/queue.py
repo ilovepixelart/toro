@@ -21,6 +21,7 @@ from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
+from .openmetrics import OUTCOMES, TOTAL_FIELDS, render
 from .scheduler import next_run, valid_cron
 
 
@@ -558,6 +559,7 @@ class Queue:
                 opts.get("priority", 0),
                 scheduler_id,
                 opts.get("concurrencyKey") or "",
+                scripts.METRICS_RETENTION_MS,
             ],
         )
 
@@ -657,6 +659,34 @@ class Queue:
             "held": held,
             "cancelled": cancelled,
         }
+
+    async def lifetime_totals(self) -> dict[str, int]:
+        """Counters since the queue was created, one per outcome, present at zero.
+
+        A dashboard serving several queues renders them together, so it needs the
+        numbers rather than one queue's finished text: a render per queue concatenated
+        declares every family twice. This is that seam, so nothing outside has to know
+        which key the totals live in.
+        """
+        raw = _str_dict(await self.redis.hgetall(self.keys.totals))
+        totals = dict.fromkeys(OUTCOMES, 0)
+        totals.update({k: int(v) for k, v in raw.items() if k in TOTAL_FIELDS})
+        return totals
+
+    async def metrics_text(self) -> str:
+        """OpenMetrics text for this queue: lifetime counters and current depth.
+
+        A reader, not a collector: both halves come from Redis at scrape time, so N
+        replicas scraped independently report the same numbers and no background task
+        has to be running for the figures to be right. The depth half is `counts()`:
+        every job in the state it is in, which is not what a dashboard's tab badges
+        count (those are flow roots, with parked parents folded into active).
+        """
+        # Depth first, counters second: the two reads have an await between them, and
+        # a job that finishes in the gap must show in the counter rather than only in
+        # the gauge. Depth above its own counter is impossible in the data.
+        depths = await self.counts()
+        return render(self.name, await self.lifetime_totals(), depths)
 
     async def _metric_buckets(self, minutes: int) -> list[tuple[int, dict[str, str]]]:
         """Fetch the last `minutes` per-minute metric buckets, oldest first, in
