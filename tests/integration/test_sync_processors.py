@@ -151,6 +151,38 @@ async def test_a_processor_whose_kind_was_misread_still_returns_its_value(q, run
         assert await q.result(job.id, timeout=15) == {"ok": "hidden"}
 
 
+async def test_cancelling_a_sync_job_cannot_stop_the_thread(q, run_worker, run_until):
+    """SS-004: a thread is not a task. The job is cancelled at once, because the
+    worker decides the outcome by what it asked for, and the work carries on to its
+    own end: Python cannot interrupt a thread, and a queue that implied otherwise
+    would be lying about the one thing people cancel jobs for."""
+    started = threading.Event()
+    finished = threading.Event()
+
+    def proc(job):
+        started.set()
+        time.sleep(0.6)
+        finished.set()
+        return 1
+
+    async with run_worker(q, proc):
+        job = await q.add("long", {})
+        assert await asyncio.to_thread(started.wait, 15)
+
+        assert await q.cancel_job(job.id) is True
+
+        assert await run_until(_cancelled(q, 1), timeout=15)
+        assert not finished.is_set(), "the thread stopped, which Python cannot do"
+        assert await asyncio.to_thread(finished.wait, 15)  # it runs to its own end
+
+
+def _cancelled(q, n: int):
+    async def check() -> bool:
+        return (await q.counts())["cancelled"] >= n
+
+    return check
+
+
 def _completed(q, n: int):
     async def check() -> bool:
         return (await q.counts())["completed"] >= n

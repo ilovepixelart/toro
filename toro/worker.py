@@ -49,6 +49,20 @@ Processor = Callable[[Job], Awaitable[Any] | Any]
 logger = logging.getLogger(__name__)
 
 
+def _blocked_threshold(blocked_warning: float | None, lock_renew_time: int) -> float:
+    """How long the loop may be unable to run anything before that is worth saying.
+
+    Tied to the renewal rather than to a round number: lag approaching a renewal
+    interval means a renewal is already late, and a late renewal is how the stalled
+    sweep comes to run a job a second time. 0 turns the watchdog off.
+    """
+    if blocked_warning is None:
+        return lock_renew_time / 1000 / 2
+    if blocked_warning < 0:
+        raise ValueError("blocked_warning is seconds, 0 to disable, never negative")
+    return float(blocked_warning)
+
+
 def _is_async(processor: Processor) -> bool:
     """Whether this processor is awaited or handed to a thread.
 
@@ -139,6 +153,7 @@ class Worker:
         max_stalled_count: int = 1,
         grace_period: float = 30.0,
         heartbeat_interval: int = 5000,
+        blocked_warning: float | None = None,
     ) -> None:
         self.name = name
         self.processor = processor
@@ -188,6 +203,7 @@ class Worker:
         self.token = uuid.uuid4().hex
         self.lock_duration = lock_duration
         self.lock_renew_time = lock_renew_time or lock_duration // 2
+        self.blocked_warning = _blocked_threshold(blocked_warning, self.lock_renew_time)
         self.renew_locks = renew_locks
         self.stalled_interval = stalled_interval
         self.max_stalled_count = max_stalled_count
@@ -269,6 +285,8 @@ class Worker:
             bg.append(asyncio.create_task(self._stalled_loop()))
         if self.heartbeat_interval > 0:
             bg.append(asyncio.create_task(self._heartbeat_loop()))
+        if self.blocked_warning > 0:
+            bg.append(asyncio.create_task(self._watchdog_loop()))
         self._tasks = [*self._process_tasks, *bg]
         with contextlib.suppress(asyncio.CancelledError):
             # return_exceptions: one freak task failure must not crash run() and
@@ -324,6 +342,36 @@ class Worker:
         return self._executor
 
     # ---- presence / heartbeat ---------------------------------------------
+
+    async def _watchdog_loop(self) -> None:
+        """Warn when the event loop could not run for longer than a job can afford.
+
+        Measures its own lateness: a sleep that returns late by more than the
+        threshold is time the loop spent unable to run anything at all, whatever the
+        cause, including causes inside a dependency. One warning per episode, because
+        the point is to name the processor, not to fill the log.
+        """
+        interval = min(1.0, self.blocked_warning / 2)
+        warned = False
+        while self._running:
+            before = time.monotonic()
+            await asyncio.sleep(interval)
+            lag = time.monotonic() - before - interval
+            if lag < self.blocked_warning:
+                warned = False
+                continue
+            if not warned:
+                jobs = sorted(self._current)
+                logger.warning(
+                    "event loop was blocked for %.1fs (threshold %.1fs); jobs in flight: %s. "
+                    "A processor that blocks the loop stops lock renewal, and the stalled "
+                    "sweep re-runs its jobs elsewhere.",
+                    lag,
+                    self.blocked_warning,
+                    ", ".join(jobs) or "none",
+                )
+                self._emit("blocked", lag, jobs)
+            warned = True
 
     async def _heartbeat_loop(self) -> None:
         while self._running:
