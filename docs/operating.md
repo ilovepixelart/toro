@@ -14,11 +14,15 @@ from one `/metrics` endpoint. Serve it yourself with any framework: the text is 
 whole response, and the content type is
 `application/openmetrics-text; version=1.0.0; charset=utf-8`.
 
-| Family | Type | Labels | Meaning |
+| Sample | Type | Labels | Meaning |
 |---|---|---|---|
 | `toro_jobs_total` | counter | `queue`, `outcome` | Jobs by outcome since the queue was created. |
 | `toro_job_duration_ms_total` | counter | `queue` | Processing time of finished jobs, in ms. |
 | `toro_queue_depth` | gauge | `queue`, `state` | Jobs currently in each state. |
+
+Those are the names you query. The counter *families* are `toro_jobs` and
+`toro_job_duration_ms`: OpenMetrics puts the `_total` suffix on the sample, not on the
+family, and a parser rejects the whole document over the difference.
 
 `outcome` is `added`, `completed`, `failed` or `cancelled`. **A cancellation is never
 counted as a failure**: that is the point of it being a state of its own, and a

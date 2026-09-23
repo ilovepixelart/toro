@@ -13,9 +13,12 @@ from collections.abc import Mapping
 # failed makes `rate()` start at a cliff, which reads as a spike that never happened.
 OUTCOMES = ("added", "completed", "failed", "cancelled")
 
+# A counter's FAMILY carries no suffix and its SAMPLE ends in `_total`: a family
+# declared as `toro_jobs_total` would need a `toro_jobs_total_total` sample, and a
+# strict parser rejects the whole document over it, every other family included.
 _FAMILIES = (
-    ("toro_jobs_total", "counter", "Jobs by outcome since the queue was created."),
-    ("toro_job_duration_ms_total", "counter", "Processing time of finished jobs, in ms."),
+    ("toro_jobs", "counter", "Jobs by outcome since the queue was created."),
+    ("toro_job_duration_ms", "counter", "Processing time of finished jobs, in ms."),
     ("toro_queue_depth", "gauge", "Jobs currently in each state."),
 )
 
@@ -35,12 +38,12 @@ def _samples(family: str, queues: Snapshot) -> list[str]:
     out: list[str] = []
     for queue, (totals, depths) in queues.items():
         name = _label(queue)
-        if family == "toro_jobs_total":
+        if family == "toro_jobs":
             out += [
                 f'toro_jobs_total{{queue="{name}",outcome="{o}"}} {int(totals.get(o, 0))}'
                 for o in OUTCOMES
             ]
-        elif family == "toro_job_duration_ms_total":
+        elif family == "toro_job_duration_ms":
             out.append(f'toro_job_duration_ms_total{{queue="{name}"}} {int(totals.get("ms", 0))}')
         else:
             # Depth is read at scrape time, which is what a gauge means: it can go

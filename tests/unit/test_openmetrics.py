@@ -5,6 +5,7 @@ checked here without a Redis in the loop.
 """
 
 import pytest
+from prometheus_client.openmetrics.parser import text_string_to_metric_families as parse
 
 from toro.openmetrics import render, render_all
 
@@ -27,18 +28,45 @@ def test_every_sample_belongs_to_a_declared_family():
     for line in text.splitlines():
         if line.startswith("#") or not line:
             continue
-        family = line.split("{")[0].split()[0]
-        assert family in declared, f"{family} has no TYPE line"
+        sample = line.split("{")[0].split()[0]
+        # a counter's sample is its family plus `_total`; every other sample is the
+        # family itself
+        family = sample.removesuffix("_total")
+        assert family in declared, f"{sample} has no TYPE line"
+        if family != sample:
+            assert declared[family] == "counter", f"{sample} is not a counter sample"
 
 
-def test_a_counter_is_named_total_and_a_gauge_is_not():
-    declared = _families(render("emails", TOTALS, DEPTHS))
+def test_the_reference_parser_reads_it_back():
+    """OP-001. The rule this catches and reading the spec does not: a counter's FAMILY
+    is `toro_jobs` and its SAMPLE is `toro_jobs_total`. A family already named
+    `toro_jobs_total` would need a `toro_jobs_total_total` sample, and the parser
+    rejects the whole document, gauge included, rather than the one family."""
+    text = render("emails", TOTALS, DEPTHS)
+
+    parsed = {family.name: family for family in parse(text)}
+
+    assert set(parsed) == {"toro_jobs", "toro_job_duration_ms", "toro_queue_depth"}
+    samples = {
+        (sample.name, sample.labels.get("outcome") or sample.labels.get("state")): sample.value
+        for family in parsed.values()
+        for sample in family.samples
+    }
+    assert samples[("toro_jobs_total", "completed")] == 4
+    assert samples[("toro_job_duration_ms_total", None)] == 512
+    assert samples[("toro_queue_depth", "wait")] == 3
+
+
+def test_the_total_suffix_is_on_the_sample_not_on_the_family():
+    """Backwards is the easy mistake, and it costs the whole document rather than the
+    one family: a family called `toro_jobs_total` would need a `_total_total` sample."""
+    text = render("emails", TOTALS, DEPTHS)
+    declared = _families(text)
 
     for name, kind in declared.items():
-        if kind == "counter":
-            assert name.endswith("_total"), f"{name} is a counter and must end in _total"
-        else:
-            assert not name.endswith("_total"), f"{name} is a {kind}, not a counter"
+        assert not name.endswith("_total"), f"{name} is a family name, so it carries no suffix"
+        sample = f"{name}_total" if kind == "counter" else name
+        assert f"\n{sample}{{" in text or f"\n{sample} " in text, f"{sample} has no sample line"
 
 
 def test_outcomes_are_labels_on_one_family_not_families_of_their_own():
@@ -68,10 +96,17 @@ def test_a_missing_counter_reads_as_zero_not_as_a_gap():
         assert f'outcome="{outcome}"' in text
 
 
-@pytest.mark.parametrize("name", ['we"ird', "back\\slash", "new\nline"])
-def test_a_label_value_cannot_break_out_of_its_quotes(name):
+@pytest.mark.parametrize(
+    ("name", "escaped"),
+    [('we"ird', 'we\\"ird'), ("back\\slash", "back\\\\slash"), ("new\nline", "new\\nline")],
+)
+def test_a_label_value_cannot_break_out_of_its_quotes(name, escaped):
     text = render(name, TOTALS, DEPTHS)
 
+    # the escape itself, so a character that is merely left alone is not mistaken for
+    # one that is escaped: a quote-balance count cannot fail on a backslash
+    assert f'queue="{escaped}"' in text
+    assert list(parse(text)), "the reference parser could not read the escaped name"
     for line in text.splitlines():
         if line.startswith("#") or not line:
             continue
