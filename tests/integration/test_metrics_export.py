@@ -8,6 +8,8 @@ transition they count, so a counter can never disagree with the state change.
 
 import asyncio
 
+from redis.asyncio import Redis
+
 from toro import FlowChild, Queue
 
 PREFIX = "torotest"
@@ -99,12 +101,78 @@ async def test_a_leftover_job_on_the_counters_key_cannot_break_a_scrape(q):
     assert await q.metrics_text()  # and the exposition still renders
 
 
+async def test_the_counters_cost_three_commands_a_job(q, run_worker, run_until):
+    """OP-010: one write when a job is added, two when it finishes (its outcome and
+    its duration). Counted on the wire rather than reasoned about, and pinned here so
+    a fourth write cannot appear unnoticed. All three run inside scripts that already
+    run, which is why they cost no round trip."""
+    seen: list[str] = []
+    watcher = Redis.from_url("redis://localhost:6379", decode_responses=True)
+    ready = asyncio.Event()
+
+    async def watch() -> None:
+        async with watcher.monitor() as monitor:
+            ready.set()
+            async for command in monitor.listen():
+                # not a comprehension: this stream ends by cancellation, and a
+                # comprehension only assigns once it ends, losing everything seen
+                if q.keys.totals in command["command"]:
+                    seen.append(command["command"])  # noqa: PERF401
+
+    watching = asyncio.create_task(watch())
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        await asyncio.sleep(0.1)  # MONITOR is live a moment after the reply
+
+        async def proc(job):
+            await asyncio.sleep(0.01)  # so the duration rounds to something
+            return job.name
+
+        async with run_worker(q, proc):
+            await q.add("j", {})
+            assert await run_until(_settled(q, 1), timeout=10)
+        await asyncio.sleep(0.2)  # let the last commands reach the monitor
+    finally:
+        watching.cancel()
+        await watcher.aclose()
+
+    assert len(seen) == 3, seen
+    assert [command.split()[2] for command in seen] == ["added", "completed", "ms"]
+
+
 async def test_totals_never_expire(q):
     """OP-002: `rate()` reads a counter across restarts, so the key it reads from
     cannot be one that quietly disappears after eight hours."""
     await q.add("j", {})
 
     assert await q.redis.ttl(q.keys.totals) == -1  # -1 is "no expiry", -2 is "gone"
+
+
+async def test_totals_survive_a_restart(q, run_worker, run_until):
+    """OP-002: `rate()` reads a counter across a restart, which is the whole reason
+    these live beside the expiring buckets. Nothing is kept in the process, so a fresh
+    one reads the same counter and the numbers only ever go up."""
+
+    async def proc(job):
+        return job.name
+
+    async with run_worker(q, proc):
+        await q.add("first", {})
+        assert await run_until(_settled(q, 1), timeout=10)
+    before = await q.lifetime_totals()
+    assert before["completed"] == 1
+
+    restarted = Queue(q.name, prefix=PREFIX)  # what a new process sees
+    try:
+        async with run_worker(restarted, proc):
+            await restarted.add("second", {})
+            assert await run_until(_settled(restarted, 2), timeout=10)
+        after = await restarted.lifetime_totals()
+    finally:
+        await restarted.close()
+
+    assert after["completed"] == before["completed"] + 1, "the work done in between is missing"
+    assert all(after[field] >= count for field, count in before.items()), "a counter went back"
 
 
 async def test_a_cancellation_is_never_counted_as_a_failure(q):
