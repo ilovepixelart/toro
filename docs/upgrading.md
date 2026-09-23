@@ -2,6 +2,29 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 0.11.0
+
+Nothing breaks. Three things are new.
+
+A plain `def` processor now runs in a thread instead of raising `TypeError` after
+running inside the event loop. If you were relying on that error, you were relying on
+a bug. Two consequences worth knowing before you switch a processor over: cancelling
+a sync job waits for its thread (the job ends `cancelled` when the work does), and the
+process cannot exit while a sync job is running. See [Processing](processing.md).
+
+A processor whose return value is not JSON now fails its job, with the encoder's
+message as the reason. It used to escape the commit and leave the job `active` until
+the stalled sweep re-ran it, which mattered most for test suites using mock
+processors.
+
+A watchdog warns when a processor blocks the event loop for longer than half the lock
+renewal interval, naming the jobs in flight. It is on by default, because the failure
+it catches (renewals stop, the stalled sweep re-runs the work) is otherwise silent.
+`blocked_warning=0` turns it off, and `blocked_warning=<seconds>` sets the threshold.
+
+`Queue.pending()` collects jobs and sends them in one round trip when you say the
+transaction committed. See [Producing](producing.md).
+
 ## 0.10.0
 
 Nothing breaks. Two things are new and worth knowing about.

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import json
 import logging
 import os
@@ -28,6 +30,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
@@ -40,9 +43,52 @@ from .job import Backoff, Job, JobContext
 from .keys import Keys
 from .scheduler import next_run
 
-Processor = Callable[[Job], Awaitable[Any]]
+# A processor is awaited when it is a coroutine function and run in a thread when it
+# is not, so both shapes are the public contract.
+Processor = Callable[[Job], Awaitable[Any] | Any]
 
 logger = logging.getLogger(__name__)
+
+
+# Below this, a threshold is smaller than the jitter of the sleep that measures it:
+# an ordinary overshoot would read as a blocked loop and an idle worker would warn.
+MIN_BLOCKED_WARNING = 0.01
+
+
+def _blocked_threshold(blocked_warning: float | None, lock_renew_time: int) -> float:
+    """How long the loop may be unable to run anything before that is worth saying.
+
+    Tied to the renewal rather than to a round number: lag approaching a renewal
+    interval means a renewal is already late, and a late renewal is how the stalled
+    sweep comes to run a job a second time. 0 turns the watchdog off.
+    """
+    if blocked_warning is None:
+        return lock_renew_time / 1000 / 2
+    if blocked_warning < 0 or 0 < blocked_warning < MIN_BLOCKED_WARNING:
+        raise ValueError(
+            f"blocked_warning is seconds: 0 to disable, otherwise at least "
+            f"{MIN_BLOCKED_WARNING} (below that is the loop's own jitter)"
+        )
+    return float(blocked_warning)
+
+
+def _is_async(processor: Processor) -> bool:
+    """Whether this processor is awaited or handed to a thread.
+
+    Asked by inspection rather than by calling it: calling a sync processor to see
+    what comes back would run it inside the event loop, which is what running it in a
+    thread exists to avoid. `asyncio.iscoroutinefunction` sees through a
+    `functools.partial`; a class-based processor answers for its `__call__`.
+    """
+    target = processor
+    while isinstance(target, functools.partial):
+        # unwrapped by hand: iscoroutinefunction sees through a partial to what it
+        # wraps, but then asks the wrong object about __call__ (the partial's own)
+        target = target.func
+    if asyncio.iscoroutinefunction(target):
+        return True
+    call = getattr(target, "__call__", None)  # noqa: B004
+    return call is not None and bool(asyncio.iscoroutinefunction(call))
 
 
 class RateLimit(TypedDict):
@@ -121,6 +167,7 @@ class Worker:
         max_stalled_count: int = 1,
         grace_period: float = 30.0,
         heartbeat_interval: int = 5000,
+        blocked_warning: float | None = None,
     ) -> None:
         self.name = name
         self.processor = processor
@@ -170,6 +217,7 @@ class Worker:
         self.token = uuid.uuid4().hex
         self.lock_duration = lock_duration
         self.lock_renew_time = lock_renew_time or lock_duration // 2
+        self.blocked_warning = _blocked_threshold(blocked_warning, self.lock_renew_time)
         self.renew_locks = renew_locks
         self.stalled_interval = stalled_interval
         self.max_stalled_count = max_stalled_count
@@ -197,6 +245,12 @@ class Worker:
         # it waits on a message, so a close in its own `finally` may never be reached,
         # and a caller-owned pool is not disconnected for us. Same shape as Queue.
         self._cancel_pubsub: PubSub | None = None
+        # Asked once, here, and not per job: calling the processor to find out what it
+        # returns would run a sync one inside the loop.
+        self._async_processor = _is_async(processor)
+        # Created on the first sync job, so an all-async worker pays nothing for a
+        # feature it never uses.
+        self._executor: ThreadPoolExecutor | None = None
         # "running" until a graceful stop flips it to "stopping" - the dashboard shows
         # a live "draining" state, and a worker that then vanishes was mid-shutdown,
         # not a crash. (The only honest way to know graceful; absence can't say why.)
@@ -245,6 +299,8 @@ class Worker:
             bg.append(asyncio.create_task(self._stalled_loop()))
         if self.heartbeat_interval > 0:
             bg.append(asyncio.create_task(self._heartbeat_loop()))
+        if self.blocked_warning > 0:
+            bg.append(asyncio.create_task(self._watchdog_loop()))
         self._tasks = [*self._process_tasks, *bg]
         with contextlib.suppress(asyncio.CancelledError):
             # return_exceptions: one freak task failure must not crash run() and
@@ -276,11 +332,60 @@ class Worker:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._close_cancel_pubsub()
+        if self._executor is not None:
+            # A thread cannot be cancelled, so a sync job still running keeps its
+            # thread to the end; what this drops is the work that never started.
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
         with contextlib.suppress(Exception):
             await self._deregister()  # drop our presence record so we vanish at once
         await self.redis.aclose(close_connection_pool=self._owns_connection)
 
+    def _pool(self) -> ThreadPoolExecutor:
+        """Return the worker's own threads, one per slot.
+
+        Not the loop's default executor: that one is shared process-wide and sized
+        `min(32, cpu + 4)`, so a worker with more slots than that would queue sync
+        jobs behind a pool it does not control, and a job waiting for a thread waits
+        holding its lock.
+        """
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.concurrency, thread_name_prefix=f"toro-{self.name}"
+            )
+        return self._executor
+
     # ---- presence / heartbeat ---------------------------------------------
+
+    async def _watchdog_loop(self) -> None:
+        """Warn when the event loop could not run for longer than a job can afford.
+
+        Measures its own lateness: a sleep that returns late by more than the
+        threshold is time the loop spent unable to run anything at all, whatever the
+        cause, including causes inside a dependency. One warning per episode, because
+        the point is to name the processor, not to fill the log.
+        """
+        interval = max(MIN_BLOCKED_WARNING / 2, min(1.0, self.blocked_warning / 2))
+        warned = False
+        while self._running:
+            before = time.monotonic()
+            await asyncio.sleep(interval)
+            lag = time.monotonic() - before - interval
+            if lag < self.blocked_warning:
+                warned = False
+                continue
+            if not warned:
+                jobs = sorted(self._current)
+                logger.warning(
+                    "event loop was blocked for %.1fs (threshold %.1fs); jobs in flight: %s. "
+                    "A processor that blocks the loop stops lock renewal, and the stalled "
+                    "sweep re-runs its jobs elsewhere.",
+                    lag,
+                    self.blocked_warning,
+                    ", ".join(jobs) or "none",
+                )
+                self._emit("blocked", lag, jobs)
+            warned = True
 
     async def _heartbeat_loop(self) -> None:
         while self._running:
@@ -460,7 +565,14 @@ class Worker:
         # there is nothing to stop but the process loop itself. Wrapped because a
         # processor is any awaitable, and only a coroutine can become a task.
         async def run_processor() -> Any:
-            return await self.processor(job)
+            if self._async_processor:
+                return await self.processor(job)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self._pool(), self.processor, job)
+            # The inspection can be wrong (a decorator that hides a coroutine
+            # function), and then the thread hands back an un-started coroutine. The
+            # job's "result" would be a coroutine object that fails to serialize.
+            return await result if inspect.isawaitable(result) else result
 
         task = asyncio.create_task(run_processor())
         self._processors[job_id] = (task, str(fields.get("processedOn", "")))
@@ -512,8 +624,18 @@ class Worker:
             return await self._finish_failed(job, exc)
         if job.id in self._cancelling:
             return await self._finish_cancelled(job)
+        try:
+            committed = await self._finish_completed(job, result)
+        except (TypeError, ValueError) as exc:
+            # A result the queue cannot store is the processor's bug, and it has to
+            # end the job like any other error would. Left to escape the commit, the
+            # job stays `active` holding its lock until the stalled sweep re-runs it,
+            # burning an attempt on work that fails the same way every time.
+            await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
+            self._failed += 1
+            return await self._finish_failed(job, exc)
         self._processed += 1
-        return await self._finish_completed(job, result)
+        return committed
 
     def _request_cancel(self, job_id: str, claim: str | None = None) -> None:
         """Stop a job this worker is running, once.
@@ -530,6 +652,8 @@ class Worker:
         Nothing to do either if the task is finished, though a cancellation that lands
         between the processor returning and the task being marked done still wins:
         CPython discards the result and the job commits `cancelled`.
+
+        A SYNC processor is recorded and not interrupted: see the comment below.
         """
         if job_id in self._cancelling:
             return
@@ -540,6 +664,14 @@ class Worker:
         if task.done() or (claim is not None and claim != mine):
             return
         self._cancelling.add(job_id)
+        if not self._async_processor:
+            # A thread cannot be interrupted, so cancelling the await would free this
+            # slot and commit a terminal state that hands on the concurrency key,
+            # while the work itself carried on: the pool would have one thread fewer
+            # than the worker has slots, and the next job on that key would start
+            # beside work that never stopped. The request stands, and the job ends
+            # `cancelled` when its thread returns.
+            return
         task.cancel()
 
     async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
