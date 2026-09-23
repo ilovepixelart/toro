@@ -148,6 +148,13 @@ class Keys:
         return f"{self.base}departed"
 
     @property
+    def meta(self) -> str:
+        # HASH of what this queue IS rather than what it holds: the data-model version
+        # it was stamped with. Written once, read once per process, never on a read
+        # path - a dashboard opening a queue must not create it by looking.
+        return f"{self.base}meta"
+
+    @property
     def totals(self) -> str:
         # HASH of lifetime counters, one field per outcome. The per-minute buckets
         # self-expire, which is right for charting and useless for `rate()`: a counter

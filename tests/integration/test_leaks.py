@@ -19,7 +19,7 @@ _INFRA = {
     "id", "pc", "marker", "prioritized", "active", "delayed", "completed", "failed",
     "waiting-children", "children", "stalled", "stalled-check", "meta-paused",
     "limiter", "repeat", "workers", "departed", "roots-scratch", "events",
-    "cancelled", "cancel", "held", "totals",
+    "cancelled", "cancel", "held", "totals", "meta",
 }  # fmt: skip
 
 

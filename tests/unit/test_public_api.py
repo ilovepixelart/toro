@@ -17,12 +17,14 @@ import toro
 # The frozen list. Adding to it is a minor release, removing from it a major one, and
 # either way this file is the diff that says so.
 PUBLIC = {
+    "DATA_MODEL_VERSION",
     "Backoff",
     "BackoffOpts",
     "Deduplication",
     "FlowChild",
     "FlowMetricsPoint",
     "FlowView",
+    "IncompatibleDataModelError",
     "Job",
     "JobCancelledError",
     "JobFailedError",

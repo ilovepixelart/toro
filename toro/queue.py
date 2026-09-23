@@ -18,7 +18,7 @@ from redis.asyncio.client import PubSub
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
 from .connection import confirm_subscribed, connect
-from .errors import JobCancelledError, JobFailedError, PartialFlushError
+from .errors import IncompatibleDataModelError, JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
@@ -29,6 +29,18 @@ from .scheduler import next_run, valid_cron
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+async def stamp_data_model(stamp: Any, keys: Keys, name: str) -> None:
+    """Stamp an unmarked queue with this library's data-model version, and refuse a
+    queue whose model is newer than this library understands.
+
+    Shared by the producer and the worker because both write, and a rolling upgrade
+    puts two libraries on one queue by design.
+    """
+    found = int(await stamp(keys=[keys.meta], args=[scripts.DATA_MODEL_VERSION]))
+    if found > scripts.DATA_MODEL_VERSION:
+        raise IncompatibleDataModelError(name, found, scripts.DATA_MODEL_VERSION)
 
 
 @dataclass(frozen=True)
@@ -146,6 +158,11 @@ class Queue:
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
         self._cancel_job = self.redis.register_script(scripts.CANCEL_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
+        self._stamp = self.redis.register_script(scripts.STAMP_MODEL)
+        # Asked once per process, on the first WRITE. Not on a read: a dashboard opens
+        # a queue for every name it is given, and stamping on a read would create the
+        # ones nobody has used yet.
+        self._model_checked = False
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
         self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
         self._roots_counts_script = self.redis.register_script(scripts.ROOTS_COUNTS)
@@ -200,6 +217,7 @@ class Queue:
         already-queued job's id is returned. Self-expiring; independent of job_id.
         """
         staged = self._stage_add(name, data, job_id=job_id, deduplication=deduplication, opts=opts)
+        await self._stamp_model()
         return staged.build(await staged.script(keys=staged.keys, args=staged.args))
 
     def _stage_add(
@@ -295,6 +313,7 @@ class Queue:
         resolves when the whole flow does. See docs/flows-design.md.
         """
         staged = self._stage_flow(name, data, children=children, opts=opts)
+        await self._stamp_model()
         return staged.build(await staged.script(keys=staged.keys, args=staged.args))
 
     def _stage_flow(
@@ -331,6 +350,17 @@ class Queue:
             args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
             build=build,
         )
+
+    async def _stamp_model(self) -> None:
+        """Adopt this queue's data model, or refuse it, once per process.
+
+        The version changes during an upgrade, not during a call, so checking per call
+        would buy nothing and cost the hot path a round trip.
+        """
+        if self._model_checked:
+            return
+        await stamp_data_model(self._stamp, self.keys, self.name)
+        self._model_checked = True
 
     def pending(self) -> PendingJobs:
         """Collect jobs now; send them when the write they belong to has committed.
@@ -1427,6 +1457,7 @@ class PendingJobs:
             return []
         try:
             staged = [stage() for stage in calls]
+            await self._queue._stamp_model()  # noqa: SLF001 - the queue's own check
         except BaseException:
             self._calls = calls + self._calls  # nothing was sent; the batch stands
             raise

@@ -45,6 +45,11 @@ PROMOTE_BATCH = 1000
 # charts, bounded key count (at most 480 small hashes per queue).
 METRICS_RETENTION_MS = 8 * 60 * 60 * 1000
 
+# The version of the KEY LAYOUT, which is not the library's version: it changes only
+# when the stored shape changes incompatibly, and a library that finds a higher one
+# stops. Absence means a queue written before the marker existed (0.x).
+DATA_MODEL_VERSION = 1
+
 # Duration histogram shape: log-scaled buckets so one set covers 20ms jobs and
 # 5-minute jobs alike. Bucket 0 is [0, 20ms); each next bucket grows 1.5x;
 # the last bucket absorbs everything past ~5.6 minutes. Successful jobs only -
@@ -875,6 +880,14 @@ end
 return {outcome}
 """
 )
+
+# Claim the queue's data model: stamp it when it is unmarked, and answer with what it
+# actually holds either way, so one round trip both adopts and checks.
+# KEYS[1] meta  ARGV[1] this library's model version
+STAMP_MODEL = """
+redis.call("HSETNX", KEYS[1], "model", ARGV[1])
+return redis.call("HGET", KEYS[1], "model")
+"""
 
 # Add a delayed job with a caller-provided id, idempotently. Used by schedulers:
 # the deterministic id `repeat:<schedulerId>:<nextMillis>` means the same
