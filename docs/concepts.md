@@ -95,7 +95,10 @@ events channel:
 
 - **`await job.result()`** (or `queue.result(job_id)`) on the producer side
   subscribes and waits for the terminal event, returning the value or raising
-  `JobFailedError`, or `JobCancelledError` if the job was cancelled.
+  `JobFailedError`, or `JobCancelledError` if the job was cancelled. A result up to
+  16 KiB travels inside the event, so the waiter needs no second round trip; a larger
+  one (or one nested deeper than JSON can carry inside another document) is read back
+  from the job's hash instead, which is where it was written either way.
 - **A dashboard** (such as [matador](https://github.com/ilovepixelart/matador))
   subscribes to refresh live as state changes.
 

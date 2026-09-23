@@ -44,6 +44,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `workers` | ZSET | Live worker id -> last-heartbeat ms; stale entries pruned on read, and entries a day old by any worker's heartbeat. |
 | `departed` | LIST (capped) | Recent worker departures: graceful `stopped` or `lost` (crashed). |
 | `metrics:<minute>` | HASH | Per-minute counters (`added`/`completed`/`failed`/`cancelled`/`ms`, per-name fields, histograms); self-expiring. |
+| `meta` | HASH | What this queue IS rather than what it holds: `model`, the [data-model version](versioning.md) it was stamped with. Written once, on the first write by a 1.0+ library; a library that finds a newer one refuses to run. |
 | `totals` | HASH | Outcome counters and `ms` since the queue was created, and never expiring: `rate()` reads across restarts, and a counter that resets reads as a cliff. Five fields, whatever the traffic; the per-name fields and histograms stay in the expiring buckets. |
 | `de:<dedupId>` | string (PX) | A live deduplication throttle window; holds the already-queued job's id. |
 

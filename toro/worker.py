@@ -41,6 +41,7 @@ from ._replies import _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, confirm_subscribed, connect, read_timeout
 from .job import Backoff, Job, JobContext
 from .keys import Keys
+from .queue import stamp_data_model
 from .scheduler import next_run
 
 # A processor is awaited when it is a coroutine function and run in a thread when it
@@ -264,6 +265,7 @@ class Worker:
         self._move_stalled = self.redis.register_script(scripts.MOVE_STALLED)
         self._promote_delayed = self.redis.register_script(scripts.PROMOTE_DELAYED)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
+        self._stamp = self.redis.register_script(scripts.STAMP_MODEL)
 
         # Simple event callbacks: worker.on("completed", fn)
         self._handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -282,6 +284,9 @@ class Worker:
 
     async def run(self) -> None:
         """Start processing until stop() is called. Awaitable forever."""
+        # Before anything is claimed: a worker writes more than a producer does, and
+        # must not run a claim loop against a model it cannot read.
+        await stamp_data_model(self._stamp, self.keys, self.name)
         self._running = True
         self.started_at = _now_ms()
         await self._write_heartbeat()  # register at once so the worker shows up immediately

@@ -7,17 +7,30 @@ Two modes:
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 
 def valid_cron(cron: str) -> bool:
-    """Whether `cron` parses as a cron expression - validate before storing a schedule."""
+    """Whether `cron` is an expression this queue can actually schedule.
+
+    Parsing is not enough: `0 0 30 2 *` (February the 30th) parses and then has no
+    next date, which used to surface after the scheduler's template had been written
+    and left it behind, invisible to `schedulers()`. A schedule is valid when it can
+    name its next occurrence.
+    """
     try:
         # croniter is an optional dep, imported lazily.
         from croniter import croniter  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("cron schedules need croniter: pip install croniter") from exc
-    return bool(croniter.is_valid(cron))
+    if not croniter.is_valid(cron):
+        return False
+    try:
+        croniter(cron, time.time()).get_next(float)
+    except Exception:
+        return False
+    return True
 
 
 def next_run(now_ms: int, *, every: int | None = None, cron: str | None = None) -> int:

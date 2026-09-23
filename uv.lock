@@ -471,7 +471,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "croniter", specifier = ">=2.0" },
-    { name = "redis", specifier = ">=5.0" },
+    { name = "redis", specifier = ">=5.0.1" },
 ]
 
 [package.metadata.requires-dev]

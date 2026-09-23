@@ -6,9 +6,15 @@ results, inspecting the queue, and the admin operations.
 ## add()
 
 ```python
-queue = Queue("emails")
+queue = Queue("emails")                          # url="redis://localhost:6379"
 job = await queue.add("welcome", {"user_id": 42})
 ```
+
+`Queue(name, *, url=..., prefix="toro", connection=None, default_job_options=None)`.
+Pass `url=` to reach another server, or `connection=` to share a
+`redis.asyncio.Redis` you already have (toro never closes a connection it did not
+open). `prefix=` namespaces every key, so two applications can share one Redis, and
+it must match the workers' prefix or they are looking at different queues.
 
 `add(name, data=None, *, job_id=None, deduplication=None, **options)` writes the
 job hash and enqueues (or delays) it in one atomic script - the `added` event is
@@ -39,7 +45,7 @@ The `session.flush()` matters: `session.add()` does not talk to the database, so
 server-generated primary key is still `None` until something flushes. Collecting
 `{"user_id": None}` would produce exactly the job this section exists to prevent.
 
-`pending()` gives back a buffer whose `add` and `add_flow` take the same arguments
+`pending()` gives back a `PendingJobs` buffer whose `add` and `add_flow` take the same arguments
 they take on the queue, and copy what they are given: the dict you filled in before
 the commit is the dict that gets sent. `flush()` sends the whole batch as one
 pipelined write (plus the client's own script-cache check, so two round trips, not
@@ -88,6 +94,11 @@ hit, a job about a row that was rolled back.
 | `remove_on_complete` | unset | Which successes to keep: unset keeps the newest 1000, `False` keeps all, `True` removes at once, `N` keeps the newest N, `{"count": N, "age": seconds}` bounds both. |
 | `remove_on_fail` | unset | Same, for terminal failures; unset keeps the newest 5000. |
 | `concurrency_key` | `None` | Jobs sharing a key run one at a time, in the order they were added. See [Serializing on a key](#serializing-on-a-key). |
+
+The option **values** have names of their own, exported for anyone writing typed code:
+`Backoff` and `BackoffOpts` for the retry delay, `RemoveOption` for retention,
+`Deduplication` for `{"id", "ttl"}`, `OnFail` for a flow child's failure policy, and
+`JobOptions` for the merged set a job ends up with.
 
 Per-queue defaults go on the constructor and merge under per-call options:
 
@@ -206,6 +217,11 @@ refuses one that would land on another key: a queue key's name (`completed`,
 job's aux key (`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`). Colons are
 otherwise fine: `order:123`.
 
+It is also a path segment in every dashboard that shows it, so it may not contain
+`/` or a control character, and stops at 256 characters. A job whose id cannot go in
+a URL is a job nobody can open or remove: the page that would list it is the page
+that breaks.
+
 To enqueue a parent job together with children that must run first
 (fan-out/fan-in, chains), use `add_flow()` - see [Flows](flows.md).
 
@@ -235,8 +251,13 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.workers()` | Live workers from their heartbeats; stale entries are pruned (and logged as `lost`) on read. |
 | `await queue.departed_workers()` | Recent departures, newest first: graceful `stopped` or crashed `lost`. |
 | `await queue.metrics(minutes=60)` | Per-minute `{timestamp, added, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the same atomic scripts as the transitions (a count can never disagree with the state change it counts); `added` counts real inserts (dedup hits and id replays don't count), `failed` means terminal failures - retries don't count, stall-failures do. Buckets expire after 8 hours. |
-| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms}` totals over the window, failures first - the triage order ("which job is responsible"), not the volume order. |
+| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms}` totals over the window, failures first - the triage order ("which job is responsible"), not the volume order. A name is a label, so the breakdown stops taking new names past 1024 fields in a minute: a name with an id in it is a cardinality bomb, and the queue-level counters stay correct either way. |
 | `await queue.latency()` | Age (ms) of the next-to-run waiting job, `0` when nothing waits. Depth says how much is queued; latency says how far behind the workers are. |
+| `await queue.roots_counts()` / `get_jobs_roots(state, start, end)` | The same counts and pages with flow **children** left out, so a list reads as one row per piece of work rather than one per node ([Flows](flows.md)). |
+| `await queue.lifetime_totals()` / `metrics_text()` | Counters that never reset, and the OpenMetrics rendering of them ([Operating](operating.md)). |
+
+The shapes those metric calls return are exported and typed: `MetricsPoint`,
+`NameMetrics` and `FlowMetricsPoint`.
 
 ## Admin operations
 
@@ -249,10 +270,17 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. A RUNNING job's processor is stopped too, so its worker slot frees at once rather than when the work happens to end; the job is removed, not `cancelled`. Removing a flow parent removes its whole subtree - children included, even running ones. |
 | `await queue.clean(state, limit=1000)` | Remove every job in a state (pipelined). |
 | `await queue.pause()` / `resume()` / `is_paused()` | Stop workers claiming new jobs (in-flight jobs finish); resume wakes idle workers. |
+| `await queue.clear_departed()` | Forget the stopped-worker history. Presence records prune themselves; this is the "I have read those" button. |
 
 These are the operations a dashboard such as
 [matador](https://github.com/ilovepixelart/matador) calls under its buttons -
 they're ordinary public API.
+
+## Errors
+
+Everything toro raises subclasses `ToroError`: `JobFailedError` and
+`JobCancelledError` from `result()`, and `PartialFlushError` from a batch that half
+landed. A `ValueError` from an option is a programming error and stays one.
 
 ## Lifecycle
 

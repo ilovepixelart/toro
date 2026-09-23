@@ -14,6 +14,10 @@ worker = Worker("emails", send_welcome, concurrency=20)
 await worker.run()                   # awaits until stop()
 ```
 
+`Worker(name, processor, *, url=..., prefix="toro", connection=None, ...)` reaches
+Redis exactly as a `Queue` does: `url=` for another server, `connection=` to share a
+client you already have, `prefix=` to namespace the keys (it must match the queue's).
+
 The processor is an `async` function of one argument, the `Job`. Returning
 commits the job as `completed` (the return value, JSON-serialized, becomes
 `returnvalue`); raising routes it through the retry policy - back to the queue
@@ -215,6 +219,10 @@ state). That powers the dashboard's workers view; a worker that misses
 heartbeats long enough is pruned and logged as a `lost` departure, while
 `stop()` flips it to a visible `stopping` state first and logs `stopped` - so
 the dashboard can tell a drain from a crash.
+
+`Worker.check_stalled()` runs that sweep once by hand, which is what
+`stalled_interval=0` leaves you: the background loop is off and recovery happens when
+you ask for it (a test, or a scheduler of your own).
 
 That pruning happens when something reads `Queue.workers()`. With no reader, a
 worker killed without deregistering still does not leave its record for good: the

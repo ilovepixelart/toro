@@ -4,6 +4,8 @@ Each asserts the resulting state AND the negative case (acting on a missing job
 returns False rather than silently succeeding).
 """
 
+import uuid
+
 import pytest
 
 from toro import Queue
@@ -150,3 +152,35 @@ async def test_trigger_scheduler_carries_the_concurrency_key(q):
     # the occurrence holds the key, so the manual run has to queue behind it
     assert (await q.counts())["held"] == 1
     assert (await q.get_jobs("held", 0, -1))[0].opts.concurrency_key == "tenant-1"
+
+
+async def test_removing_something_that_is_not_a_job_touches_nothing(q):
+    """A job id arrives from a URL, and a job hash lives beside the queue's own keys:
+    `remove_job("totals")` used to delete the lifetime counters, `remove_job("meta")`
+    the data-model stamp, and `remove_job("worker:<token>")` a live worker's presence
+    record, which then read as a crashed worker. A job hash is one with options on it,
+    and nothing else is a job whatever its name.
+    """
+    await q.add("real", {})  # so the totals and the marker exist
+    worker_key = f"worker:{uuid.uuid4().hex}"
+    await q.redis.hset(q.keys.base + worker_key, mapping={"id": "w1", "host": "h"})
+
+    for name in ("totals", "meta", worker_key):
+        assert await q.remove_job(name) is False, name
+
+    assert await q.redis.hget(q.keys.totals, "added") == "1"
+    assert await q.redis.hget(q.keys.meta, "model") is not None
+    assert await q.redis.exists(q.keys.base + worker_key) == 1
+    await q.redis.delete(q.keys.base + worker_key)
+
+
+async def test_a_scheduled_occurrence_is_still_removable(q):
+    """The guard is about what a key IS, not what it is called: an occurrence's id
+    looks like an internal key (`repeat:<scheduler>:<millis>`) and is a real job."""
+    await q.add_scheduler("nightly", every=60_000, name="rollup")
+    [occurrence] = await q.get_jobs("delayed", 0, 10)
+    assert occurrence.id.startswith("repeat:")
+
+    assert await q.remove_job(occurrence.id) is True
+
+    assert await q.get_job(occurrence.id) is None

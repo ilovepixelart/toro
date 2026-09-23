@@ -22,7 +22,11 @@ pip install toro-queue      # the import name is `toro`
 
 > Installed as **`toro-queue`** on PyPI (the name `toro` was taken), but you
 > `import toro`. See the [docs](https://github.com/ilovepixelart/toro/tree/main/docs) for the
-> architecture, the reliability model, and the detailed guides.
+> architecture, the reliability model, and the detailed guides. Coming from Celery,
+> RQ or Dramatiq? [Migrating](https://github.com/ilovepixelart/toro/blob/main/docs/migrating.md)
+> maps the vocabulary. Wondering whether you need a queue at all?
+> [The FAQ](https://github.com/ilovepixelart/toro/blob/main/docs/faq.md) answers
+> "why not just use Postgres" honestly.
 > Upgrading? Breaking changes are listed per release in
 > [Upgrading](https://github.com/ilovepixelart/toro/blob/main/docs/upgrading.md).
 

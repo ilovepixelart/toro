@@ -45,6 +45,17 @@ PROMOTE_BATCH = 1000
 # charts, bounded key count (at most 480 small hashes per queue).
 METRICS_RETENTION_MS = 8 * 60 * 60 * 1000
 
+# The version of the KEY LAYOUT, which is not the library's version: it changes only
+# when the stored shape changes incompatibly, and a library that finds a higher one
+# stops. Absence means a queue written before the marker existed (0.x).
+DATA_MODEL_VERSION = 1
+
+# How much of a return value may ride along inside the completion event. Past this the
+# event carries only the job id and the waiter reads the value from the hash: decoding
+# and re-encoding a large document inside the finish script is O(size) on the single
+# Redis thread, and a script that has already written cannot be killed.
+MAX_INLINE_RESULT_BYTES = 16 * 1024
+
 # Duration histogram shape: log-scaled buckets so one set covers 20ms jobs and
 # 5-minute jobs alike. Bucket 0 is [0, 20ms); each next bucket grows 1.5x;
 # the last bucket absorbs everything past ~5.6 minutes. Successful jobs only -
@@ -290,7 +301,12 @@ local function recordMetrics(base, field, now, durMs, retentionMs, name, count)
   redis.call("HINCRBY", base .. "totals", field, count or 1)
   if durMs > 0 then redis.call("HINCRBY", base .. "totals", "ms", durMs) end
   if durMs > 0 then redis.call("HINCRBY", bucket, "ms", durMs) end
-  if name then
+  -- A job name is a LABEL, and this bucket keeps a field per distinct value for its
+  -- whole life. A producer that puts an id in the name ("email-<user>") would hand
+  -- Redis a field per user, times every bucket in the retention window, and make the
+  -- by-name read walk all of them. Past the ceiling the breakdown stops; the
+  -- queue-level counters, which are what alerting reads, are untouched.
+  if name and redis.call("HLEN", bucket) < 1024 then
     redis.call("HINCRBY", bucket, field .. ":" .. name, 1)
     if durMs > 0 then redis.call("HINCRBY", bucket, "ms:" .. name, durMs) end
     -- duration histogram ("h:<name>:<bucketIdx>"), successful jobs only
@@ -757,7 +773,7 @@ return 0
 # ARGV[1] jobId  ARGV[2] returnvalue(json)  ARGV[3] now(ms)  ARGV[4] token
 # ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)
 # ARGV[7] rlMax  ARGV[8] rlDuration(ms)  ARGV[9] metricsRetention(ms)
-# ARGV[10] globalConcurrency (0 = no cap)
+# ARGV[10] globalConcurrency (0 = no cap)  ARGV[11] inline the result in the event?
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}.
 MOVE_TO_COMPLETED = (
     _LIB
@@ -780,12 +796,24 @@ if meta[4] and not meta[3] then
 end
 -- a flow child settles into its parent here, atomically with its own commit
 if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2], now) end
--- the result is decoded and re-encoded as part of ONE cjson document: a
--- return value full of JSON metacharacters can never corrupt the message
-local okr, resultDoc = pcall(cjson.decode, ARGV[2])
+-- The result rides along with the event so a waiter needs no second round trip, and
+-- it is decoded and re-encoded as part of ONE cjson document, so a return value full
+-- of JSON metacharacters cannot corrupt the message.
+--
+-- Only while it is small. Decoding and re-encoding is O(size) on the single Redis
+-- thread, inside a script that has already written: a large enough value crosses the
+-- busy threshold, every other client on the server is refused, and SCRIPT KILL
+-- answers UNKILLABLE. A value too deep for cjson fails the encode instead, and the
+-- publish never happens at all. Either way the event goes without it and the waiter
+-- reads the value from the hash, where this script has already put it.
 local completedMsg = {jobId = ARGV[1], event = "completed"}
-if okr then completedMsg.result = resultDoc end
-redis.call("PUBLISH", KEYS[10], cjson.encode(completedMsg))
+if ARGV[11] == "1" then
+  local okr, resultDoc = pcall(cjson.decode, ARGV[2])
+  if okr then completedMsg.result = resultDoc end
+end
+local oke, encoded = pcall(cjson.encode, completedMsg)
+if not oke then encoded = cjson.encode({jobId = ARGV[1], event = "completed"}) end
+redis.call("PUBLISH", KEYS[10], encoded)
 if ARGV[5] == "1" then
   local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                           ARGV[4], tonumber(ARGV[6]), ARGV[3],
@@ -875,6 +903,14 @@ end
 return {outcome}
 """
 )
+
+# Claim the queue's data model: stamp it when it is unmarked, and answer with what it
+# actually holds either way, so one round trip both adopts and checks.
+# KEYS[1] meta  ARGV[1] this library's model version
+STAMP_MODEL = """
+redis.call("HSETNX", KEYS[1], "model", ARGV[1])
+return redis.call("HGET", KEYS[1], "model")
+"""
 
 # Add a delayed job with a caller-provided id, idempotently. Used by schedulers:
 # the deterministic id `repeat:<schedulerId>:<nextMillis>` means the same
@@ -1023,7 +1059,11 @@ local function removeTree(jobId)
     for _, cid in ipairs(cjson.decode(meta[1])) do removeTree(cid) end
   end
 end
-local existed = redis.call("EXISTS", base .. ARGV[1])
+-- What a key IS, not what it is called: a job id arrives from a URL and a job hash
+-- lives beside the queue's own keys, so `totals`, `meta` or `worker:<token>` would
+-- otherwise be removable by asking to remove a job. Every job carries its options.
+local existed = redis.call("HEXISTS", base .. ARGV[1], "opts")
+if existed == 0 then return 0 end
 local parentId = redis.call("HGET", base .. ARGV[1], "parentId")
 removeTree(ARGV[1])
 if parentId then
@@ -1359,6 +1399,7 @@ def completed_args(
         rl_duration,
         METRICS_RETENTION_MS,
         global_concurrency,
+        "1" if len(returnvalue) <= MAX_INLINE_RESULT_BYTES else "0",
     ]
 
 

@@ -6,6 +6,8 @@
 import asyncio
 import json
 
+import pytest
+
 from toro import Queue
 
 PREFIX = "torotest"
@@ -69,3 +71,16 @@ async def test_scheduler_options_win_over_the_queue_defaults(q):
     finally:
         await producer.close()
     assert stored["attempts"] == 2
+
+
+async def test_a_cron_that_never_comes_round_leaves_nothing_behind(q):
+    """`0 0 30 2 *` parses: February the 30th. croniter accepts it and then refuses to
+    name a next run, so the scheduler hash was written and the call raised after it:
+    a template invisible to `schedulers()` (which reads the repeat set) and impossible
+    to remove by name. Anything that can refuse has to refuse before the first write.
+    """
+    with pytest.raises(ValueError, match="cron"):
+        await q.add_scheduler("impossible", cron="0 0 30 2 *", name="never")
+
+    assert await q.schedulers() == []
+    assert await q.redis.exists(q.keys.scheduler("impossible")) == 0

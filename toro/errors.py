@@ -43,3 +43,20 @@ class PartialFlushError(ToroError):
         super().__init__(f"{len(sent)} of {total} jobs were sent; the rest failed: {errors[0]}")
         self.sent = sent
         self.errors = errors
+
+
+class IncompatibleDataModelError(ToroError):
+    """The queue's keys were written by a toro that understands a newer data model.
+
+    Two versions share one Redis during a rolling upgrade, so this is the ordinary
+    way an upgrade goes wrong: the older library stops rather than writing into a
+    shape it was not built for.
+    """
+
+    def __init__(self, queue: str, found: int, understood: int) -> None:
+        super().__init__(
+            f"queue {queue!r} uses data model {found}; this toro understands {understood}. "
+            f"Upgrade this process, or point it at a queue of its own."
+        )
+        self.found = found
+        self.understood = understood

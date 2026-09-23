@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import functools
 import json
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass
-from typing import Any, TypedDict, cast
+from typing import Any, ParamSpec, TypedDict, TypeVar, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
@@ -18,7 +19,7 @@ from redis.asyncio.client import PubSub
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
 from .connection import confirm_subscribed, connect
-from .errors import JobCancelledError, JobFailedError, PartialFlushError
+from .errors import IncompatibleDataModelError, JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
@@ -26,9 +27,68 @@ from .keys import Keys
 from .openmetrics import OUTCOMES, TOTAL_FIELDS, render
 from .scheduler import next_run, valid_cron
 
+# A job id travels in URLs and log lines, so it is bounded like anything else a
+# stranger writes.
+MAX_JOB_ID_CHARS = 256
+# A job name is a LABEL: it is rendered on every row, and the per-minute metrics keep
+# a field per distinct value for eight hours. Bounded for the same reasons.
+MAX_JOB_NAME_CHARS = 128
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _writes(method: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Coroutine[Any, Any, _R]]:
+    """Mark an entry point that writes, and check the data model before it does.
+
+    Once per process, not once per call: the version changes during an upgrade, not
+    during a call. The mark is what a test reads to find a write path that forgot.
+    Typed through, because the package ships `py.typed` and a decorator that erased
+    `add`'s signature would take every caller's type checking with it.
+    """
+
+    @functools.wraps(method)
+    async def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        await cast("Queue", args[0])._stamp_model()  # noqa: SLF001 - its own method
+        return await method(*args, **kwargs)
+
+    guarded.__toro_writes__ = True  # ty: ignore[unresolved-attribute]
+    return guarded
+
+
+def _job_name(name: object) -> str:
+    """Check a job name: a label a person reads and a metrics series is kept under,
+    not a place to put a payload or an id.
+    """
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > MAX_JOB_NAME_CHARS
+        or any(ord(c) < 0x20 for c in name)
+    ):
+        msg = (
+            f"job name must be a non-empty string of at most {MAX_JOB_NAME_CHARS} "
+            f"characters with no control characters"
+        )
+        raise ValueError(msg)
+    return name
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+async def stamp_data_model(stamp: Any, keys: Keys, name: str) -> None:
+    """Stamp an unmarked queue with this library's data-model version, and refuse a
+    queue whose model is newer than this library understands.
+
+    Shared by the producer and the worker because both write, and a rolling upgrade
+    puts two libraries on one queue by design.
+    """
+    found = int(await stamp(keys=[keys.meta], args=[scripts.DATA_MODEL_VERSION]))
+    if found > scripts.DATA_MODEL_VERSION:
+        raise IncompatibleDataModelError(name, found, scripts.DATA_MODEL_VERSION)
 
 
 @dataclass(frozen=True)
@@ -146,6 +206,13 @@ class Queue:
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
         self._cancel_job = self.redis.register_script(scripts.CANCEL_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
+        self._stamp = self.redis.register_script(scripts.STAMP_MODEL)
+        # Asked once per process, on the first WRITE. Not on a read: a dashboard opens
+        # a queue for every name it is given, and stamping on a read would create the
+        # ones nobody has used yet.
+        self._model_checked = False
+        # Tasks reading a result back for a waiter whose event could not carry it.
+        self._read_backs: set[asyncio.Task[None]] = set()
         self._promote_job = self.redis.register_script(scripts.PROMOTE_JOB)
         self._list_roots = self.redis.register_script(scripts.LIST_ROOTS)
         self._roots_counts_script = self.redis.register_script(scripts.ROOTS_COUNTS)
@@ -166,6 +233,15 @@ class Queue:
                 "custom job_id must be a non-empty, non-all-digits string "
                 "(digits collide with auto-generated ids) - try e.g. 'order-123'"
             )
+        # A job id is a path segment in every dashboard that shows it. One that cannot
+        # be put in a URL is a job nobody can open or remove, because the page that
+        # would list it is the page that breaks; a control character does the same to
+        # a log line. The length cap is the same idea as clipping a payload.
+        if "/" in job_id or any(ord(c) < 0x20 for c in job_id) or len(job_id) > MAX_JOB_ID_CHARS:
+            raise ValueError(
+                f"custom job_id must have no '/' or control characters and be at most "
+                f"{MAX_JOB_ID_CHARS} characters: it is a path segment wherever it is shown"
+            )
         conflict = self.keys.job_id_conflict(job_id)
         if conflict:
             # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
@@ -175,6 +251,7 @@ class Queue:
             )
         return job_id
 
+    @_writes
     async def add(
         self,
         name: str,
@@ -214,6 +291,7 @@ class Queue:
         """Everything `add()` does except the round trip. Shared with `pending()`,
         which stages a batch and sends it in one.
         """
+        _job_name(name)
         options = JobOptions(**{**self.default_job_options, **opts})
         options.priority = _clamp_priority(options.priority)
         if job_id is not None:
@@ -277,6 +355,7 @@ class Queue:
             build=build,
         )
 
+    @_writes
     async def add_flow(
         self,
         name: str,
@@ -301,6 +380,7 @@ class Queue:
         self, name: str, data: Any, *, children: list[FlowChild], opts: dict[str, Any]
     ) -> _Staged:
         """Everything `add_flow()` does except the round trip."""
+        _job_name(name)
         if not children:
             raise ValueError("a flow needs at least one child - use add() for a single job")
         # The root is a FlowChild too: same validation (incl. "no delay on a
@@ -331,6 +411,17 @@ class Queue:
             args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
             build=build,
         )
+
+    async def _stamp_model(self) -> None:
+        """Adopt this queue's data model, or refuse it, once per process.
+
+        The version changes during an upgrade, not during a call, so checking per call
+        would buy nothing and cost the hot path a round trip.
+        """
+        if self._model_checked:
+            return
+        await stamp_data_model(self._stamp, self.keys, self.name)
+        self._model_checked = True
 
     def pending(self) -> PendingJobs:
         """Collect jobs now; send them when the write they belong to has committed.
@@ -542,14 +633,36 @@ class Queue:
             if fut.done():
                 continue
             if event == "completed":
-                fut.set_result(data.get("result"))
+                if "result" in data:
+                    fut.set_result(data["result"])
+                else:
+                    # too large or too deep to travel in the event: read it back from
+                    # the hash, where the finish script already wrote it
+                    self._read_back(job_id, fut)
             elif event == "cancelled":
                 fut.set_exception(JobCancelledError(job_id, data.get("reason")))
             else:
                 fut.set_exception(JobFailedError(data.get("reason")))
 
+    def _read_back(self, job_id: str, fut: asyncio.Future[Any]) -> None:
+        """Resolve a waiter from the job's stored return value.
+
+        The task is held in a set of its own: the loop keeps no reference to a task
+        nobody awaits, and a garbage-collected one leaves the waiter hanging forever.
+        """
+
+        async def read() -> None:
+            job = await self.get_job(job_id)
+            if not fut.done():
+                fut.set_result(job.returnvalue if job else None)
+
+        task = asyncio.create_task(read())
+        self._read_backs.add(task)
+        task.add_done_callback(self._read_backs.discard)
+
     # ---- schedulers (cron / repeatable) -----------------------------------
 
+    @_writes
     async def add_scheduler(
         self,
         scheduler_id: str,
@@ -628,6 +741,7 @@ class Queue:
             ],
         )
 
+    @_writes
     async def remove_scheduler(self, scheduler_id: str) -> None:
         """Stop a schedule and drop its pending occurrence."""
         score = await self.redis.zscore(self.keys.repeat, scheduler_id)
@@ -636,6 +750,7 @@ class Queue:
         if score is not None:
             await self.remove_job(f"repeat:{scheduler_id}:{int(score)}")
 
+    @_writes
     async def trigger_scheduler(self, scheduler_id: str) -> bool:
         """Enqueue one immediate occurrence of a scheduler (a manual 'run now').
 
@@ -956,6 +1071,7 @@ class Queue:
         raw = _str_list(await self.redis.lrange(self.keys.departed, 0, limit - 1))
         return [json.loads(r) for r in raw]
 
+    @_writes
     async def clear_departed(self) -> int:
         """Drop the recorded worker departures (the post-mortem log). Returns the count
         cleared. Live workers re-appear via their heartbeats; this only clears history.
@@ -1084,6 +1200,7 @@ class Queue:
             self.keys.base,
         ]
 
+    @_writes
     async def retry_job(self, job_id: str) -> bool:
         """Move a failed job back to the queue for another attempt.
 
@@ -1126,6 +1243,7 @@ class Queue:
             self.keys.cancel,
         ]
 
+    @_writes
     async def remove_job(self, job_id: str) -> bool:
         """Delete a job from every state and drop its hash.
 
@@ -1136,6 +1254,7 @@ class Queue:
         res = await self._remove_job(keys=self._remove_job_keys(), args=[job_id, _now_ms()])
         return bool(res)
 
+    @_writes
     async def cancel_job(self, job_id: str, *, reason: str | None = None) -> bool:
         """Stop a job wherever it is. True when there was something to stop.
 
@@ -1164,6 +1283,7 @@ class Queue:
         )
         return bool(res)
 
+    @_writes
     async def promote_job(self, job_id: str) -> bool:
         """Move a delayed job into the queue to run now."""
         res = await self._promote_job(
@@ -1237,6 +1357,7 @@ class Queue:
                 out.append(Job.from_hash(job_id, h))
         return out
 
+    @_writes
     async def retry_all_failed(self, limit: int = 1000) -> int:
         """Re-queue every failed job. Returns how many were retried.
 
@@ -1274,6 +1395,7 @@ class Queue:
             ]
         return ids
 
+    @_writes
     async def retry_flow(self, parent_id: str) -> int:
         """Re-drive a whole failed flow: retry every failed job in the parent's
         subtree (the parent and all its descendants) in one call. Returns how
@@ -1297,6 +1419,7 @@ class Queue:
         res = await pipe.execute()
         return sum(1 for r in res if r)
 
+    @_writes
     async def clean(self, state: JobState, limit: int = 1000) -> int:
         """Remove every job in a state (up to `limit`, oldest first - when the
         limit truncates, old history goes before recent results). Returns how
@@ -1323,10 +1446,12 @@ class Queue:
 
     # ---- queue control ----------------------------------------------------
 
+    @_writes
     async def pause(self) -> None:
         """Stop workers from claiming new jobs (in-flight jobs still finish)."""
         await self.redis.set(self.keys.meta_paused, "1")
 
+    @_writes
     async def resume(self) -> None:
         """Resume claiming, and wake idle workers."""
         await self.redis.delete(self.keys.meta_paused)
@@ -1336,21 +1461,27 @@ class Queue:
         return bool(await self.redis.exists(self.keys.meta_paused))
 
     async def close(self) -> None:
-        if self._events_task is not None:
-            self._events_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._events_task
-            self._events_task = None
-        if self._events_pubsub is not None:
-            await self._events_pubsub.aclose()
-            self._events_pubsub = None
-        # Fail anyone still awaiting result() fast, rather than leaving them to
-        # sit out their timeout against a closed connection.
-        for waiters in self._result_waiters.values():
-            for fut in waiters:
-                if not fut.done():
-                    fut.set_exception(RuntimeError("queue closed while waiting for a result"))
-        await self.redis.aclose(close_connection_pool=self._owns_connection)
+        # Every step in a finally: a pub/sub close that raises would otherwise skip
+        # the connection close and leak the pool, which is the one thing this method
+        # exists to prevent.
+        try:
+            if self._events_task is not None:
+                self._events_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._events_task
+                self._events_task = None
+            if self._events_pubsub is not None:
+                with contextlib.suppress(Exception):
+                    await self._events_pubsub.aclose()
+                self._events_pubsub = None
+            # Fail anyone still awaiting result() fast, rather than leaving them to
+            # sit out their timeout against a closed connection.
+            for waiters in self._result_waiters.values():
+                for fut in waiters:
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("queue closed while waiting for a result"))
+        finally:
+            await self.redis.aclose(close_connection_pool=self._owns_connection)
 
 
 class PendingJobs:
@@ -1421,19 +1552,33 @@ class PendingJobs:
         Redis has no rollback: if a script fails for one job the others are already
         enqueued. That raises `PartialFlushError`, naming what was sent, and leaves
         exactly what did not send in the buffer, so a retry cannot double anything.
+
+        A flush that never reaches Redis at all (a dead connection) keeps the whole
+        batch, because nothing can say how much of it landed: a retry may duplicate,
+        which is the direction an at-least-once queue errs in.
         """
         calls, self._calls = self._calls, []
         if not calls:
             return []
         try:
             staged = [stage() for stage in calls]
+            await self._queue._stamp_model()  # noqa: SLF001 - the queue's own check
         except BaseException:
             self._calls = calls + self._calls  # nothing was sent; the batch stands
             raise
-        async with self._queue.redis.pipeline(transaction=False) as pipe:
-            for item in staged:
-                await item.script(keys=item.keys, args=item.args, client=pipe)
-            replies = await pipe.execute(raise_on_error=False)
+        try:
+            async with self._queue.redis.pipeline(transaction=False) as pipe:
+                for item in staged:
+                    await item.script(keys=item.keys, args=item.args, client=pipe)
+                replies = await pipe.execute(raise_on_error=False)
+        except BaseException:
+            # The connection died somewhere in there and nothing can say how much of
+            # the batch landed. Keeping it means a retry may duplicate; dropping it
+            # means the jobs are gone with no record of what they were, after the
+            # transaction they belong to has committed. This queue is at-least-once
+            # by design, so duplicating beats losing.
+            self._calls = calls + self._calls
+            raise
         sent: list[Job] = []
         failed: list[tuple[Callable[[], _Staged], BaseException]] = []
         for call, item, reply in zip(calls, staged, replies, strict=True):

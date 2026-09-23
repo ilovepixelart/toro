@@ -361,7 +361,7 @@ async def test_finish_with_a_missing_cap_commits_nothing(q):
                 rl_max=0,
                 rl_duration=0,
                 global_concurrency=0,
-            )[:-1],  # the cap is the last argument: a caller that never sends it
+            )[:9],  # a caller that never sends the cap (ARGV[10]) or anything after
         )
 
     failed_keys = [
