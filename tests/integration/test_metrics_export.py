@@ -67,6 +67,23 @@ async def test_a_flow_counts_every_job_it_adds(q):
     assert (await _totals(q))["added"] == 3
 
 
+async def test_a_scheduled_occurrence_is_counted_as_added(q, run_worker, run_until):
+    """A schedule's occurrences are jobs like any other. Counted nowhere, a queue
+    driven only by a schedule reports added=0 while completing work, so any panel
+    reading backlog as added minus finished goes negative and stays there."""
+
+    async def proc(job):
+        return job.name
+
+    await q.add_scheduler("tick", every=100, name="tock")  # mints the first occurrence
+    assert (await _totals(q))["added"] == 1
+
+    async with run_worker(q, proc):  # picking one up mints the next
+        assert await run_until(_settled(q, 1), timeout=10)
+
+    assert (await _totals(q))["added"] >= 2, "the occurrence a worker minted was not counted"
+
+
 async def test_totals_never_expire(q):
     """OP-002: `rate()` reads a counter across restarts, so the key it reads from
     cannot be one that quietly disappears after eight hours."""

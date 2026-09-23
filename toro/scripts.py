@@ -880,7 +880,7 @@ return {outcome}
 # KEYS[1] delayed  KEYS[2] key base
 # ARGV[1] jobId  ARGV[2] name  ARGV[3] data(json)  ARGV[4] opts(json)
 # ARGV[5] now(ms)  ARGV[6] processAt(ms)  ARGV[7] priority  ARGV[8] schedulerId
-# ARGV[9] concurrency key ("" = none)
+# ARGV[9] concurrency key ("" = none)  ARGV[10] metrics retention(ms)
 ADD_SCHEDULED = (
     _LIB
     + """
@@ -898,6 +898,8 @@ if takeKey(base, jobKey, ARGV[1], ARGV[9], tonumber(ARGV[7]), base .. "pc", now)
   redis.call("HSET", jobKey, "state", "delayed")
   redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
 end
+-- an occurrence is a job: counted where it is created, like every other enqueue
+recordMetrics(base, "added", now, 0, tonumber(ARGV[10]))
 return 1
 """
 )
