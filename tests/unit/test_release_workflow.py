@@ -10,7 +10,18 @@ green build, which is the most expensive place to find out.
 import pathlib
 import re
 
-WORKFLOW = pathlib.Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+import pytest
+
+WORKFLOWS = sorted(
+    (pathlib.Path(__file__).resolve().parents[2] / ".github/workflows").glob("*.y*ml")
+)
+WORKFLOW = next(w for w in WORKFLOWS if w.name == "release.yml")
+# The one action that cannot be pinned to a commit. It is a composite action that
+# generates a Docker action at run time, and `create-docker-action.py` builds the
+# image reference as `ghcr.io/<repo>:<the ref you called it with>`. No image is
+# published under a bare commit, so a hash pin asks for a tag that never existed
+# and the runner reports "manifest unknown". Verified the hard way, twice.
+DOCKER_ACTION = "pypa/gh-action-pypi-publish"
 PUBLISH = re.compile(r"uses:\s*pypa/gh-action-pypi-publish@(?P<ref>\S+)")
 
 
@@ -29,6 +40,59 @@ def test_the_publish_action_is_pinned_to_a_release():
     )
 
 
+def test_the_workflows_are_linted_by_something():
+    """Everything above is a rule about these files that only this suite enforces,
+    and this suite only knows the rules it was told. zizmor knows the ones nobody
+    here has thought of yet, so it runs where the other checks run."""
+    ci = next(w for w in WORKFLOWS if w.name != "release.yml")
+    assert "zizmor" in ci.read_text(), "nothing audits the workflows themselves"
+
+
+def _jobs(workflow: pathlib.Path) -> dict[str, str]:
+    """Split a workflow into its jobs. Regex rather than a YAML parser because that
+    is one more dependency than this check is worth, and the indentation here is not
+    in question."""
+    text = workflow.read_text()
+    body = text[text.index("\njobs:") :]
+    chunks = re.split(r"\n  (?=[\w-]+:\n)", body)
+    return {chunk.split(":", 1)[0].strip(): chunk for chunk in chunks[1:]}
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_every_job_gives_up_eventually(workflow: pathlib.Path):
+    """A hosted job runs for six hours before GitHub stops it, and these finish in
+    about three minutes. A wedged service container or a deadlocked test would
+    otherwise hold a runner all afternoon, once per matrix cell."""
+    jobs = _jobs(workflow)
+    assert jobs, f"found no jobs in {workflow.name}"
+    forever = [name for name, body in jobs.items() if "timeout-minutes:" not in body]
+    assert forever == [], f"these run until GitHub stops them: {forever}"
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_no_checkout_leaves_its_credentials_in_the_workspace(workflow: pathlib.Path):
+    """actions/checkout writes a token into .git/config and leaves it there for the
+    rest of the job, where anything that packages the directory can carry it out."""
+    text = workflow.read_text()
+    checkouts = text.count("uses: actions/checkout@")
+    assert checkouts == text.count("persist-credentials: false"), (
+        f"{workflow.name}: a checkout keeps its credentials"
+    )
+
+
+def test_something_keeps_the_pinned_commits_current():
+    """A commit pin freezes the action at that commit, including its unfixed bugs and
+    its unfixed vulnerabilities. Pinning without anything to raise the pins trades a
+    moving reference for a stale one, so the two belong together: Dependabot rewrites
+    the hash and the version comment beside it.
+    """
+    config = WORKFLOWS[0].parent.parent / "dependabot.yml"
+    assert config.exists(), "nothing raises the commit pins this repo now requires"
+    text = config.read_text()
+    assert "github-actions" in text
+    assert "interval" in text
+
+
 def test_the_publish_job_asks_for_the_token_it_needs_and_no_more():
     """The workflow's default permissions are the repository's, which is more than a
     release needs; the publish job asks for id-token itself."""
@@ -37,11 +101,31 @@ def test_the_publish_job_asks_for_the_token_it_needs_and_no_more():
     assert "id-token: write" in text
 
 
-def test_nothing_else_in_the_release_rides_a_branch():
-    """Every action in the release path is pinned to something that does not move."""
-    floating = [
-        ref
-        for ref in re.findall(r"uses:\s*\S+@(\S+)", WORKFLOW.read_text())
-        if not re.fullmatch(r"v\d+(\.\d+)*", ref) and not re.fullmatch(r"[0-9a-f]{40}", ref)
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_every_action_is_pinned_to_a_commit(workflow: pathlib.Path):
+    """A tag is not an immutable reference: whoever owns the action can move it, and
+    GitHub's own guidance is that a full commit is the only way to pin one. Our
+    release job hands an OIDC token that can publish to PyPI to an action we do not
+    own, so this is the job where a moved tag would cost the most.
+
+    `DOCKER_ACTION` is the documented exception and is checked separately.
+    """
+    unpinned = [
+        f"{action}@{ref}"
+        for action, ref in re.findall(r"uses:\s*(\S+)@(\S+)", workflow.read_text())
+        if action != DOCKER_ACTION and not re.fullmatch(r"[0-9a-f]{40}", ref)
     ]
-    assert floating == [], f"these move under the release: {floating}"
+    assert unpinned == [], f"pin these to a commit: {unpinned}"
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_a_pinned_commit_still_says_which_release_it_is(workflow: pathlib.Path):
+    """A bare hash tells a reader nothing and tells Dependabot nothing either: it
+    matches the trailing comment when it raises the pin, so the comment is part of
+    the mechanism rather than decoration."""
+    bare = [
+        line.strip()
+        for line in workflow.read_text().splitlines()
+        if re.search(r"uses:\s*\S+@[0-9a-f]{40}\s*$", line)
+    ]
+    assert bare == [], f"say which release these are, as `# vX.Y.Z`: {bare}"

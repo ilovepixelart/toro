@@ -16,13 +16,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # checkout leaves a token in .git/config for the rest of the job, and the
+          # next step packages this directory into a release artifact.
+          persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - name: Build sdist + wheel
         run: uv build
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
@@ -30,18 +35,23 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist/
       - name: Publish to PyPI
-        # Pinned to a release, not to the branch: this job holds the OIDC token that
-        # publishes to PyPI, and `release/v1` is a branch anyone who can move it can
-        # run code with. NOT a commit SHA: this is a Docker action and the runner
-        # pulls ghcr.io/pypa/gh-action-pypi-publish:<ref>, which has no image for a
-        # bare commit ("manifest unknown", verified the hard way).
+        # The one action here not pinned to a commit, and it cannot be: it is a
+        # composite action that generates a Docker action at run time, and its
+        # create-docker-action.py builds `ghcr.io/<repo>:<the ref you called it
+        # with>`. Nothing is published under a bare commit, so a hash pin asks for
+        # an image tag that never existed ("manifest unknown", verified twice).
+        #
+        # It stays for what it does that `uv publish` does not: it generates the
+        # PEP 740 attestations that every file of this package currently carries.
+        # A release tag is therefore the strongest pin available for it.
         uses: pypa/gh-action-pypi-publish@v1.14.2
