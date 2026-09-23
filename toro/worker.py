@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
@@ -213,6 +215,12 @@ class Worker:
         # it waits on a message, so a close in its own `finally` may never be reached,
         # and a caller-owned pool is not disconnected for us. Same shape as Queue.
         self._cancel_pubsub: PubSub | None = None
+        # Asked once, here, and not per job: calling the processor to find out what it
+        # returns would run a sync one inside the loop.
+        self._async_processor = _is_async(processor)
+        # Created on the first sync job, so an all-async worker pays nothing for a
+        # feature it never uses.
+        self._executor: ThreadPoolExecutor | None = None
         # "running" until a graceful stop flips it to "stopping" - the dashboard shows
         # a live "draining" state, and a worker that then vanishes was mid-shutdown,
         # not a crash. (The only honest way to know graceful; absence can't say why.)
@@ -292,9 +300,28 @@ class Worker:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._close_cancel_pubsub()
+        if self._executor is not None:
+            # A thread cannot be cancelled, so a sync job still running keeps its
+            # thread to the end; what this drops is the work that never started.
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
         with contextlib.suppress(Exception):
             await self._deregister()  # drop our presence record so we vanish at once
         await self.redis.aclose(close_connection_pool=self._owns_connection)
+
+    def _pool(self) -> ThreadPoolExecutor:
+        """Return the worker's own threads, one per slot.
+
+        Not the loop's default executor: that one is shared process-wide and sized
+        `min(32, cpu + 4)`, so a worker with more slots than that would queue sync
+        jobs behind a pool it does not control, and a job waiting for a thread waits
+        holding its lock.
+        """
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.concurrency, thread_name_prefix=f"toro-{self.name}"
+            )
+        return self._executor
 
     # ---- presence / heartbeat ---------------------------------------------
 
@@ -476,7 +503,14 @@ class Worker:
         # there is nothing to stop but the process loop itself. Wrapped because a
         # processor is any awaitable, and only a coroutine can become a task.
         async def run_processor() -> Any:
-            return await self.processor(job)
+            if self._async_processor:
+                return await self.processor(job)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self._pool(), self.processor, job)
+            # The inspection can be wrong (a decorator that hides a coroutine
+            # function), and then the thread hands back an un-started coroutine. The
+            # job's "result" would be a coroutine object that fails to serialize.
+            return await result if inspect.isawaitable(result) else result
 
         task = asyncio.create_task(run_processor())
         self._processors[job_id] = (task, str(fields.get("processedOn", "")))
