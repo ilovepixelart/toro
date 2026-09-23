@@ -22,6 +22,8 @@ Reference docs for how toro works. The [README](../README.md) is the quick start
   decisions behind the queue.
 - **[Operating](operating.md)** - what to scrape, what the numbers mean, and a
   dashboard that can be read-only.
+- **[Scaling](scaling.md)** - the process model, slots against replicas, what the
+  loop and the enqueue path are actually worth, measured.
 - **[Security](security.md)** - what toro guarantees (JSON-only, no dynamic
   dispatch, no string-built commands) and what you own (Redis access, secrets).
 - **[Upgrading](upgrading.md)** - breaking changes by release, each with what to

@@ -45,6 +45,60 @@ failures = await job.failed_children()   # {child_id: reason} (on_fail="continue
 
 See [Flows](flows.md) for the full model.
 
+## A sync processor
+
+A plain `def` is a processor too. It runs in a thread, so the loop stays free to
+renew locks and answer heartbeats:
+
+```python
+def handle(job):                 # no async, no await
+    return requests.get(...).json()   # a blocking library is fine here
+```
+
+The threads are the worker's own, `concurrency` of them, created on the first sync
+job and given back when the worker stops. That is deliberate: `asyncio`'s default
+executor is shared process-wide and sized `min(32, cpu + 4)`, so a worker with more
+slots than that would queue sync jobs behind a pool it does not control, each waiting
+job holding its lock while it waits.
+
+Two things a thread cannot do. It cannot be cancelled: `cancel_job()` on a running
+sync job ends the **job** at once, and the work carries on to its own end, so a sync
+processor should check `job.id` against something it can act on if that matters.
+And it cannot be interrupted at shutdown: `stop()` drops sync jobs that have not
+started and lets the running ones finish.
+
+A processor that is neither a plain `def` nor an `async def` (a decorated one, a
+callable object) is read off its `__call__`. If that reading is wrong and the call
+returns a coroutine, it is awaited rather than handed back as the job's result.
+
+## When the loop is blocked
+
+The failure this catches is silent. An async processor that calls a blocking library
+starves the loop; lock renewal is a coroutine, so renewals stop, the stalled sweep
+takes the job back, and a queue that looks healthy runs its work twice.
+
+A watchdog measures how late its own sleep returns, which sees every cause including
+ones inside a dependency, and warns once per episode:
+
+```
+event loop was blocked for 8.4s (threshold 7.5s); jobs in flight: 41, 42.
+A processor that blocks the loop stops lock renewal, and the stalled sweep
+re-runs its jobs elsewhere.
+```
+
+The jobs it names are the shortlist of suspects: the processor that blocked the loop
+is one of them. The threshold follows the lock rather than a round number (half the
+renewal interval, so 7.5 s at the defaults), `blocked_warning=<seconds>` sets it, and
+`blocked_warning=0` turns it off. A `blocked` event carries the same thing to a
+dashboard or an alert:
+
+```python
+worker.on("blocked", lambda lag, jobs: alert(f"loop blocked {lag:.1f}s: {jobs}"))
+```
+
+The fix is almost always one of two things: make the call async, or make the
+processor a plain `def` so it runs in a thread.
+
 ## Concurrency
 
 `concurrency=N` runs N processing loops ("slots") as `asyncio` tasks on one
@@ -80,6 +134,7 @@ per job.
 | `stalled_interval` / `max_stalled_count` | 30000 / 1 | The recovery sweep - same page. |
 | `grace_period` | 30.0 s | Default drain window for `stop()`. |
 | `heartbeat_interval` | 5000 ms | Presence cadence for the workers view. |
+| `blocked_warning` | half `lock_renew_time` | Seconds the loop may be blocked before a warning (below). `0` turns it off. |
 
 ## Rate limiting
 

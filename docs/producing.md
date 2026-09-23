@@ -18,6 +18,44 @@ event can't be lost between the two.
 `name` is a free-form label for your processor to dispatch on; `data` is any
 JSON-serializable payload.
 
+## Enqueueing with a database write
+
+A job enqueued before its transaction commits refers to a row a rollback may take
+away: the worker picks it up, the row is not there, and the failure is a puzzle.
+Collect the adds and send them once the commit has returned.
+
+```python
+pending = queue.pending()
+user = User(email=...)
+session.add(user)
+pending.add("welcome", {"user_id": user.id})   # nothing sent yet
+
+await session.commit()
+await pending.flush()                          # one round trip, whatever the count
+```
+
+`pending()` gives back a buffer whose `add` and `add_flow` take the same arguments
+they take on the queue. `flush()` sends everything in order and returns the jobs;
+`discard()` throws the batch away. Ids are minted at the flush, so a batch that is
+never sent consumes none, and a flush that raises (a payload that will not encode)
+has sent nothing and left the batch in hand.
+
+With a framework hook, the flush moves out of the request code. SQLAlchemy:
+
+```python
+@event.listens_for(session.sync_session, "after_commit")
+def _flush(_):
+    asyncio.create_task(pending.flush())   # keep a reference; log its failures
+```
+
+Django's `transaction.on_commit` is the same shape. Either way the hook runs after
+the commit, which is the point.
+
+**It defers, it does not guarantee.** A process that dies between the commit and the
+flush sends nothing. Closing that needs an outbox table and a relay, which is a
+database integration and a different product; what this closes is the half people
+hit, a job about a row that was rolled back.
+
 ## Options
 
 | Option | Default | Meaning |

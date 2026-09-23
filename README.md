@@ -56,6 +56,9 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Reliability** | per-job locks, lock renewal, stalled-job recovery |
 | **Observability** | progress, per-job logs, lifecycle events, `await result()` |
 | **Metrics** | `metrics_text()`: OpenMetrics for any scraper, backed by counters that survive a restart |
+| **Sync handlers** | a plain `def` processor runs in the worker's own thread pool, so the loop stays free |
+| **Blocked-loop alarm** | a processor that starves the event loop is named before its lock expires |
+| **Transactional enqueue** | `pending()` collects jobs and sends them in one round trip once your write commits |
 | **Lifecycle** | pause / resume, graceful shutdown that drains in-flight jobs |
 | **Dashboard** | [matador](https://github.com/ilovepixelart/matador) - a live web UI |
 

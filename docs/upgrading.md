@@ -2,6 +2,22 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 0.11.0
+
+Nothing breaks. Three things are new.
+
+A plain `def` processor now runs in a thread instead of raising `TypeError` after
+running inside the event loop. If you were relying on that error, you were relying on
+a bug. See [Processing](processing.md).
+
+A watchdog warns when a processor blocks the event loop for longer than half the lock
+renewal interval, naming the jobs in flight. It is on by default, because the failure
+it catches (renewals stop, the stalled sweep re-runs the work) is otherwise silent.
+`blocked_warning=0` turns it off, and `blocked_warning=<seconds>` sets the threshold.
+
+`Queue.pending()` collects jobs and sends them in one round trip when you say the
+transaction committed. See [Producing](producing.md).
+
 ## 0.10.0
 
 Nothing breaks. Two things are new and worth knowing about.
