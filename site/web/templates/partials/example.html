@@ -11,5 +11,13 @@
       </button>
     {% endfor %}
   </nav>
-  <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ examples[chosen][1] | py | safe }}</code></pre>
+  <div class="min-w-0">
+    <div class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
+      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+      <span class="ml-2 font-mono text-xs text-muted">{{ examples[chosen][0] }}</span>
+    </div>
+    <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ examples[chosen][1] | py | safe }}</code></pre>
+  </div>
 </div>

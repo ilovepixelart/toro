@@ -74,7 +74,14 @@ app.mount(
   {# min-w-0: a grid item is min-content wide by default, so a wide <pre> would
      stretch its track instead of scrolling inside it. #}
   <div class="card min-w-0">
-    <div class="px-4 pt-3 pb-1"><span class="text-xs uppercase tracking-wider text-muted">{{ label }}</span></div>
+    {# the same window chrome the dashboard screenshot wears, so every pane on
+       the page reads as the same kind of object #}
+    <div class="flex items-center gap-1.5 px-3 py-2 border-b border-line bg-panel2">
+      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+      <span class="w-2.5 h-2.5 rounded-full bg-line"></span>
+      <span class="ml-2 font-mono text-xs text-muted">{{ label }}</span>
+    </div>
     <pre class="code min-w-0 p-4 font-mono text-sm leading-relaxed overflow-x-auto"><code>{{ source | py | safe }}</code></pre>
   </div>
 {% endmacro %}
@@ -107,14 +114,14 @@ app.mount(
       </div>
     </div>
 
-    {{ codepane('the whole api, more or less', quickstart) }}
+    {{ codepane('Quick start', quickstart) }}
   </div>
 </section>
 
 {% if static | default(false) %}
 <section class="pb-14">
   <div class="{{ pad }}">
-    {{ codepane('run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
+    {{ codepane('Run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
     <p class="mt-3 text-muted max-w-[64ch]">
       These commands start this page with a working queue behind it: two workers, a continuous
       stream of jobs, and the dashboard mounted at
@@ -150,7 +157,7 @@ app.mount(
 
 <section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
-    {{ heading('The API', 'Pick the problem, see the code',
+    {{ heading('API', 'Pick the problem, see the code',
        'The options you reach for most often, and the exact call for each. Everything here is in the
         library: no plugins, no extras to install.') }}
     <div class="mt-7 card">
@@ -161,7 +168,7 @@ app.mount(
 
 <section class="py-14 sm:py-16">
   <div class="{{ pad }}">
-    {{ heading('Scope', 'Everything a queue is expected to have',
+    {{ heading('Features', 'Everything a queue is expected to have',
        'None of this is an add-on or a plugin. It is in the library, documented, and enforced inside
         the same atomic scripts that move jobs between states.') }}
     <div class="mt-10 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-8">
@@ -200,18 +207,18 @@ app.mount(
         ], 'max-w-[56ch]') }}
       </div>
     </div>
-    <div class="min-w-0">{{ codepane('a parent and three children', flows) }}</div>
+    <div class="min-w-0">{{ codepane('Parent and children', flows) }}</div>
   </div>
 </section>
 
 <section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
-    {{ heading('The dashboard', 'Mounted, not run',
+    {{ heading('Dashboard', 'Mounted, not run',
        'matador is a FastAPI app. It goes inside the application you already deploy, behind the auth
         you already have, so there is no second service to run and no second login to hand out.') }}
     <div class="mt-7 grid lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-8 items-start">
       <div class="grid gap-6 min-w-0">
-        {{ codepane('mounted into your own app', mount) }}
+        {{ codepane('Mounting', mount) }}
         {{ blurbs([
           ('Read-only is a predicate', 'can_mutate decides per request, and when it says no the controls are never drawn, not merely refused.'),
           ('Scrapeable', '/metrics speaks OpenMetrics, so the queue reaches Prometheus without an exporter.'),
@@ -247,7 +254,7 @@ app.mount(
 
 <section class="py-14 sm:py-16">
   <div class="{{ pad }}">
-    {{ heading('The contract', 'What you are depending on', 'No adjectives on this one.') }}
+    {{ heading('Contract', 'What you are depending on', 'No adjectives on this one.') }}
     <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
       {% for term, value in [
           ('Version', '1.0.0, frozen API'), ('Python', '3.10 &ndash; 3.13'),
