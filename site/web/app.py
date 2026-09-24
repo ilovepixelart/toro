@@ -1,13 +1,14 @@
 """The toro website.
 
-One set of Jinja templates, rendered two ways: this app for editing them with a
-reload, and `build_static.py` for what GitHub Pages serves. Both render the same
-templates from the same example table, so the published page cannot drift from
-the one written against.
+One set of Jinja templates, rendered two ways: this app while editing them, and
+`build_static.py` for what GitHub Pages serves. Both render the same templates
+from the same example table, so the published page cannot drift from the one
+written against.
 """
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from textwrap import dedent
 
@@ -24,8 +25,9 @@ HERE = Path(__file__).parent
 # the same places.
 DOCS_URL = "https://github.com/ilovepixelart/toro/tree/main/docs"
 MATADOR_URL = "https://github.com/ilovepixelart/matador"
-# Where the page is published. Absolute because a link preview cannot resolve a
-# relative one, and canonical wherever it is rendered from.
+# Where the page is published: absolute, because a link preview cannot resolve a
+# relative URL, and canonical wherever the page is rendered from. The trailing
+# slash is load-bearing, since the head appends asset paths to it.
 SITE_URL = "https://ilovepixelart.github.io/toro/"
 
 _templates = Jinja2Templates(directory=str(HERE / "templates"))
@@ -43,12 +45,18 @@ def _highlight(source: str) -> str:
 _templates.env.filters["py"] = _highlight
 
 
-def _asset_v() -> int:
-    """Newest mtime across the static assets, so a rebuilt stylesheet is fetched
-    rather than served from cache. matador does the same; leaving it out is why
-    the first restyle appeared to do nothing."""
-    files = (HERE / "static").rglob("*")
-    return int(max((f.stat().st_mtime for f in files if f.is_file()), default=0))
+def _asset_v() -> str:
+    """A digest of the files served with `?v=`, so a rebuilt stylesheet is fetched
+    rather than read from cache. Leaving it out is why the first restyle appeared
+    to do nothing.
+
+    Content, not mtime: a fresh checkout stamps every file with the time it was
+    cloned, which would bust the cache on a deploy that changed nothing.
+    """
+    digest = hashlib.blake2b(digest_size=8)
+    for name in ("app.css", "code.css", "js/htmx.min.js"):
+        digest.update((HERE / "static" / name).read_bytes())
+    return digest.hexdigest()
 
 
 _templates.env.globals.update(
