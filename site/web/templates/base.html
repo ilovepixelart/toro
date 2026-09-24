@@ -1,3 +1,11 @@
+{# The page's spacing, defined once. A section that wants different padding is a
+   section that has drifted, so these are the only vertical numbers in the markup:
+   `band` is a section's own top and bottom, `lede` the gap under a heading block,
+   `cols` the split between two columns, and `pad` the horizontal gutter and cap. #}
+{% set pad = "w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24" %}
+{% set band = "py-14 sm:py-16" %}
+{% set lede = "mt-8" %}
+{% set cols = "gap-12 xl:gap-20" %}
 <!doctype html>
 <html lang="en" class="[color-scheme:light] [&.dark]:[color-scheme:dark]">
 <head>
@@ -31,7 +39,7 @@
 </head>
 <body class="bg-ink text-fg antialiased selection:bg-accent/25">
   <header class="border-b border-line bg-panel/40 backdrop-blur sticky top-0 z-20">
-    <div class="w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24 h-14 flex items-center gap-3">
+    <div class="{{ pad }} h-14 flex items-center gap-3">
       <span class="text-accent font-semibold tracking-tight text-base">toro</span>
       <span class="chip border border-line rounded px-1.5 py-px font-mono">1.0.0</span>
       <nav class="ml-auto flex items-center gap-6 text-sm">
@@ -55,10 +63,10 @@
   </header>
   <main>{% block body %}{% endblock %}</main>
   <footer class="border-t border-line">
-    <div class="w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24 py-12 grid sm:grid-cols-[minmax(0,1fr)_auto] gap-6 items-start">
+    <div class="{{ pad }} {{ band }} grid sm:grid-cols-[minmax(0,1fr)_auto] gap-6 items-start">
       <div>
         <p class="text-sm font-medium">toro <span class="text-muted font-normal">&middot; a job queue for Python</span></p>
-        <p class="mt-1 text-sm text-muted max-w-[52ch]">
+        <p class="mt-1.5 text-sm text-muted max-w-[52ch]">
           An async-first, Redis-backed job queue, and a dashboard you mount into your own
           application. Both MIT licensed.
         </p>

@@ -25,12 +25,22 @@ LAYOUT = re.compile(
 
 
 def _classes() -> set[str]:
+    """Every layout utility the markup names, from two places.
+
+    Class attributes, minus the ones assembled at render time. And the double
+    quoted `{% set %}` strings, because base.html keeps the page's spacing in
+    four of them (`band`, `lede`, `cols`, `pad`) and reading only attributes
+    would leave the whole vertical rhythm unchecked. Snippet blocks are written
+    with `'''`, so none of them is picked up here.
+    """
     out: set[str] = set()
     for template in TEMPLATES:
-        for attr in re.findall(r'class="([^"]*)"', template.read_text()):
-            if "{{" in attr or "{%" in attr:  # built at render time, not scannable
-                continue
-            for token in attr.split():
+        text = template.read_text()
+        attrs = re.findall(r'class="([^"]*)"', text)
+        sources = [a for a in attrs if "{{" not in a and "{%" not in a]
+        sources += re.findall(r'\{%\s*set\s+\w+\s*=\s*"([^"]*)"\s*%\}', text)
+        for source in sources:
+            for token in source.split():
                 # Keep the variant: `sm:py-16` is emitted as its own selector
                 # inside a media query, and no bare `.py-16` need exist.
                 if LAYOUT.match(token.split(":")[-1]):
@@ -69,3 +79,19 @@ def test_every_layout_utility_the_markup_uses_exists_in_the_stylesheet():
         f"{len(missing)} utilities are used but absent from app.css, so they do nothing: "
         f"{missing}. Rebuild with ./tailwindcss -i styles/input.css -o web/static/app.css --minify"
     )
+
+
+def test_no_section_writes_its_own_vertical_padding():
+    """The page's vertical rhythm is one token, `band`, defined in base.html.
+
+    A section that spells its own `py-`/`pt-`/`pb-` has stepped outside it, which
+    is how one block ended up with a bottom padding and no top padding at all,
+    sitting flush against the section above it.
+    """
+    index = (SITE / "web" / "templates" / "index.html").read_text()
+    offenders = [
+        tag
+        for tag in re.findall(r"<section[^>]*>", index)
+        if re.search(r"\b(py|pt|pb)-[0-9.]+", tag)
+    ]
+    assert offenders == [], f"these sections set their own padding instead of band: {offenders}"
