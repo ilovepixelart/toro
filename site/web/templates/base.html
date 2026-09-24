@@ -4,11 +4,22 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="htmx-config" content='{"selfRequestsOnly": true, "historyCacheSize": 0, "allowEval": false, "allowScriptTags": false}' />
-  <title>{% block title %}toro{% endblock %}</title>
-  <meta name="description" content="An async-first, Redis-backed job queue for Python. Atomic Lua state changes, per-job locks, and a dashboard you mount into your own app." />
-  {# theme before paint, the same rule matador uses #}
+  {% set summary = "An async-first, Redis-backed job queue for Python. Atomic Lua state changes, per-job locks, and a dashboard you mount into your own app." %}
+  <title>{% block title %}toro: a job queue for Python{% endblock %}</title>
+  <meta name="description" content="{{ summary }}" />
+  <link rel="canonical" href="{{ site_url }}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="toro" />
+  <meta property="og:title" content="Jobs that survive the worker running them" />
+  <meta property="og:description" content="{{ summary }}" />
+  <meta property="og:url" content="{{ site_url }}" />
+  <meta property="og:image" content="{{ site_url }}assets/dashboard.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  {# --ink, dark: the page opens dark whatever the OS says, so this is not
+     conditioned on prefers-color-scheme. #}
+  <meta name="theme-color" content="#0e1014" />
   {# Dark unless the visitor has chosen otherwise. Applied before paint so the
-     page never flashes light first. #}
+     page never flashes light first; the same rule matador uses. #}
   <script>(function () {
     if (localStorage.toroTheme !== 'light') document.documentElement.classList.add('dark');
   })();</script>
@@ -17,7 +28,6 @@
   <link rel="stylesheet" href="{{ base | default('') }}/assets/app.css?v={{ v }}" />
   <link rel="stylesheet" href="{{ base | default('') }}/assets/code.css?v={{ v }}" />
   <script src="{{ base | default('') }}/assets/js/htmx.min.js?v={{ v }}" defer></script>
-  {% if static | default(false) %}<script src="{{ base | default('') }}/assets/js/replay.js?v={{ v }}" defer></script>{% endif %}
 </head>
 <body class="bg-ink text-fg antialiased selection:bg-accent/25">
   <header class="border-b border-line bg-panel/40 backdrop-blur sticky top-0 z-20">
@@ -25,11 +35,7 @@
       <span class="text-accent font-semibold tracking-tight text-base">toro</span>
       <span class="chip border border-line rounded px-1.5 py-px font-mono">1.0.0</span>
       <nav class="ml-auto flex items-center gap-6 text-sm">
-        {% if static | default(false) %}
-          <a class="text-muted hover:text-fg transition-colors" href="{{ docs_url }}">Docs</a>
-        {% else %}
-          <a class="text-muted hover:text-fg transition-colors" href="/dashboard">Demo</a>
-        {% endif %}
+        <a class="text-muted hover:text-fg transition-colors" href="{{ docs_url }}">Docs</a>
         <a class="text-muted hover:text-fg transition-colors" href="https://github.com/ilovepixelart/toro">GitHub</a>
         <a class="text-muted hover:text-fg transition-colors" href="https://pypi.org/project/toro-queue/">PyPI</a>
         <button type="button" title="Toggle theme"
@@ -60,10 +66,26 @@
       <nav class="flex flex-wrap gap-x-6 gap-y-2 text-sm">
         <a class="text-muted hover:text-fg" href="https://github.com/ilovepixelart/toro">toro</a>
         <a class="text-muted hover:text-fg" href="https://github.com/ilovepixelart/matador">matador</a>
-        <a class="text-muted hover:text-fg" href="{{ docs_url if static | default(false) else '/dashboard' }}">{{ 'Docs' if static | default(false) else 'Demo' }}</a>
+        <a class="text-muted hover:text-fg" href="{{ docs_url }}">Docs</a>
         <a class="text-muted hover:text-fg" href="https://pypi.org/project/toro-queue/">PyPI</a>
       </nav>
     </div>
   </footer>
+  <script>(function () {
+    if (!navigator.clipboard) return;   // then the text stays select-all, as it is without JS
+    document.querySelectorAll('[data-copy]').forEach(function (button) {
+      var source = button.parentElement.querySelector('[data-install]');
+      button.hidden = false;
+      button.addEventListener('click', function () {
+        navigator.clipboard.writeText(source.textContent).then(function () {
+          button.textContent = 'copied';
+          setTimeout(function () { button.textContent = 'copy'; }, 1500);
+        }, function () {
+          // a denied clipboard leaves the visitor with the selection to copy
+          window.getSelection().selectAllChildren(source);
+        });
+      });
+    });
+  })();</script>
 </body>
 </html>

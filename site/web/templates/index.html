@@ -40,6 +40,14 @@ async def send_digest(job):
     parts = await job.children_results()
     return smtp.send("".join(parts.values()))''' %}
 
+{% set reliability = '''await Worker(
+    "emails", send,
+    lock_duration=30_000,     # the lease a running job holds
+    lock_renew_time=15_000,   # renewed this often
+    stalled_interval=30_000,  # swept for this often
+    max_stalled_count=1,      # recoveries before it fails
+).run()''' %}
+
 {% set mount = '''from fastapi import FastAPI, Depends
 from matador import create_app
 
@@ -53,6 +61,16 @@ app.mount(
         can_mutate=lambda r: r.user.is_staff,
     ),
 )''' %}
+
+{# The one string a visitor is here to copy, written once so the two places it
+   appears cannot disagree. The button appears only where the clipboard API does;
+   without it the text is still select-all. #}
+{% macro install() %}
+  <span class="inline-flex items-center gap-2 font-mono text-sm text-muted border border-dashed border-line rounded-lg pl-3 pr-1.5 py-1">
+    <span class="select-all" data-install>pip install toro-queue matador-dashboard</span>
+    <button type="button" data-copy hidden class="btn btn-sm btn-ghost text-muted">copy</button>
+  </span>
+{% endmacro %}
 
 {% macro heading(eyebrow, title, intro) %}
   <p class="text-xs uppercase tracking-wider text-accent">{{ eyebrow }}</p>
@@ -103,14 +121,10 @@ app.mount(
 
       <div class="mt-8 flex flex-wrap items-center gap-2">
         <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">View on GitHub</a>
-        {% if static | default(false) %}
-          <a class="btn btn-ghost" href="{{ docs_url }}">Read the docs</a>
-        {% else %}
-          <a class="btn btn-ghost" href="/dashboard">Open the live demo</a>
-        {% endif %}
+        <a class="btn btn-ghost" href="{{ docs_url }}">Read the docs</a>
       </div>
       <div class="mt-3 flex items-center gap-3 font-mono text-sm text-muted">
-        <span class="select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
+        {{ install() }}
         <span class="chip">MIT &middot; 1.0.0</span>
       </div>
     </div>
@@ -119,47 +133,58 @@ app.mount(
   </div>
 </section>
 
-{% if static | default(false) %}
-<section class="pb-14">
+<section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
-    {% include "partials/replay.html" %}
-    <p class="mt-3 text-muted max-w-[64ch]">
-      A run against Redis, recorded when this page was built. Twelve seconds in, a worker is
-      stopped without a graceful shutdown, so its locks are never released. Its jobs stay in
-      <span class="font-mono text-sm">active</span> until those locks expire, after which the
-      stalled sweep reassigns them to the surviving worker.
+    {{ heading('States', 'Eight states, one atomic move between them',
+       'A job is in exactly one of them at a time, and every move is a single Lua script, so a
+        crash cannot leave a job in two of them or in none. The tones are the dashboard\'s own.') }}
+    {# state, tone and meaning follow matador's state_token macro and the table in
+       docs/concepts.md; a test pins this list to toro's JobState. #}
+    <dl class="mt-9 grid sm:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-7">
+      {% for state, tone, meaning in [
+        ('wait', 'muted', 'Ready to run, waiting for a free worker.'),
+        ('delayed', 'warning', 'Scheduled for later, promoted when it comes due.'),
+        ('held', 'muted', 'Behind another job on the same concurrency key, holding no slot.'),
+        ('active', 'info', 'Claimed by a worker, running under a lock that worker renews.'),
+        ('waiting-children', 'muted', 'A flow parent, parked until its last child settles.'),
+        ('completed', 'success', 'Finished. returnvalue holds what the processor returned.'),
+        ('failed', 'danger', 'Out of attempts. failed_reason holds the error.'),
+        ('cancelled', 'muted', 'Stopped on purpose. Terminal, counted apart from failures.'),
+      ] %}
+        <div class="min-w-0">
+          <dt class="flex items-center gap-2 font-mono text-sm text-{{ tone }}">
+            <span class="inline-block w-1.5 h-1.5 rounded-full bg-{{ tone }}"></span>{{ state }}
+          </dt>
+          <dd class="mt-1.5 text-sm text-muted">{{ meaning }}</dd>
+        </div>
+      {% endfor %}
+    </dl>
+    <p class="mt-9 text-sm text-muted">
+      The normal path is <span class="font-mono text-fg">wait &rarr; active &rarr; completed</span>.
+      A failure with attempts left goes back to <span class="font-mono text-fg">wait</span>, or to
+      <span class="font-mono text-fg">delayed</span> when a backoff applies, and only the last one
+      lands in <span class="font-mono text-fg">failed</span>.
     </p>
-    <div class="mt-8">
-    {{ codepane('Run it locally', 'git clone https://github.com/ilovepixelart/toro\ncd toro/site\nuv run uvicorn web.app:app --port 8100') }}
-    <p class="mt-3 text-muted max-w-[64ch]">
-      The same page with a live queue behind it, where the kill button works.
-    </p>
-    </div>
   </div>
 </section>
-{% else %}
+
 <section class="pb-14">
-  <div class="{{ pad }}">
-    <div class="card ring-1 ring-accent/25 shadow-sm">
-      <div class="px-5 py-3 border-b border-line flex items-center gap-2 flex-wrap">
-        <span class="relative flex w-2 h-2">
-          <span class="absolute inline-flex w-full h-full rounded-full bg-success opacity-60 motion-safe:animate-ping"></span>
-          <span class="relative inline-flex w-2 h-2 rounded-full bg-success"></span>
-        </span>
-        <span class="text-sm font-medium">A real queue, running on this page</span>
-        <span class="chip">two workers &middot; concurrency 3 &middot; 4s locks</span>
+  <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
+    <div class="min-w-0">
+      {{ heading('Reliability', 'What happens when a worker dies',
+         'A claimed job is held under a lock that its worker renews while the processor runs.
+          A process that disappears stops renewing, and the next sweep puts its jobs back.') }}
+      <div class="mt-7">
+        {{ blurbs([
+          ('The lock proves the worker is alive', 'A renewer refreshes it every lock_renew_time, so a lock expires only when the process actually stopped.'),
+          ('Recovery is a sweep, not a timeout', 'Every worker looks for jobs whose lock expired and re-enqueues them at their stored priority, throttled so the fleet sweeps about once per interval.'),
+          ('The result commits once', 'A late finish from the dead process is rejected by its token: the handler may run twice, the job settles once.'),
+        ], 'max-w-[56ch]') }}
       </div>
-      {% include "partials/pulse.html" %}
     </div>
-    <p class="mt-3 text-muted max-w-[64ch]">
-      The kill buttons stop a worker without a graceful shutdown, so its locks are never
-      released. Its jobs stay in <span class="font-mono text-sm">active</span> until those locks
-      expire, after which the stalled sweep reassigns them to the surviving worker. The counters
-      above read from Redis.
-    </p>
+    <div class="min-w-0">{{ codepane('Worker options', reliability) }}</div>
   </div>
 </section>
-{% endif %}
 
 <section class="py-14 sm:py-16 bg-panel">
   <div class="{{ pad }}">
@@ -236,9 +261,7 @@ app.mount(
       </div>
       {# A link only when there is something to open: on the static page this is a
          picture of the dashboard, not a door to one. #}
-      <{{ 'div' if static | default(false) else 'a' }}
-         {%- if not static | default(false) %} href="/dashboard"{% endif %}
-         class="card ring-1 ring-line block overflow-hidden group{{ ' transition-colors hover:ring-accent/40' if not static | default(false) }}">
+      <div class="card ring-1 ring-line block overflow-hidden">
         <span class="flex items-center gap-1.5 px-3 py-2.5 border-b border-line bg-panel2">
           <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
           <span class="w-2.5 h-2.5 rounded-full bg-muted/40"></span>
@@ -248,15 +271,10 @@ app.mount(
         <img src="{{ base | default('') }}/assets/dashboard.png" alt="The matador dashboard showing a queue's jobs, states and throughput"
              class="w-full block" loading="lazy" />
         <span class="flex items-center justify-between px-4 py-3 border-t border-line text-sm">
-          {% if static | default(false) %}
-            <span class="text-muted">matador, reading a toro queue</span>
-            <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">Source &rarr;</a>
-          {% else %}
-            <span class="text-muted">Reading the queue above</span>
-            <span class="text-accent font-medium group-hover:underline">Open it &rarr;</span>
-          {% endif %}
+          <span class="text-muted">matador, reading a toro queue</span>
+          <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">Source &rarr;</a>
         </span>
-      </{{ 'div' if static | default(false) else 'a' }}>
+      </div>
     </div>
   </div>
 </section>
@@ -277,7 +295,7 @@ app.mount(
     </dl>
     <div class="mt-10 flex flex-wrap items-center gap-3">
       <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">Read the source</a>
-      <span class="font-mono text-sm text-muted select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
+      {{ install() }}
     </div>
   </div>
 </section>

@@ -16,12 +16,12 @@ import re
 import subprocess
 import sys
 import textwrap
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
 import toro
-from toro import FlowChild, Job, JobOptions, PendingJobs, Queue, Worker
+from toro import FlowChild, Job, JobOptions, JobState, PendingJobs, Queue, Worker
 
 SITE = pathlib.Path(__file__).resolve().parents[2] / "site"
 INDEX = SITE / "web" / "templates" / "index.html"
@@ -165,4 +165,16 @@ def test_the_test_count_on_the_page_is_the_real_one():
     assert actual >= floor, f"the page claims {floor}+ tests, the suite collects {actual}"
     assert actual - floor < 100, (
         f"the page claims {floor}+ but the suite has {actual}: raise the number"
+    )
+
+
+def test_the_states_on_the_page_are_the_states_toro_has():
+    """The page lists every job state and what it means. A state the library
+    gains or drops without the page following describes a different queue, and
+    the eight names are frozen API, so the list can be pinned exactly."""
+    listed = re.findall(
+        r"\('([a-z-]+)', '(?:muted|info|success|warning|danger)', '", INDEX.read_text()
+    )
+    assert sorted(listed) == sorted(get_args(JobState)), (
+        f"the page lists {sorted(listed)}, toro has {sorted(get_args(JobState))}"
     )
