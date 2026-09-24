@@ -1,13 +1,12 @@
 """Render the site to static HTML, the way GitHub Pages would serve it.
 
-The live queue panel cannot exist on a static host, so `static=True` swaps it for
-a still. Everything else - including the htmx example switcher, which only ever
-does a GET for HTML - is written out as files and keeps working.
+The htmx example switcher only ever does a GET for HTML, which a file on disk
+answers as well as a route, so `static=True` changes nothing but the extension it
+asks for.
 """
 
 from __future__ import annotations
 
-import json
 import pathlib
 import re
 import shutil
@@ -17,7 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from jinja2 import Environment, FileSystemLoader
 
-from web.app import EXAMPLES, _highlight
+from web.app import DOCS_URL, EXAMPLES, MATADOR_URL, _highlight
 
 HERE = pathlib.Path(__file__).parent
 DIST = HERE / "dist"
@@ -38,19 +37,10 @@ def main() -> None:
     env.globals["asset_v"] = lambda: 1
     env.globals["static"] = True
     env.globals["base"] = BASE
-    # Nothing links to a demo until one is deployed: a dead link is worse than no
-    # link. The static page sends people to the docs instead.
-    env.globals["docs_url"] = "https://github.com/ilovepixelart/toro/tree/main/docs"
-    env.globals["matador_url"] = "https://github.com/ilovepixelart/matador"
+    env.globals["docs_url"] = DOCS_URL
+    env.globals["matador_url"] = MATADOR_URL
 
-    # The panel's rendered state is the recording's first frame, so a reader with
-    # JavaScript off sees where the run started rather than invented numbers.
-    replay = json.loads((HERE / "web" / "static" / "replay.json").read_text())
-    common = {
-        "examples": EXAMPLES,
-        "chosen": next(iter(EXAMPLES)),
-        "first": replay["frames"][0],
-    }
+    common = {"examples": EXAMPLES, "chosen": next(iter(EXAMPLES))}
 
     (DIST / "index.html").write_text(env.get_template("index.html").render(**common))
     for key in EXAMPLES:
