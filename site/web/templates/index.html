@@ -62,6 +62,16 @@ app.mount(
     ),
 )''' %}
 
+{# The one string a visitor is here to copy, written once so the two places it
+   appears cannot disagree. The button appears only where the clipboard API does;
+   without it the text is still select-all. #}
+{% macro install() %}
+  <span class="inline-flex items-center gap-2 font-mono text-sm text-muted border border-dashed border-line rounded-lg pl-3 pr-1.5 py-1">
+    <span class="select-all" data-install>pip install toro-queue matador-dashboard</span>
+    <button type="button" data-copy hidden class="btn btn-sm btn-ghost text-muted">copy</button>
+  </span>
+{% endmacro %}
+
 {% macro heading(eyebrow, title, intro) %}
   <p class="text-xs uppercase tracking-wider text-accent">{{ eyebrow }}</p>
   <h2 class="font-display mt-2 text-2xl font-semibold tracking-tight text-balance">{{ title }}</h2>
@@ -114,12 +124,47 @@ app.mount(
         <a class="btn btn-ghost" href="{{ docs_url }}">Read the docs</a>
       </div>
       <div class="mt-3 flex items-center gap-3 font-mono text-sm text-muted">
-        <span class="select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
+        {{ install() }}
         <span class="chip">MIT &middot; 1.0.0</span>
       </div>
     </div>
 
     {{ codepane('Quick start', quickstart) }}
+  </div>
+</section>
+
+<section class="py-14 sm:py-16 bg-panel">
+  <div class="{{ pad }}">
+    {{ heading('States', 'Eight states, one atomic move between them',
+       'A job is in exactly one of them at a time, and every move is a single Lua script, so a
+        crash cannot leave a job in two of them or in none. The tones are the dashboard\'s own.') }}
+    {# state, tone and meaning follow matador's state_token macro and the table in
+       docs/concepts.md; a test pins this list to toro's JobState. #}
+    <dl class="mt-9 grid sm:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-7">
+      {% for state, tone, meaning in [
+        ('wait', 'muted', 'Ready to run, waiting for a free worker.'),
+        ('delayed', 'warning', 'Scheduled for later, promoted when it comes due.'),
+        ('held', 'muted', 'Behind another job on the same concurrency key, holding no slot.'),
+        ('active', 'info', 'Claimed by a worker, running under a lock that worker renews.'),
+        ('waiting-children', 'muted', 'A flow parent, parked until its last child settles.'),
+        ('completed', 'success', 'Finished. returnvalue holds what the processor returned.'),
+        ('failed', 'danger', 'Out of attempts. failed_reason holds the error.'),
+        ('cancelled', 'muted', 'Stopped on purpose. Terminal, counted apart from failures.'),
+      ] %}
+        <div class="min-w-0">
+          <dt class="flex items-center gap-2 font-mono text-sm text-{{ tone }}">
+            <span class="inline-block w-1.5 h-1.5 rounded-full bg-{{ tone }}"></span>{{ state }}
+          </dt>
+          <dd class="mt-1.5 text-sm text-muted">{{ meaning }}</dd>
+        </div>
+      {% endfor %}
+    </dl>
+    <p class="mt-9 text-sm text-muted">
+      The normal path is <span class="font-mono text-fg">wait &rarr; active &rarr; completed</span>.
+      A failure with attempts left goes back to <span class="font-mono text-fg">wait</span>, or to
+      <span class="font-mono text-fg">delayed</span> when a backoff applies, and only the last one
+      lands in <span class="font-mono text-fg">failed</span>.
+    </p>
   </div>
 </section>
 
@@ -250,7 +295,7 @@ app.mount(
     </dl>
     <div class="mt-10 flex flex-wrap items-center gap-3">
       <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">Read the source</a>
-      <span class="font-mono text-sm text-muted select-all border border-dashed border-line rounded-lg px-3 py-1.5">pip install toro-queue matador-dashboard</span>
+      {{ install() }}
     </div>
   </div>
 </section>

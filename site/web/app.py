@@ -24,6 +24,9 @@ HERE = Path(__file__).parent
 # the same places.
 DOCS_URL = "https://github.com/ilovepixelart/toro/tree/main/docs"
 MATADOR_URL = "https://github.com/ilovepixelart/matador"
+# Where the page is published. Absolute because a link preview cannot resolve a
+# relative one, and canonical wherever it is rendered from.
+SITE_URL = "https://ilovepixelart.github.io/toro/"
 
 _templates = Jinja2Templates(directory=str(HERE / "templates"))
 
@@ -48,7 +51,9 @@ def _asset_v() -> int:
     return int(max((f.stat().st_mtime for f in files if f.is_file()), default=0))
 
 
-_templates.env.globals.update(asset_v=_asset_v, docs_url=DOCS_URL, matador_url=MATADOR_URL)
+_templates.env.globals.update(
+    asset_v=_asset_v, docs_url=DOCS_URL, matador_url=MATADOR_URL, site_url=SITE_URL
+)
 
 # The use-case browser. Every snippet is lifted from toro's README, so the page
 # cannot drift from the API it is advertising without the README drifting too.

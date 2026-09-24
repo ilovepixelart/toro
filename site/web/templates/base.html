@@ -4,11 +4,22 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="htmx-config" content='{"selfRequestsOnly": true, "historyCacheSize": 0, "allowEval": false, "allowScriptTags": false}' />
-  <title>{% block title %}toro{% endblock %}</title>
-  <meta name="description" content="An async-first, Redis-backed job queue for Python. Atomic Lua state changes, per-job locks, and a dashboard you mount into your own app." />
-  {# theme before paint, the same rule matador uses #}
+  {% set summary = "An async-first, Redis-backed job queue for Python. Atomic Lua state changes, per-job locks, and a dashboard you mount into your own app." %}
+  <title>{% block title %}toro: a job queue for Python{% endblock %}</title>
+  <meta name="description" content="{{ summary }}" />
+  <link rel="canonical" href="{{ site_url }}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="toro" />
+  <meta property="og:title" content="Jobs that survive the worker running them" />
+  <meta property="og:description" content="{{ summary }}" />
+  <meta property="og:url" content="{{ site_url }}" />
+  <meta property="og:image" content="{{ site_url }}assets/dashboard.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  {# --ink, dark: the page opens dark whatever the OS says, so this is not
+     conditioned on prefers-color-scheme. #}
+  <meta name="theme-color" content="#0e1014" />
   {# Dark unless the visitor has chosen otherwise. Applied before paint so the
-     page never flashes light first. #}
+     page never flashes light first; the same rule matador uses. #}
   <script>(function () {
     if (localStorage.toroTheme !== 'light') document.documentElement.classList.add('dark');
   })();</script>
@@ -60,5 +71,21 @@
       </nav>
     </div>
   </footer>
+  <script>(function () {
+    if (!navigator.clipboard) return;   // then the text stays select-all, as it is without JS
+    document.querySelectorAll('[data-copy]').forEach(function (button) {
+      var source = button.parentElement.querySelector('[data-install]');
+      button.hidden = false;
+      button.addEventListener('click', function () {
+        navigator.clipboard.writeText(source.textContent).then(function () {
+          button.textContent = 'copied';
+          setTimeout(function () { button.textContent = 'copy'; }, 1500);
+        }, function () {
+          // a denied clipboard leaves the visitor with the selection to copy
+          window.getSelection().selectAllChildren(source);
+        });
+      });
+    });
+  })();</script>
 </body>
 </html>

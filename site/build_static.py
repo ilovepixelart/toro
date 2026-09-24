@@ -16,7 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from jinja2 import Environment, FileSystemLoader
 
-from web.app import DOCS_URL, EXAMPLES, MATADOR_URL, _highlight
+from web.app import DOCS_URL, EXAMPLES, MATADOR_URL, SITE_URL, _highlight
 
 HERE = pathlib.Path(__file__).parent
 DIST = HERE / "dist"
@@ -39,6 +39,7 @@ def main() -> None:
     env.globals["base"] = BASE
     env.globals["docs_url"] = DOCS_URL
     env.globals["matador_url"] = MATADOR_URL
+    env.globals["site_url"] = SITE_URL
 
     common = {"examples": EXAMPLES, "chosen": next(iter(EXAMPLES))}
 
