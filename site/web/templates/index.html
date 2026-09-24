@@ -6,10 +6,6 @@
   bundling utilities into CSS classes with @apply.
 #}
 
-{# Centred with a generous cap, the way most developer sites do it: wide enough
-   that a laptop is effectively full-bleed, capped so a wide monitor centres
-   rather than stretching. One number to change. #}
-{% set pad = "w-full mx-auto max-w-[1600px] px-6 lg:px-10 xl:px-16 2xl:px-24" %}
 
 {% set quickstart = '''from toro import Queue, Worker
 
@@ -83,7 +79,7 @@ app.mount(
     {% for term, body in items %}
       <div>
         <dt class="text-sm font-semibold">{{ term }}</dt>
-        <dd class="mt-1 text-sm text-muted {{ measure }}">{{ body }}</dd>
+        <dd class="mt-1.5 text-sm text-muted {{ measure }}">{{ body }}</dd>
       </div>
     {% endfor %}
   </dl>
@@ -106,8 +102,8 @@ app.mount(
 {% endmacro %}
 
 {% block body %}
-<section class="gridded pt-16 pb-14">
-  <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
+<section class="gridded {{ band }}">
+  <div class="{{ pad }} grid lg:grid-cols-2 {{ cols }} items-start">
     <div class="min-w-0">
       <p class="text-xs uppercase tracking-wider text-accent">Python job queue &middot; Redis &middot; asyncio</p>
       <h1 class="font-display mt-3 text-5xl sm:text-6xl font-semibold tracking-[-0.04em] leading-[0.98] text-balance">
@@ -133,14 +129,14 @@ app.mount(
   </div>
 </section>
 
-<section class="py-14 sm:py-16 bg-panel">
+<section class="{{ band }} bg-panel">
   <div class="{{ pad }}">
     {{ heading('States', 'Eight states, one atomic move between them',
        'A job is in exactly one of them at a time, and every move is a single Lua script, so a
         crash cannot leave a job in two of them or in none. The tones are the dashboard\'s own.') }}
     {# state, tone and meaning follow matador's state_token macro and the table in
        docs/concepts.md; a test pins this list to toro's JobState. #}
-    <dl class="mt-9 grid sm:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-7">
+    <dl class="{{ lede }} grid sm:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-8">
       {% for state, tone, meaning in [
         ('wait', 'muted', 'Ready to run, waiting for a free worker.'),
         ('delayed', 'warning', 'Scheduled for later, promoted when it comes due.'),
@@ -155,11 +151,13 @@ app.mount(
           <dt class="flex items-center gap-2 font-mono text-sm text-{{ tone }}">
             <span class="inline-block w-1.5 h-1.5 rounded-full bg-{{ tone }}"></span>{{ state }}
           </dt>
-          <dd class="mt-1.5 text-sm text-muted">{{ meaning }}</dd>
+          {# pl-3.5 is the dot plus its gap, so the meaning starts under the state
+             name rather than under the dot, as every other pair on the page does #}
+          <dd class="mt-1.5 pl-3.5 text-sm text-muted">{{ meaning }}</dd>
         </div>
       {% endfor %}
     </dl>
-    <p class="mt-9 text-sm text-muted">
+    <p class="{{ lede }} text-sm text-muted">
       The normal path is <span class="font-mono text-fg">wait &rarr; active &rarr; completed</span>.
       A failure with attempts left goes back to <span class="font-mono text-fg">wait</span>, or to
       <span class="font-mono text-fg">delayed</span> when a backoff applies, and only the last one
@@ -168,13 +166,13 @@ app.mount(
   </div>
 </section>
 
-<section class="pb-14">
-  <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
+<section class="{{ band }}">
+  <div class="{{ pad }} grid lg:grid-cols-2 {{ cols }} items-start">
     <div class="min-w-0">
       {{ heading('Reliability', 'What happens when a worker dies',
          'A claimed job is held under a lock that its worker renews while the processor runs.
           A process that disappears stops renewing, and the next sweep puts its jobs back.') }}
-      <div class="mt-7">
+      <div class="{{ lede }}">
         {{ blurbs([
           ('The lock proves the worker is alive', 'A renewer refreshes it every lock_renew_time, so a lock expires only when the process actually stopped.'),
           ('Recovery is a sweep, not a timeout', 'Every worker looks for jobs whose lock expired and re-enqueues them at their stored priority, throttled so the fleet sweeps about once per interval.'),
@@ -186,23 +184,23 @@ app.mount(
   </div>
 </section>
 
-<section class="py-14 sm:py-16 bg-panel">
+<section class="{{ band }} bg-panel">
   <div class="{{ pad }}">
     {{ heading('API', 'Common tasks, and the call for each',
        'Retries, scheduling, rate limits, transactional enqueue, cancellation and flows,
         configured where the job is enqueued or the worker is started.') }}
-    <div class="mt-7 card ring-1 ring-line">
+    <div class="{{ lede }} card ring-1 ring-line">
       {% include "partials/example.html" %}
     </div>
   </div>
 </section>
 
-<section class="py-14 sm:py-16">
+<section class="{{ band }}">
   <div class="{{ pad }}">
     {{ heading('Features', 'Everything a queue is expected to have',
        'None of this is an add-on or a plugin. It is in the library, documented, and enforced inside
         the same atomic scripts that move jobs between states.') }}
-    <div class="mt-10 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-8">
+    <div class="{{ lede }} grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-8">
       {% for title, body in [
         ('Retries with backoff', 'Fixed or exponential, per job, with a ceiling. A failed attempt goes back with its history intact.'),
         ('Priorities and delays', 'Enqueue ahead of the queue, or for later. Delayed jobs promote themselves when due.'),
@@ -219,21 +217,21 @@ app.mount(
       ] %}
         <div>
           <h3 class="text-sm font-semibold">{{ title }}</h3>
-          <p class="mt-1 text-sm text-muted max-w-[42ch]">{{ body }}</p>
+          <p class="mt-1.5 text-sm text-muted max-w-[42ch]">{{ body }}</p>
         </div>
       {% endfor %}
     </div>
   </div>
 </section>
 
-<section class="py-14 sm:py-16">
-  <div class="{{ pad }} grid lg:grid-cols-2 gap-12 xl:gap-20 items-start">
+<section class="{{ band }}">
+  <div class="{{ pad }} grid lg:grid-cols-2 {{ cols }} items-start">
     <div class="min-w-0">
       {{ heading('Flows', 'Fan out, fan in, without the plumbing',
          'A flow is a parent job whose children run first. The parent waits in
           <span class="font-mono text-xs">waiting-children</span> until they finish, then runs with
           their results.') }}
-      <div class="mt-6">
+      <div class="{{ lede }}">
         {{ blurbs([
           ('The tree is the unit', 'Retry a parent and the failed branch re-runs, not the work that already succeeded.'),
           ('Failure is a policy', 'on_fail decides per child: fail the parent, or carry on without it.'),
@@ -245,12 +243,12 @@ app.mount(
   </div>
 </section>
 
-<section class="py-14 sm:py-16 bg-panel">
+<section class="{{ band }} bg-panel">
   <div class="{{ pad }}">
     {{ heading('Dashboard', 'Mounted, not run',
        'matador is a FastAPI app. It goes inside the application you already deploy, behind the auth
         you already have, so there is no second service to run and no second login to hand out.') }}
-    <div class="mt-7 grid lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-8 items-start">
+    <div class="{{ lede }} grid lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] {{ cols }} items-start">
       <div class="grid gap-6 min-w-0">
         {{ codepane('Mounting', mount) }}
         {{ blurbs([
@@ -270,7 +268,7 @@ app.mount(
         </span>
         <img src="{{ base | default('') }}/assets/dashboard.png" alt="The matador dashboard showing a queue's jobs, states and throughput"
              class="w-full block" loading="lazy" />
-        <span class="flex items-center justify-between px-4 py-3 border-t border-line text-sm">
+        <span class="flex items-center justify-between px-3 py-2.5 border-t border-line text-sm">
           <span class="text-muted">matador, reading a toro queue</span>
           <a class="text-accent font-medium hover:underline" href="{{ matador_url }}">Source &rarr;</a>
         </span>
@@ -279,21 +277,21 @@ app.mount(
   </div>
 </section>
 
-<section class="py-14 sm:py-16">
+<section class="{{ band }}">
   <div class="{{ pad }}">
     {{ heading('Contract', 'What you are depending on', '') }}
-    <dl class="mt-8 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
+    <dl class="{{ lede }} grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
       {% for term, value in [
           ('Version', '1.0.0, frozen API'), ('Python', '3.10 to 3.13'),
           ('Redis', '6.2 and later'), ('Tests', '860+, on real Redis'),
           ('Dependencies', 'redis, croniter'), ('Licence', 'MIT')] %}
         <div>
           <dt class="text-xs uppercase tracking-wider text-muted">{{ term }}</dt>
-          <dd class="mt-1 text-sm font-medium">{{ value | safe }}</dd>
+          <dd class="mt-1.5 text-sm font-medium">{{ value | safe }}</dd>
         </div>
       {% endfor %}
     </dl>
-    <div class="mt-10 flex flex-wrap items-center gap-3">
+    <div class="{{ lede }} flex flex-wrap items-center gap-3">
       <a class="btn btn-solid" href="https://github.com/ilovepixelart/toro">Read the source</a>
       {{ install() }}
     </div>
