@@ -9,8 +9,10 @@ import asyncio
 import itertools
 import time
 
+import pytest
+
 from toro import FlowChild as c  # noqa: N813 - `c("fetch", ...)` keeps trees readable
-from toro import Queue, Worker
+from toro import Queue, Worker, scripts
 from toro.scripts import METRICS_RETENTION_MS
 
 PREFIX = "torotest"
@@ -445,3 +447,34 @@ async def test_the_per_name_breakdown_stops_taking_new_names(q, run_worker, run_
     assert sizes, "no metrics buckets were written"
     assert max(sizes) <= 1100, f"{max(sizes)} fields in one bucket for 800 names"
     assert (await q.lifetime_totals())["completed"] == 800
+
+
+@pytest.mark.parametrize(("duration_ms", "bucket"), [(0, 0), (19, 0), (20, 1), (29, 1), (30, 2)])
+async def test_the_first_histogram_bucket_ends_before_20ms(q, duration_ms, bucket):
+    """Bucket 0 is [0, 20ms): a 20ms job is the first one bucket 1 counts, the edge
+    `bucket_upper_ms(0)` reports. Run through the script's own helper, since a
+    duration of exactly 20ms cannot be staged through a worker."""
+    lua = scripts._LIB + "\nreturn histIdx(tonumber(ARGV[1]))"
+    assert scripts.HIST_BASE_MS == 20
+    assert await q.redis.eval(lua, 0, duration_ms) == bucket
+
+
+@pytest.mark.parametrize(("fields_before", "counted"), [(1022, True), (1023, False)])
+async def test_the_per_name_breakdown_stops_at_1024_fields(q, fields_before, counted):
+    """A bucket takes per-name fields while it holds fewer than 1024, counted after the
+    queue-level field this same call adds; past that only the queue-level counters
+    grow. Run through the script's own helper so the edge is exact."""
+    base = f"{PREFIX}:namecap:"
+    now = 60_000 * 7
+    bucket = f"{base}metrics:{now}"
+    await q.redis.hset(bucket, mapping={f"f{i}": 1 for i in range(fields_before)})
+    lua = (
+        scripts._LIB
+        + '\nrecordMetrics(KEYS[1], "completed", tonumber(ARGV[1]), 0, 60000, "report")'
+    )
+    try:
+        await q.redis.eval(lua, 1, base, now)
+        assert (await q.redis.hget(bucket, "completed:report") is not None) is counted
+        assert await q.redis.hget(f"{base}totals", "completed") == "1"
+    finally:
+        await q.redis.delete(bucket, f"{base}totals")

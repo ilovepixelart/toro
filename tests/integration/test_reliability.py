@@ -678,3 +678,39 @@ async def test_result_event_roundtrips_hostile_payloads(q, run_worker):
     async with run_worker(q, proc):
         j = await q.add("m", {})
         assert await q.result(j.id, timeout=10) == nasty
+
+
+async def test_a_job_that_finishes_between_sweep_passes_is_not_recovered(q, run_until):
+    """The sweep marks every active job on one pass and recovers the marked ones
+    that have lost their lock on the next. A job that finished in between has lost
+    its lock too, but it has also left `active`: recovering it would put a completed
+    job back in the queue and run it a second time."""
+    job = await q.add("once", {})
+    release = asyncio.Event()
+    runs: list[str] = []
+
+    async def proc(j):
+        runs.append(j.id)
+        await release.wait()
+
+    w = Worker(QUEUE, proc, prefix=PREFIX, stalled_interval=0)
+    task = asyncio.create_task(w.run())
+    try:
+        assert await run_until(lambda: runs)
+        await w.check_stalled(throttle_ms=0)  # pass 1: marks the running job
+        release.set()
+
+        async def completed() -> bool:
+            return (await q.counts())["completed"] == 1
+
+        assert await run_until(completed)
+        failed, recovered = await w.check_stalled(throttle_ms=0)  # pass 2
+    finally:
+        release.set()
+        await w.stop()
+        task.cancel()
+
+    assert (failed, recovered) == ([], [])
+    counts = await q.counts()
+    assert (counts["completed"], counts["wait"]) == (1, 0), counts
+    assert runs == [job.id]
