@@ -101,3 +101,37 @@ jobs:
             -Dsonar.tests=tests
             -Dsonar.test.exclusions=tests/**
             -Dsonar.coverage.exclusions=tests/**
+
+  redis-floor:
+    # docs/versioning.md names the oldest supported Redis; this runs the suite on it.
+    name: Tests (Redis 6.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      redis:
+        image: redis:6.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Tests (unit + integration)
+        run: uv run pytest -m "unit or integration"
