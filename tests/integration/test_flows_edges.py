@@ -271,6 +271,33 @@ async def test_retried_continue_child_rejoins_the_barrier(q, run_worker, run_unt
     assert report["failures"] == {}  # the stale :cfail record was cleared by the retry
 
 
+async def test_a_retried_continue_child_holds_its_parent_until_it_settles(q, run_worker, run_until):
+    """A retried `continue` child is a pending dependency again. Left out of the
+    barrier, removing its last sibling releases the parent while the child is still
+    queued, and the parent runs without the child's result."""
+
+    async def proc(job):
+        raise RuntimeError("first-run")
+
+    parent = await q.add_flow(
+        "report",
+        {},
+        children=[
+            c("flaky", {}, on_fail="continue"),
+            c("slow", {}, delay=60_000, on_fail="continue"),
+        ],
+    )
+    flaky_id, slow_id = (await q.get_job(parent.id)).children_ids
+    async with run_worker(q, proc):
+        assert await run_until(_count_is(q, "failed", 1))
+
+    assert await q.retry_job(flaky_id) is True
+    assert await q.remove_job(slow_id) is True
+
+    assert (await q.get_job(parent.id)).state == "waiting-children"
+    assert await q.redis.smembers(q.keys.deps(parent.id)) == {flaky_id}
+
+
 async def test_stall_escalated_job_resolves_result_waiters(q):
     parent = await q.add_flow("report", {}, children=[c("doomed", {})])
     cid = (await q.get_flow(parent.id))["children"][0]["job"].id
@@ -593,6 +620,24 @@ async def test_children_run_in_priority_order(q, run_worker, run_until):
 
     assert order == ["high", "low", None]  # priority beats declaration order
     assert (await q.get_job(parent.id)).state == "completed"
+
+
+async def test_a_released_parent_keeps_its_priority(q, run_worker, run_until):
+    """A parent released by its last child queues at its own priority, ahead of a
+    less urgent job that was waiting before it. Queued at the default priority, it
+    runs behind that job."""
+    order = []
+
+    async def proc(job):
+        order.append(job.name)
+        return "ok"
+
+    await q.add_flow("report", {}, children=[c("fetch", {})], priority=10)
+    await q.add("other", {})
+    async with run_worker(q, proc):  # concurrency 1: strict claim order
+        assert await run_until(_count_is(q, "completed", 3))
+
+    assert order == ["fetch", "report", "other"]
 
 
 # ---- retry_flow: one-call whole-flow recovery ------------------------------------

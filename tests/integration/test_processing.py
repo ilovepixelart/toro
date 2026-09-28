@@ -93,3 +93,14 @@ async def test_a_result_that_will_not_encode_fails_the_job(q, run_worker, run_un
     settled = await q.get_job(job.id)
     assert settled.state == "failed"
     assert "JSON serializable" in (settled.failed_reason or "")
+
+
+async def test_a_delayed_job_is_due_its_delay_after_it_was_added(q):
+    """A delayed job is filed at add time plus its delay, so the shorter delay comes
+    due first. Filed at add time minus its delay, every delayed job is already due
+    and the promote sweep runs it at once."""
+    later = await q.add("later", {}, delay=60_000)
+    sooner = await q.add("sooner", {}, delay=1_000)
+
+    assert [j.id for j in await q.get_jobs("delayed")] == [sooner.id, later.id]
+    assert await q.redis.zscore(q.keys.delayed, later.id) == later.timestamp + 60_000
