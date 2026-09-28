@@ -51,7 +51,7 @@ it. A library that finds a **newer** model than it understands refuses to run an
 says both numbers, rather than reading a shape it was not built for:
 
 ```
-IncompatibleDataModelError: queue "emails" uses data model 2; this toro understands 1
+IncompatibleDataModelError: queue 'emails' uses data model 2; this toro understands 1. Upgrade this process, or point it at a queue of its own.
 ```
 
 An absent marker means the queue predates 1.0, and the first write adopts it. The

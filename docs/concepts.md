@@ -18,8 +18,9 @@ toro has a clean producer/consumer split, and both talk to the same Redis.
 - A **`Job`** is one unit of work. It carries an `id`, a `name` (a label you
   choose, e.g. `"welcome"`), a JSON-serializable `data` payload, its options, and
   bookkeeping the system fills in: `state`, `attempts_made`, timestamps
-  (`timestamp`, `processed_on`, `finished_on`), `progress`, `stacktrace`, and
-  either a `returnvalue` or a `failed_reason`. (A job's log lines and its lock
+  (`timestamp`, `processed_on`, `finished_on`), `progress`, `stacktrace`, a
+  `returnvalue` once it completes, and a `failed_reason` from its latest failed
+  attempt (kept when a later attempt succeeds). (A job's log lines and its lock
   live in separate Redis keys, not as fields on the `Job` - see the
   [data model](data-model.md).)
 
@@ -86,7 +87,8 @@ processors `await`-y.
 ## Events
 
 toro publishes events to a Redis pub/sub channel: `added` when a job is enqueued
-(published by the add script, atomically with the enqueue), `progress` from a running processor
+(published by the add script, atomically with the enqueue; a flow announces its root
+only, and a scheduler occurrence announces nothing), `progress` from a running processor
 (`job.update_progress`), and `completed` / `failed` / `cancelled`, which the finish Lua
 scripts publish atomically with the state change. `failed` fires only on terminal failure,
 not on a retry. A second channel carries cancellation requests to workers and nothing

@@ -20,8 +20,9 @@ amplifying that access.
   Redis (`base .. "ck:" .. key`), which is how one script addresses many keys; all of
   them sit under the queue's own base.
 - **Key-safe identifiers.** The prefix, the queue name, scheduler ids, deduplication
-  ids and `concurrency_key` are all validated as key segments: non-empty, bounded, no
-  control characters, and no `:` except in the prefix, which is the one segment
+  ids and `concurrency_key` are all validated as key segments: non-empty, no control
+  characters (the prefix and the queue name are also capped at 128 characters), and no
+  `:` except in the prefix, which is the one segment
   allowed to carry its own namespace. Without that rule two different (prefix, name)
   pairs could be one namespace, and one queue's worker could expire another's locks.
   A custom job id may contain `:`, may not contain `/` (it is a path segment in any

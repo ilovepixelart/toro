@@ -34,7 +34,8 @@ the whole flow, not one job.
 
 `add_flow` inserts the entire tree in one atomic script - either the whole
 flow exists or none of it. Leaves go straight to `wait` (or `delayed`, if they
-carry a `delay`); every node with children parks in `waiting-children`.
+carry a `delay`, or `held` behind a `concurrency_key` another job holds); every node
+with children parks in `waiting-children`.
 
 `FlowChild` takes the same options as `Queue.add()` (`priority` - clamped to
 the same range as `add()` - `attempts`, `backoff`, `delay`, auto-removal),
@@ -111,8 +112,9 @@ stalled-recovery limit settles its parent the same way.
 
 Eager parent failure does **not** cancel siblings: in-flight and still-queued
 children keep running, and their results are still collected into the parent
-(useful if you later retry it). To actually stop the remaining work, remove
-the parent - removal cascades the subtree.
+(useful if you later retry it). To actually stop the remaining work, cancel
+the parent: `cancel_job(parent_id)` stops its whole subtree, into `cancelled`, even
+when the parent has already failed.
 
 ## Retrying a failed flow
 
@@ -138,14 +140,15 @@ retried. The dashboard's *retry flow* button on a failed parent calls it.
 
 ## Removing flow jobs
 
-- Removing a **parent** removes its whole subtree - children included, even
-  ones currently running. This is how you cancel a flow. (A running child's
-  processor coroutine is not interrupted; it finishes and its commit is then
-  discarded by the lock-token guard.)
+- Removing a **parent** deletes its whole subtree - children included, even
+  ones currently running: a running async child's processor is cancelled, and a
+  sync one's thread runs to its end with its commit refused by the lock-token guard.
+  To stop a flow and keep a record of it, cancel it instead
+  ([Cancellation](processing.md#cancellation)).
 - Removing a pending **child** releases the parent if it was the last thing
   being waited on. A removed completed child does *not* take its
   already-collected result with it.
-- `clean("waiting-children")` therefore cancels every parked flow outright.
+- `clean("waiting-children")` therefore deletes every parked flow outright.
 
 All removal paths (manual, bulk, auto-removal) clean up the flow bookkeeping
 keys with the job - nothing is left behind to leak.
@@ -180,11 +183,11 @@ count completions only - a failed flow never reads as done. Returns `None` if
 the job doesn't exist.
 
 To show fan-in progress for a whole *page* of parents without hydrating each
-tree, `flow_progress(parent_ids)` returns `{parent_id: (completed, failed)}` from
-cheap pipelined `HLEN` reads (just the counts):
+tree, `flow_progress(parent_ids)` returns `{parent_id: (completed, failed, cancelled)}`
+from cheap pipelined `HLEN` reads (just the counts):
 
 ```python
-progress = await queue.flow_progress([p1, p2, p3])   # {p1: (2, 0), p2: (1, 1), ...}
+progress = await queue.flow_progress([p1, p2, p3])   # {p1: (2, 0, 0), p2: (1, 1, 0), ...}
 ```
 
 [matador](https://github.com/ilovepixelart/matador) renders a flow as its root

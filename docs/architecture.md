@@ -168,7 +168,8 @@ Redis build.
 
 ## Python-specific choices
 
-- **async-first** - `redis.asyncio`, `async def` processors, one event loop;
-  concurrency is N `asyncio` tasks sharing the loop.
+- **async-first** - `redis.asyncio`, one event loop; concurrency is N `asyncio`
+  tasks sharing the loop. A plain `def` processor runs in the worker's own thread
+  pool, one thread per slot, so it does not block the loop.
 - **Cluster** - a `{braces}` hash-tag in the prefix keeps all of a queue's keys on
   one slot, which the multi-key Lua scripts require.
