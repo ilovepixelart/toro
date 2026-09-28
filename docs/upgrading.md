@@ -2,6 +2,61 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 1.0.3
+
+Three things change for a caller, and one for a rolling upgrade. The rest are fixes.
+
+**A `Queue` call whose reply times out raises `redis.exceptions.TimeoutError`** and
+is not sent again. A re-sent `add()` whose first attempt had reached Redis enqueued
+the job twice. A connection error is still retried three times with backoff; a
+timeout is the caller's to handle, since the command may have run.
+
+**`run()` cancelled outright ends cancelled.** A worker whose `run()` task is
+cancelled without `stop()` (a framework cancelling its tasks, Ctrl-C under
+`asyncio.run()`) ends its loops, leaves the job in flight to the stalled sweep and
+re-raises `CancelledError`, as any cancelled task does. It used to return normally,
+and on Python 3.10 it failed that job and went on claiming instead.
+
+**`add_scheduler(every=...)` rejects a fractional or bool value** with `ValueError`.
+`every=1000.0` was stored as text the worker could not read, which ended the schedule
+at its first pickup; a whole float such as `60_000 / 2` still works.
+
+**Rolling upgrade.** Where `result()` is used with `remove_on_complete=True`, upgrade
+producers before workers: a 1.0.3 worker publishes such a result inside the event
+only (`resultJson`), and a 1.0.2 producer reads it from the job's hash, which is
+already gone, and resolves `None`.
+
+Fixes:
+
+- `result()` delivers exactly what the processor returned: numbers over 14 digits and
+  empty lists were rounded and turned into `{}` on the way through the event.
+- A repeatable schedule survives an occurrence picked up early, one that fails before
+  minting its successor, `cancel_job`, `remove_job` or `clean("delayed")` of a pending
+  occurrence, and `remove_scheduler()` landing while the next occurrence is minted.
+- Lock renewal survives a Redis error while the lease still holds; the job is not
+  run twice.
+- A run that lost its lock cannot commit over its own worker's re-run of the job.
+- Progress, log lines and stack traces are written only to a job that still exists,
+  and the stack trace is stored atomically with the failure.
+- `retry_job` starts the stall count over, and retrying a flow parent whose failed
+  child was removed by retention runs it instead of parking it for good.
+- `stop()` landing before or during `run()`'s startup ends the run; a worker run
+  again reports as running, not draining.
+- A cancel request applies to the run it was made for: a job id re-added while its
+  cancelled run unwinds is no longer cancelled with it.
+- The delayed-job sweep, the stalled sweep and the heartbeat log one warning per
+  failure episode and one line on recovery, where they were silent.
+- `get_job()` returns `None` for an id that names one of the queue's own keys or a
+  hash that is not a job's; `get_jobs()` reads a negative index from the end and an
+  inverted range as empty in every state; `latency()` counts from when the head job
+  could first run rather than from its add.
+- `roots_counts()` and `get_jobs_roots()` no longer diff the whole state on every
+  call: on 200,000 waiting jobs a dashboard refresh cost 30 to 100 ms of Redis time
+  and now costs about 1 ms. The Redis floor is unchanged (`ZMSCORE` joins
+  `ZDIFFSTORE`, both 6.2).
+
+CI now runs the suite on the declared redis-py floor (5.0.1) as well as Redis 6.2.
+
 ## 1.0.2
 
 Nothing breaks. One fix.
