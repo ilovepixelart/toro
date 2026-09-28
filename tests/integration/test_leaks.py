@@ -287,3 +287,60 @@ async def test_a_stopped_worker_gives_back_its_cancel_subscription(q):
             await task
 
     assert await q.redis.pubsub_channels(q.keys.cancel) == []
+
+
+async def test_a_removed_jobs_cleanup_leaves_no_stub(q, run_worker, run_until):
+    """A processor's cleanup may report progress or log after its job was removed.
+    Written blindly, those recreated the hash as a stub with no state: unlistable,
+    unremovable, and holding the custom id so a later add() with it did nothing."""
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            await job.update_progress(100)
+            await job.log("cleaned up")
+            cleaned_up.set()
+
+    job = await q.add("order", {}, job_id="order-1")
+    async with run_worker(q, proc):
+        await asyncio.wait_for(started.wait(), 5)
+        assert await q.remove_job(job.id) is True
+        await asyncio.wait_for(cleaned_up.wait(), 5)
+
+    assert await q.redis.exists(q.keys.job(job.id)) == 0
+    assert await q.redis.exists(q.keys.logs(job.id)) == 0
+    again = await q.add("order", {}, job_id="order-1")
+    assert (await q.get_job(again.id)).state == "wait"
+
+
+async def test_a_failure_after_the_sweep_removed_the_job_leaves_no_stub(q, run_worker, run_until):
+    """A run that lost its lock and was failed by the stalled sweep, with its hash
+    removed by retention, still fails in the end. Its traceback written blindly
+    recreated the hash as a stub holding only `stacktrace`."""
+    release = asyncio.Event()
+
+    async def proc(job):
+        await release.wait()
+        raise RuntimeError("late failure")
+
+    job = await q.add("order", {}, job_id="order-2", remove_on_fail=True)
+    async with run_worker(q, proc, max_stalled_count=0, stalled_interval=0) as worker:
+        assert await run_until(lambda: q.redis.exists(q.keys.lock(job.id)))
+        await q.redis.delete(q.keys.lock(job.id))  # the run's lock expired
+        await worker.check_stalled(throttle_ms=0)  # mark
+        await worker.check_stalled(throttle_ms=0)  # fail it: over max_stalled_count
+        assert await q.redis.exists(q.keys.job(job.id)) == 0  # retention removed it
+        release.set()
+        assert await run_until(lambda: _gone_for(q, job.id, 0.3))
+
+    assert await q.redis.exists(q.keys.job(job.id)) == 0
+
+
+async def _gone_for(q, job_id: str, seconds: float) -> bool:
+    """True once the job's hash has stayed absent for `seconds`."""
+    await asyncio.sleep(seconds)  # the late failure lands inside this window
+    return await q.redis.exists(q.keys.job(job_id)) == 0

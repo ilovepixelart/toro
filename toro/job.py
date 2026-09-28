@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast
 
 from redis.asyncio import Redis
+from redis.commands.core import AsyncScript
 
 from ._replies import _str_dict
 
@@ -195,6 +196,9 @@ class JobContext:
     results_key: str  # the flow aux keys, derived via Keys by the worker so
     cfail_key: str  # the layout stays defined in exactly one place (keys.py)
     ccancel_key: str
+    # Guarded writes: a no-op once the job is gone (see scripts.UPDATE_PROGRESS)
+    update_progress: AsyncScript
+    append_log: AsyncScript
 
 
 @dataclass
@@ -236,17 +240,17 @@ class Job:
             raise RuntimeError("update_progress() is only available inside a worker processor")
         ctx = self._ctx
         self.progress = value
-        await ctx.redis.hset(ctx.job_key, "progress", json.dumps(value))
-        await ctx.redis.publish(
-            ctx.events_key,
-            json.dumps({"jobId": ctx.job_id, "event": "progress", "progress": value}),
+        event = json.dumps({"jobId": ctx.job_id, "event": "progress", "progress": value})
+        await ctx.update_progress(
+            keys=[ctx.job_key, ctx.events_key], args=[json.dumps(value), event]
         )
 
     async def log(self, message: str) -> None:
         """Append a log line to this job (visible in the dashboard)."""
         if self._ctx is None:
             raise RuntimeError("log() is only available inside a worker processor")
-        await self._ctx.redis.rpush(self._ctx.logs_key, message)
+        ctx = self._ctx
+        await ctx.append_log(keys=[ctx.job_key, ctx.logs_key], args=[message])
 
     async def children_results(self) -> dict[str, Any]:
         """Pull this flow parent's collected child results, keyed by child id.

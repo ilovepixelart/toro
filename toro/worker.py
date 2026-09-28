@@ -262,15 +262,7 @@ class Worker:
         # not a crash. (The only honest way to know graceful; absence can't say why.)
         self._state = "running"
 
-        self._move_to_active = self.redis.register_script(scripts.MOVE_TO_ACTIVE)
-        self._extend_lock = self.redis.register_script(scripts.EXTEND_LOCK)
-        self._move_to_completed = self.redis.register_script(scripts.MOVE_TO_COMPLETED)
-        self._move_to_failed = self.redis.register_script(scripts.MOVE_TO_FAILED)
-        self._move_to_cancelled = self.redis.register_script(scripts.MOVE_TO_CANCELLED)
-        self._move_stalled = self.redis.register_script(scripts.MOVE_STALLED)
-        self._promote_delayed = self.redis.register_script(scripts.PROMOTE_DELAYED)
-        self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
-        self._stamp = self.redis.register_script(scripts.STAMP_MODEL)
+        self._register_scripts()
 
         # Simple event callbacks: worker.on("completed", fn)
         self._handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -495,6 +487,21 @@ class Worker:
                 logger.exception("process loop hiccup; the slot lives on")
                 await asyncio.sleep(0.1)
 
+    def _register_scripts(self) -> None:
+        """Register the Lua scripts this worker runs (a local call; Redis is not touched)."""
+        register = self.redis.register_script
+        self._move_to_active = register(scripts.MOVE_TO_ACTIVE)
+        self._extend_lock = register(scripts.EXTEND_LOCK)
+        self._move_to_completed = register(scripts.MOVE_TO_COMPLETED)
+        self._move_to_failed = register(scripts.MOVE_TO_FAILED)
+        self._move_to_cancelled = register(scripts.MOVE_TO_CANCELLED)
+        self._move_stalled = register(scripts.MOVE_STALLED)
+        self._promote_delayed = register(scripts.PROMOTE_DELAYED)
+        self._add_scheduled = register(scripts.ADD_SCHEDULED)
+        self._stamp = register(scripts.STAMP_MODEL)
+        self._update_progress = register(scripts.UPDATE_PROGRESS)
+        self._append_log = register(scripts.APPEND_LOG)
+
     async def _acquire(self) -> tuple[str, dict[str, str]] | None:
         """Pop the highest-priority job into `active`, lock + load it."""
         res = await self._move_to_active(
@@ -563,6 +570,8 @@ class Worker:
             results_key=self.keys.results(job_id),
             cfail_key=self.keys.cfail(job_id),
             ccancel_key=self.keys.ccancel(job_id),
+            update_progress=self._update_progress,
+            append_log=self._append_log,
         )
         # A scheduler job mints its successor when it is picked up, so the schedule
         # stays on time regardless of how long (or whether) this run succeeds. Any
@@ -767,11 +776,12 @@ class Worker:
         self, job: Job, exc: Exception
     ) -> tuple[str, dict[str, str]] | None:
         """Record the traceback being handled and fail the job with `exc`."""
-        await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
         self._failed += 1
-        return await self._finish_failed(job, exc)
+        return await self._finish_failed(job, exc, traceback.format_exc())
 
-    async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict[str, str]] | None:
+    async def _finish_failed(
+        self, job: Job, exc: Exception, stacktrace: str = ""
+    ) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_failed(
             keys=[
                 self.keys.active,
@@ -802,6 +812,7 @@ class Worker:
                 rl_duration=self.rl_duration,
                 global_concurrency=self.global_concurrency,
                 claim=_claim(job),
+                stacktrace=stacktrace,
             ),
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel

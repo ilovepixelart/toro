@@ -83,11 +83,11 @@ async def test_dropped_fail_commit_recovers_and_fails_once(q, run_worker, run_un
         orig = w._finish_failed
         hits = {"n": 0}
 
-        async def flaky(job, exc):
+        async def flaky(job, exc, *rest):
             hits["n"] += 1
             if hits["n"] == 1:
                 raise ConnectionError("redis dropped mid-fail-commit")
-            return await orig(job, exc)
+            return await orig(job, exc, *rest)
 
         w._finish_failed = flaky
 
