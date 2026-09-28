@@ -102,6 +102,37 @@ async def test_dropped_fail_commit_recovers_and_fails_once(q, run_worker, run_un
     assert hits["n"] >= 2
 
 
+async def test_a_fresh_claim_clears_a_stalled_mark_from_the_previous_run(q, run_worker, run_until):
+    """The sweep recovers a job marked on one pass that still has no lock on the next.
+    A claim starts a new run, so it drops a mark left from the run before: a retry that
+    loses its lock is marked first, not recovered at once on the first attempt's mark."""
+    runs: list[int] = []
+    fail_first = asyncio.Event()
+    hold_second = asyncio.Event()
+
+    async def proc(job):
+        runs.append(job.attempts_made)
+        if len(runs) == 1:
+            await fail_first.wait()
+            raise RuntimeError("first attempt fails")
+        await hold_second.wait()
+
+    async with run_worker(q, proc, concurrency=1, stalled_interval=0) as w:
+        try:
+            job = await q.add("j", {}, attempts=2)
+            assert await run_until(lambda: len(runs) == 1)
+            await w.check_stalled(throttle_ms=0)  # pass 1: marks the first run
+            fail_first.set()  # no backoff: requeued and claimed again at once
+            assert await run_until(lambda: len(runs) == 2)
+            await q.redis.delete(q.keys.lock(job.id))  # the retry loses its lock
+            failed, recovered = await w.check_stalled(throttle_ms=0)  # pass 2
+        finally:
+            fail_first.set()
+            hold_second.set()
+
+    assert (failed, recovered) == ([], [])
+
+
 # ---- two workers hit the same atomic guard at once ---------------------------------
 
 
