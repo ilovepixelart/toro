@@ -10,9 +10,10 @@ def test_bucket_bounds_grow_log_scale():
     bounds = [bucket_upper_ms(i) for i in range(scripts.HIST_BUCKETS)]
     assert bounds[0] == scripts.HIST_BASE_MS  # [0, 20ms)
     assert bounds == sorted(bounds)
-    # each bucket ~1.5x the previous (int truncation allowed)
+    # each bucket ~1.5x the previous; rounding each bound up to whole ms moves a small
+    # bucket's ratio by about 1% (45 -> 68 is 1.511)
     for a, b in itertools.pairwise(bounds):
-        assert 1.4 < b / a <= 1.51
+        assert 1.45 < b / a < 1.52
     assert bounds[-1] > 5 * 60 * 1000  # top bucket reaches past 5 minutes
 
 

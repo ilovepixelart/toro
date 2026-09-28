@@ -141,8 +141,13 @@ class FlowMetricsPoint(TypedDict):
 
 
 def bucket_upper_ms(idx: int) -> int:
-    """Upper bound (ms) of histogram bucket `idx` - see scripts.HIST_*."""
-    return int(scripts.HIST_BASE_MS * scripts.HIST_GROWTH**idx)
+    """Upper bound (ms, exclusive) of histogram bucket `idx` - see scripts.HIST_*.
+
+    Rounded UP: durations are whole milliseconds, so "under 67.5" and "under 68" hold
+    the same values, and the script buckets against the exact bound. Truncated to 67,
+    the bound itself would land in the bucket it claims to close.
+    """
+    return math.ceil(scripts.HIST_BASE_MS * scripts.HIST_GROWTH**idx)
 
 
 def bucket_estimate_ms(idx: int) -> int:

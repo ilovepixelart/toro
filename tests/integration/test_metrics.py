@@ -13,6 +13,7 @@ import pytest
 
 from toro import FlowChild as c  # noqa: N813 - `c("fetch", ...)` keeps trees readable
 from toro import Queue, Worker, scripts
+from toro.queue import bucket_upper_ms
 from toro.scripts import METRICS_RETENTION_MS
 
 PREFIX = "torotest"
@@ -478,3 +479,16 @@ async def test_the_per_name_breakdown_stops_at_1024_fields(q, fields_before, cou
         assert await q.redis.hget(f"{base}totals", "completed") == "1"
     finally:
         await q.redis.delete(bucket, f"{base}totals")
+
+
+@pytest.mark.parametrize("bucket", range(scripts.HIST_BUCKETS - 1))
+async def test_every_bucket_ends_where_bucket_upper_ms_says(q, bucket):
+    """The readout reports bucket `i` as ending before `bucket_upper_ms(i)`, and the
+    script decides which bucket a duration lands in. A duration of exactly that bound
+    belongs to the next bucket, and one millisecond less to this one; with the bound
+    truncated to whole milliseconds, 22 of the 25 edges put the bound itself in the
+    bucket it closes."""
+    lua = scripts._LIB + "\nreturn histIdx(tonumber(ARGV[1]))"
+    upper = bucket_upper_ms(bucket)
+    assert await q.redis.eval(lua, 0, upper - 1) == bucket
+    assert await q.redis.eval(lua, 0, upper) == bucket + 1
