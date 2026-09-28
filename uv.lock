@@ -449,7 +449,7 @@ wheels = [
 
 [[package]]
 name = "toro-queue"
-version = "1.0.1"
+version = "1.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },

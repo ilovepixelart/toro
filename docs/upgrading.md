@@ -2,6 +2,18 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 1.0.2
+
+Nothing breaks. One fix.
+
+**Latency percentiles are read against the histogram's real bucket edges.** Each
+bucket's upper bound was truncated to whole milliseconds while the durations were
+bucketed against the exact bound, so at 22 of the 25 edges a duration equal to the
+stated bound was counted in the bucket that bound claimed to close: bucket 3 said it
+ended before 67 ms and held a 67 ms job. The bounds are now rounded up (67.5 to 68),
+which is the same edge for whole-millisecond durations. The estimates `percentiles()`,
+`flow_percentiles()` and `metrics_by_name()` report move by under 1 ms.
+
 ## 1.0.1
 
 Nothing breaks. Two fixes.
