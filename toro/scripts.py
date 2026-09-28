@@ -171,6 +171,13 @@ local function unkey(base, jobId, state, ckey, now)
     releaseKey(base, base .. jobId, jobId, now)
   end
 end
+-- A lock value names the worker, and one worker can hold a job twice: a run that lost
+-- its lock, and the run another of its slots re-claimed after the stalled sweep. The
+-- claim's processedOn (stamped below) tells the two apart, as the cancel message
+-- already does. "" skips the check.
+local function claimedBy(jobKey, claim)
+  return claim == "" or redis.call("HGET", jobKey, "processedOn") == claim
+end
 local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   local jobKey = base .. jobId
   redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
@@ -774,13 +781,15 @@ return 0
 # ARGV[5] fetch(1/0)  ARGV[6] lockDuration(ms)
 # ARGV[7] rlMax  ARGV[8] rlDuration(ms)  ARGV[9] metricsRetention(ms)
 # ARGV[10] globalConcurrency (0 = no cap)  ARGV[11] inline the result in the event?
+# ARGV[12] the claim's processedOn ("" = unchecked)
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}.
 MOVE_TO_COMPLETED = (
     _LIB
     + """
 local cap = 0
 if ARGV[5] == "1" then cap = requireCap(ARGV[10]) end
-if redis.call("GET", KEYS[4]) ~= ARGV[4] then return -2 end
+if redis.call("GET", KEYS[4]) ~= ARGV[4]
+  or not claimedBy(KEYS[3], ARGV[12] or "") then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[3])
@@ -834,14 +843,15 @@ return {1}
 # ARGV[5] maxAttempts  ARGV[6] backoff(ms)  ARGV[7] token  ARGV[8] fetch(1/0)
 # ARGV[9] lockDuration(ms)
 # ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
-# ARGV[13] globalConcurrency (0 = no cap)
+# ARGV[13] globalConcurrency (0 = no cap)  ARGV[14] the claim's processedOn ("" = unchecked)
 # Returns -2/-3, else {outcome} or {outcome, nextHash, nextId}; outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
     + """
 local cap = 0
 if ARGV[8] == "1" then cap = requireCap(ARGV[13]) end
-if redis.call("GET", KEYS[6]) ~= ARGV[7] then return -2 end
+if redis.call("GET", KEYS[6]) ~= ARGV[7]
+  or not claimedBy(KEYS[5], ARGV[14] or "") then return -2 end
 redis.call("DEL", KEYS[6])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local attemptsMade = tonumber(ARGV[4])
@@ -1092,12 +1102,13 @@ return existed
 # KEYS[1] active  KEYS[2] cancelled  KEYS[3] job hash  KEYS[4] lock
 # KEYS[5] prioritized  KEYS[6] marker  KEYS[7] base  KEYS[8] events channel
 # ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] token  ARGV[4] metricsRetention(ms)
+# ARGV[5] the claim's processedOn ("" = unchecked)
 # Returns -2 lock lost, -3 not active, 1 committed.
 MOVE_TO_CANCELLED = (
     _LIB
     + """
 local base = KEYS[7]
-if redis.call("GET", KEYS[4]) ~= ARGV[3] then return -2 end
+if redis.call("GET", KEYS[4]) ~= ARGV[3] or not claimedBy(KEYS[3], ARGV[5] or "") then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[2])
@@ -1392,8 +1403,9 @@ def completed_args(
     rl_max: int,
     rl_duration: int,
     global_concurrency: int,
+    claim: str = "",
 ) -> list[str | int]:
-    """ARGV for MOVE_TO_COMPLETED."""
+    """ARGV for MOVE_TO_COMPLETED (`claim`: the processedOn this run was claimed at)."""
     return [
         job_id,
         returnvalue,
@@ -1406,6 +1418,7 @@ def completed_args(
         METRICS_RETENTION_MS,
         global_concurrency,
         "1" if len(returnvalue) <= MAX_INLINE_RESULT_BYTES else "0",
+        claim,
     ]
 
 
@@ -1423,8 +1436,9 @@ def failed_args(
     rl_max: int,
     rl_duration: int,
     global_concurrency: int,
+    claim: str = "",
 ) -> list[str | int]:
-    """ARGV for MOVE_TO_FAILED."""
+    """ARGV for MOVE_TO_FAILED (`claim`: the processedOn this run was claimed at)."""
     return [
         job_id,
         reason,
@@ -1439,4 +1453,5 @@ def failed_args(
         rl_duration,
         METRICS_RETENTION_MS,
         global_concurrency,
+        claim,
     ]

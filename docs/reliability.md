@@ -52,10 +52,14 @@ script, so recovery can't race a finish.
 ## Exactly-once commit: the token-guarded finish
 
 The handler may run more than once; the *result* is committed exactly once. The
-finish scripts (`MOVE_TO_COMPLETED` / `MOVE_TO_FAILED`) begin with two guards:
+finish scripts (`MOVE_TO_COMPLETED` / `MOVE_TO_FAILED` / `MOVE_TO_CANCELLED`) begin
+with two guards:
 
-- the lock must still hold **this worker's token** - otherwise the script
-  returns `LOCK_LOST` (-2) and commits nothing;
+- the lock must still hold **this worker's token**, and the job must still carry
+  **this run's claim** (the `processedOn` it was claimed at) - otherwise the script
+  returns `LOCK_LOST` (-2) and commits nothing. The claim matters when the same
+  worker holds the job twice: a run that lost its lock, and the run another of its
+  slots took it back up with after the stalled sweep;
 - the job must still be in `active` - otherwise `NOT_ACTIVE` (-3), same result.
 
 So when a slow worker comes back from the dead after its job was recovered and
