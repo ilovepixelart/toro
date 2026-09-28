@@ -935,3 +935,35 @@ async def test_a_job_already_queued_is_cancellable_the_instant_it_runs(q, run_wo
 
         # the lock backstop is half a minute away, so only the message can land this
         assert await run_until(lambda: _in_state(q, job.id, "cancelled"), timeout=3)
+
+
+async def test_a_cancellation_nobody_asked_for_fails_the_job_and_keeps_the_slot(
+    q, run_worker, run_until
+):
+    """A processor can raise CancelledError without anyone cancelling the job: it
+    awaited a future something else cancelled. That is the processor failing. Taken
+    for a shutdown, it ended the slot's loop without a log line: the worker went on
+    looking alive with nothing left to process, and the job sat in `active`."""
+    ran: list[str] = []
+
+    async def proc(job):
+        ran.append(job.name)
+        if job.name == "awaits-a-cancelled-future":
+            doomed = asyncio.get_running_loop().create_future()
+            doomed.cancel()
+            await doomed
+        return "ok"
+
+    first = await q.add("awaits-a-cancelled-future", {})
+    second = await q.add("next", {})
+    async with run_worker(q, proc, concurrency=1):
+        assert await run_until(lambda: len(ran) == 2, timeout=5)
+        assert await run_until(lambda: _completed(q, second.id), timeout=5)
+
+    job = await q.get_job(first.id)
+    assert job.state == "failed"
+    assert "CancelledError" in job.failed_reason
+
+
+async def _completed(q: Queue, job_id: str) -> bool:
+    return await _state(q, job_id) == "completed"
