@@ -46,7 +46,7 @@ from the page rather than merely refused.
 | OP-003 | Totals are written in the same atomic step as the transition they count, so a counter can never disagree with the state change. Every enqueue path counts, schedules included. | `::test_a_total_counts_every_way_a_job_can_end`, `::test_a_scheduled_occurrence_is_counted_as_added`, `::test_a_flow_counts_every_job_it_adds` |
 | OP-004 | A cancellation is counted as a cancellation, not a failure, in the export as everywhere else, and the same way whichever path cancelled it. | `::test_a_cancellation_is_never_counted_as_a_failure`, `::test_a_cancellation_records_the_same_fields_whichever_path_took_it` |
 | OP-005 | Gauges read current depth per state, including `held` and `cancelled`, and never lead their own counters. | `tests/unit/test_openmetrics.py::test_depth_is_reported_for_every_state_given`, `tests/integration/test_metrics_export.py::test_a_scrape_never_shows_depth_its_counters_have_not_caught_up_to` |
-| OP-006 | matador serves `/metrics` from its mount, in the scraper's content type. | `tests/integration/test_metrics_endpoint.py` |
+| OP-006 | matador serves `/metrics` from its mount, in the scraper's content type. | [matador `tests/integration/test_metrics_endpoint.py`](https://github.com/ilovepixelart/matador/blob/main/tests/integration/test_metrics_endpoint.py) |
 | OP-007 | In read-only mode every mutating route refuses, and the set is derived from the route table so a new route is covered without being listed. | `tests/integration/test_read_only.py::test_every_mutating_route_refuses` |
 | OP-008 | In read-only mode the controls are absent from the markup, not merely refused when clicked. | `::test_controls_are_not_drawn` |
 | OP-009 | `can_mutate` receives the request, so the host app can allow some callers and not others. | `::test_the_predicate_sees_the_request` |
@@ -74,8 +74,8 @@ from the page rather than merely refused.
 | 1 | OP-003 | The totals hash, incremented in the metrics routine | `toro/scripts.py` | red first |
 | 2 | OP-001, OP-004, OP-005 | `metrics_text()` and its families | `toro/queue.py` | unit, red first |
 | 3 | OP-002 | Restart survival | | integration |
-| 4 | OP-006 | `/metrics` from the mount | `matador/app.py` | red first |
-| 5 | OP-007, OP-008, OP-009 | `can_mutate`, the guard, the templates | `matador/app.py`, templates | red first |
+| 4 | OP-006 | `/metrics` from the mount | [`matador/app.py`](https://github.com/ilovepixelart/matador/blob/main/matador/app.py) | red first |
+| 5 | OP-007, OP-008, OP-009 | `can_mutate`, the guard, the templates | [`matador/app.py`](https://github.com/ilovepixelart/matador/blob/main/matador/app.py), templates | red first |
 | 6 | OP-010 | Throughput with and without | bench | before and after |
 | 7 | | Docs: an operating page, the data model, upgrading | `docs/` | review |
 | 8 | | Prove: full suite, mutation audit, adversarial review | | evidence |

@@ -21,7 +21,9 @@ While the job runs, a per-job **renewer** task extends the lock every
 `lock_renew_time` (default `lock_duration / 2`) and clears the job from the
 `stalled` candidate set. Renewal is token-guarded - a worker can never renew a
 lock another worker has since taken over. If a renewal finds the token gone, the
-worker emits `lock-lost` and stops touching the job.
+worker emits `lock-lost` and stops renewing; the processor runs on, and its finish is
+refused by the same token guard. If the job was removed outright, the worker also
+cancels its processor.
 
 ## Stalled recovery: mark and sweep
 

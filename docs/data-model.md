@@ -36,10 +36,11 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `held:<key>` | ZSET | The jobs queued behind one key, scored as `prioritized` would score them. |
 | `meta-paused` | string (flag) | Exists only while the queue is paused; workers stop claiming new jobs. |
 | `events` | pub/sub channel | Carries `added` / `progress` / `completed` / `failed` / `cancelled`; drives `result()` and live dashboards. |
-| `cancel` | pub/sub channel | Carries bare job ids: a cancellation asked of whichever worker is running that job. Separate from `events` because that one carries a message per job, and a worker listening there would parse the whole firehose to catch something rare. |
+| `cancel` | pub/sub channel | Carries `<jobId>:<processedOn>`, naming the claim as well as the job, so a message cannot land on a later job that reuses the id: a cancellation asked of whichever worker is running that job. Separate from `events` because that one carries a message per job, and a worker listening there would parse the whole firehose to catch something rare. |
 | `limiter` | HASH | The queue-wide rate-limit token bucket (`{tokens, ts}`), shared by every worker. |
 | `stalled` | SET | Candidate ids for the mark-and-sweep recovery pass. |
 | `stalled-check` | string (PX) | Throttle key so the stalled sweep runs about once per interval cluster-wide. |
+| `roots-scratch` | ZSET (transient) | Working set for the root-only listing and counts; written and deleted inside one script call. |
 | `repeat` | ZSET | Scheduler id -> next-run timestamp. |
 | `workers` | ZSET | Live worker id -> last-heartbeat ms; stale entries pruned on read, and entries a day old by any worker's heartbeat. |
 | `departed` | LIST (capped) | Recent worker departures: graceful `stopped` or `lost` (crashed). |
@@ -60,6 +61,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `<jobId>:deps` | SET | A flow parent's still-pending child ids - the fan-in barrier; the parent releases when it empties. |
 | `<jobId>:results` | HASH | Child id → returnvalue JSON, written as each child completes. |
 | `<jobId>:cfail` | HASH | Child id → failure reason for children failed under `on_fail="continue"`. |
+| `<jobId>:ccancel` | HASH | Child id → why it was stopped, for children cancelled under `on_fail="continue"`. Kept apart from `:cfail` so the parent never reads a cancellation as a failure. |
 | `<jobId>:live` | ZSET | On a flow ROOT while its flow runs: the flow's finished jobs, which are scored out of the trims' reach until the root settles. |
 
 Note the job hash key is just `<prefix>:<name>:<jobId>` (no extra segment), so a job

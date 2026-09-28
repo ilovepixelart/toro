@@ -12,7 +12,7 @@ toro is the better answer when some of these are true:
 
 - You already run Redis, so the queue adds no new operational surface.
 - You want throughput in the thousands of jobs a second without tuning a database for
-  a workload it was not sized for. A job costs about 43 Redis commands end to end,
+  a workload it was not sized for. A job costs about 46 Redis commands end to end,
   all of them scripted ([Scaling](scaling.md)).
 - You want the machinery rather than the storage: per-job locks with renewal, a
   stalled-job sweep, retries with backoff, rate limits, a concurrency cap across every
