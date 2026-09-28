@@ -154,6 +154,10 @@ per job.
 | `heartbeat_interval` | 5000 ms | Presence cadence for the workers view. |
 | `blocked_warning` | half `lock_renew_time` | Seconds the loop may be blocked before a warning (below). `0` turns it off. |
 
+The delayed-job sweep, the stalled sweep and the heartbeat retry every interval
+whatever went wrong. A loop that starts failing logs one warning (with the error)
+and one info line when it next succeeds; the retries in between are silent.
+
 ## Rate limiting
 
 ```python
