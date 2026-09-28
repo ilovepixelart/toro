@@ -883,6 +883,7 @@ class Worker:
 
     async def _renew_loop(self, job_id: str) -> None:
         interval = self.lock_renew_time / 1000
+        held_until = time.monotonic() + self.lock_duration / 1000
         while True:
             await asyncio.sleep(interval)
             try:
@@ -892,8 +893,14 @@ class Worker:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:  # pragma: no cover
+            except Exception:
+                # Redis could not be asked, which says nothing about the lock: it is
+                # still ours until the lease from the last renewal runs out.
+                if time.monotonic() < held_until:
+                    continue
                 ok = 0
+            else:
+                held_until = time.monotonic() + self.lock_duration / 1000
             if int(ok) == scripts.LOCK_JOB_GONE:
                 # removed while we ran it: there is nothing left to finish, and the
                 # message that would have said so never arrived
