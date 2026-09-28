@@ -86,7 +86,8 @@ spread is the machine, not the code.
   anyway. Measure it on your own workload before adopting it.
 
 To run under another loop, build it yourself; the stdlib has the API and toro has no
-opinion:
+opinion (`asyncio.Runner` is Python 3.11+; on 3.10, `uvloop.install()` then
+`asyncio.run(...)`):
 
 ```python
 import asyncio, uvloop
@@ -96,8 +97,8 @@ with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
 
 ## Sizing Redis
 
-A job costs about **44 Redis commands end to end** on the default path: ~11 to
-enqueue it and ~33 to claim, renew, and settle it (`uv run python bench/bench.py`).
+A job costs about **46 Redis commands end to end** on the default path: ~11 to
+enqueue it and ~35 to claim, renew, and settle it (`uv run python bench/bench.py`).
 All of it is scripted, so those commands are not round trips: an enqueue is one, and
 a job's whole lifecycle is a handful.
 
@@ -106,10 +107,11 @@ cancellation channel, plus what your producers use. A dashboard adds its own.
 
 ## Caps hold across every replica
 
-`global_concurrency`, `rate_limit` and `concurrency_key` are enforced inside the
-Lua that claims a job, so they hold across every worker and every replica, not per
-process. Set the same value in each replica: they are queue-wide settings that each
-worker reports, and the dashboard warns when workers disagree.
+`global_concurrency` and `rate_limit` are enforced inside the Lua that claims a job,
+and `concurrency_key` inside the scripts that enqueue and finish one, so all three hold
+across every worker and every replica, not per process. `global_concurrency` and
+`rate_limit` are worker settings: set the same value in each replica. Each worker
+reports its `global_concurrency`, and the dashboard warns when workers disagree.
 
 ## What to watch
 
@@ -119,4 +121,4 @@ worker reports, and the dashboard warns when workers disagree.
 | `toro_queue_depth{state="held"}` climbing | same | Work serialized behind a `concurrency_key`, not behind a worker. |
 | Blocked-loop warnings | logs, `blocked` event | Something is starving the loop; more slots will not help. |
 | `rate(toro_jobs_total{outcome="failed"})` | same | The failure rate; cancellations are counted separately and are not in it. |
-| Stalled recoveries | worker logs | Locks expiring: jobs longer than `lock_duration`, or a blocked loop. |
+| Stalled recoveries | `stalled` event | Locks expiring: jobs longer than `lock_duration`, or a blocked loop. |

@@ -30,8 +30,7 @@ the stored template, so call `add_scheduler()` again to change them.
   runs don't drift, and a late tick (worker down for a while) catches up to the
   *next* slot instead of firing a backlog burst.
 - **`cron="*/5 * * * *"`** - a standard cron expression, evaluated in **UTC**
-  via [croniter](https://pypi.org/project/croniter/) - an optional dependency
-  (`pip install croniter`). Expressions are validated at `add_scheduler` time,
+  via [croniter](https://pypi.org/project/croniter/), which installs with toro. Expressions are validated at `add_scheduler` time,
   so a typo fails at registration, not silently inside a worker later.
 
 ## How occurrences work

@@ -33,7 +33,7 @@ async def handle(job):
     await job.log("starting")               # appends to <jobId>:logs
     await job.update_progress(42)           # publishes a `progress` event
     if job.attempts_made > 1:
-        ...                                 # this is a retry
+        ...                                 # a retry, or a rerun after its worker died
 ```
 
 `update_progress` takes a number or any JSON value; dashboards render it live.
@@ -160,8 +160,9 @@ per job.
 worker = Worker("emails", handle, rate_limit={"max": 100, "duration": 60_000})
 ```
 
-At most `max` jobs start per `duration`, across **all** workers on the queue -
-the token bucket lives in Redis, shared, so adding workers doesn't multiply the
+Jobs start at an average of `max` per `duration`, across **all** workers on the queue.
+The bucket starts full, so up to `max` can start at once before the steady rate
+applies. It lives in Redis, shared, so adding workers doesn't multiply the
 limit (give every worker the same config). When a claim hits the limit the job
 goes back untouched: no attempt is consumed, and the worker sleeps until a token
 frees (emitting a `rate-limited` event with the wait).
@@ -189,8 +190,8 @@ N connections, an API that allows N requests in flight. A rate limit bounds job
   finishes the last, so while the queue stays full the workers holding the slots
   keep them, and another worker can sit idle. Slots move when a holder drains,
   stops, or crashes.
-- Removing an active job does not hand its slot on at once: the processor may
-  still be running. The slot is reused when that processor ends.
+- Removing an active job frees its place under the cap at once, so the next claim
+  can take it. No parked worker is woken for it until the removed processor ends.
 - A changed value takes effect as workers restart. While a rollout mixes caps,
   each worker enforces its own, and a freed slot can wait up to `block_timeout`
   for a worker with room.
@@ -207,6 +208,8 @@ N connections, an API that allows N requests in flight. A rate limit bounds job
 | `stalled` | `job_id` | The sweep recovered one of this queue's jobs. |
 | `lock-lost` | `job_id` | This worker's lock was taken over; its result was dropped. |
 | `rate-limited` | `retry_ms` | A claim hit the rate limit. |
+| `cancelled` | `job` | A job this worker was running stopped after `cancel_job()` and committed as cancelled. |
+| `blocked` | `lag, jobs` | The event loop was blocked past `blocked_warning`: `lag` in seconds, `jobs` the ids in flight. See [When the loop is blocked](#when-the-loop-is-blocked). |
 
 These are this worker's own hooks. Cross-process consumers (dashboards,
 `result()`) use the pub/sub events channel instead - see [Concepts](concepts.md).
@@ -220,9 +223,11 @@ heartbeats long enough is pruned and logged as a `lost` departure, while
 `stop()` flips it to a visible `stopping` state first and logs `stopped` - so
 the dashboard can tell a drain from a crash.
 
-`Worker.check_stalled()` runs that sweep once by hand, which is what
+`Worker.check_stalled()` runs one pass of that sweep by hand, which is what
 `stalled_interval=0` leaves you: the background loop is off and recovery happens when
-you ask for it (a test, or a scheduler of your own).
+you ask for it (a test, or a scheduler of your own). A pass recovers the jobs an earlier
+pass marked, then marks the ones running now, so a dead worker's job takes two calls,
+with its lock expired in between.
 
 That pruning happens when something reads `Queue.workers()`. With no reader, a
 worker killed without deregistering still does not leave its record for good: the
@@ -268,7 +273,8 @@ async def process(job):
   for a cleanup that raises on the way out, which is not a failure to retry.
 - Workers hear a cancellation over a channel of their own and act at once. A worker
   that missed the message finds it at its next lock renewal instead, so the delay is
-  bounded by `lock_renew_time`, never lost.
+  bounded by `lock_renew_time`. With `renew_locks=False` there is no renewal, and a
+  missed message stays missed.
 
 ## Shutdown
 
@@ -278,5 +284,6 @@ await worker.stop()        # or stop(grace_period=10)
 
 `stop()` stops claiming new jobs, lets in-flight jobs finish for up to the grace
 period, cancels whatever remains (those jobs' locks expire and the sweep
-recovers them - nothing is lost), deregisters presence, and closes the
+recovers them; each recovery counts toward `max_stalled_count`, which is never reset,
+so at the default of 1 a job cut off a second time is failed instead), deregisters presence, and closes the
 connection. Pair `run()`/`stop()` with your framework's startup/shutdown hooks.

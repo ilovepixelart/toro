@@ -22,8 +22,8 @@ pip install toro-queue      # the import name is `toro`
 
 > Installed as **`toro-queue`** on PyPI (the name `toro` was taken), but you
 > `import toro`. See the [docs](https://github.com/ilovepixelart/toro/tree/main/docs) for the
-> architecture, the reliability model, and the detailed guides. Coming from Celery,
-> RQ or Dramatiq? [Migrating](https://github.com/ilovepixelart/toro/blob/main/docs/migrating.md)
+> architecture, the reliability model, and the detailed guides. Coming from another
+> Python task queue? [Migrating](https://github.com/ilovepixelart/toro/blob/main/docs/migrating.md)
 > maps the vocabulary. Wondering whether you need a queue at all?
 > [The FAQ](https://github.com/ilovepixelart/toro/blob/main/docs/faq.md) answers
 > "why not just use Postgres" honestly.
@@ -34,8 +34,9 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 
 ## Why toro
 
-- **Async-native.** Enqueue and process with `async`/`await` - no thread pools,
-  no sync bridge. A natural fit for FastAPI, aiohttp, or any asyncio app.
+- **Async-native.** Enqueue and process with `async`/`await` on one event loop, a
+  natural fit for FastAPI, aiohttp, or any asyncio app. A plain `def` processor
+  works too, run in the worker's own thread pool.
 - **Atomic by construction.** Claims, retries, promotions and finishes are Lua
   scripts, so a job can't be lost or double-committed between two round trips.
 - **At-least-once delivery.** Per-job locks + a background mark-and-sweep recover
@@ -55,7 +56,7 @@ Pairs with **[matador](https://github.com/ilovepixelart/matador)**, a live web d
 | **Global concurrency** | one cap on jobs active at once, across every worker process |
 | **Dedup** | custom (idempotent) job ids + a throttle window (`{id, ttl}`) |
 | **Serialize by key** | `concurrency_key`: jobs sharing a key run one at a time, in order, without holding a worker |
-| **Cancellation** | `cancel_job()` stops a job wherever it is, a running one included: its processor is cancelled where it awaits |
+| **Cancellation** | `cancel_job()` stops a job wherever it is, a running one included: an async processor is cancelled where it awaits, a sync one ends when its thread returns |
 | **Bounded history** | keeps the newest 1000 completed / 5000 failed by default; or the last N, an age, or everything |
 | **Reliability** | per-job locks, lock renewal, stalled-job recovery |
 | **Observability** | progress, per-job logs, lifecycle events, `await result()` |

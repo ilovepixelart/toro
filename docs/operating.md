@@ -21,7 +21,11 @@ to drop every sample after it.
 ```python
 from toro import render_all
 
-text = render_all({q.name: (await q.lifetime_totals(), await q.counts()) for q in queues})
+snapshot = {}
+for q in queues:
+    depths = await q.counts()  # depth first, then the counters: see below
+    snapshot[q.name] = (await q.lifetime_totals(), depths)
+text = render_all(snapshot)
 ```
 
 | Sample | Type | Labels | Meaning |
@@ -54,8 +58,8 @@ when a job fails makes `rate()` start from nothing at that instant.
 The totals are written in the same atomic step as the transition they count, so a
 counter can never disagree with the state change that produced it. That is three more
 Redis commands per job: one when it is added, two when it finishes (the outcome and
-its duration). Measured over 2,000 jobs: 10.0 to 11.0 commands per enqueue, 30.1 to
-32.1 per job processed, with throughput unchanged either side. All of them run inside
+its duration). `bench/bench.py` measures 11.0 commands per enqueue and about 35 per job processed,
+with these counters included. All of them run inside
 scripts that already run, so none is a round trip.
 
 Scraping itself reads Redis at scrape time and keeps no state in the process, so N

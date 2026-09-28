@@ -87,7 +87,7 @@ hit, a job about a row that was rolled back.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `priority` | 0 | Higher = more urgent, one global order (0 to 2^20; clamped). Default 0 is the least-urgent band, FIFO among itself. |
+| `priority` | 0 | Higher = more urgent, one global order (a whole number from 0; values above 2^20 are clamped to it). Default 0 is the least-urgent band, FIFO among itself. |
 | `delay` | 0 | ms before the job becomes runnable; it sits in `delayed` until due. |
 | `attempts` | 1 | Total tries before the job is terminally failed. |
 | `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms}`. Exponential doubles per attempt. |
@@ -213,8 +213,9 @@ Two distinct tools, usable independently:
 A custom id becomes the job's Redis key, beside the queue's own keys, so `add()`
 refuses one that would land on another key: a queue key's name (`completed`,
 `marker`, ...), a queue namespace or its bare name (`repeat:`, `worker:`,
-`metrics:`, `de:`, and so `de` itself, whose lock would be `de:lock`), or another
-job's aux key (`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`). Colons are
+`metrics:`, `de:`, `ck:`, `held:`, and so `de` itself, whose lock would be `de:lock`), or another
+job's aux key (`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`, `:ccancel`,
+`:live`). Colons are
 otherwise fine: `order:123`.
 
 It is also a path segment in every dashboard that shows it, so it may not contain
@@ -247,13 +248,13 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.get_job(job_id)` | A `Job` snapshot, or `None`. |
 | `await queue.get_jobs(state, start, end)` | A page of jobs; `wait` comes back in global priority order, finished states newest-first. |
 | `await queue.get_logs(job_id)` | Log lines appended by the processor. |
-| `await queue.search(state, query, scan_limit=500)` | Substring match over `name`/`data` within the most recent `scan_limit` jobs of a state. A bounded scan, not an index - surface the bound honestly in UIs. |
+| `await queue.search(state, query, scan_limit=500)` | Substring match over `name`/`data` within the first `scan_limit` jobs of a state in its list order: newest first for finished states, priority or due-time order for `wait`, `delayed` and `held`, claim order for `active`. A bounded scan, not an index - surface the bound honestly in UIs. |
 | `await queue.workers()` | Live workers from their heartbeats; stale entries are pruned (and logged as `lost`) on read. |
 | `await queue.departed_workers()` | Recent departures, newest first: graceful `stopped` or crashed `lost`. |
 | `await queue.metrics(minutes=60)` | Per-minute `{timestamp, added, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the same atomic scripts as the transitions (a count can never disagree with the state change it counts); `added` counts real inserts (dedup hits and id replays don't count), `failed` means terminal failures - retries don't count, stall-failures do. Buckets expire after 8 hours. |
-| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms}` totals over the window, failures first - the triage order ("which job is responsible"), not the volume order. A name is a label, so the breakdown stops taking new names past 1024 fields in a minute: a name with an id in it is a cardinality bomb, and the queue-level counters stay correct either way. |
+| `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms, p50, p95, p99}` totals over the window (percentiles of successful jobs), failures first - the triage order ("which job is responsible"), not the volume order. A name is a label, so once a minute's bucket holds 1024 fields the per-name breakdown stops for the rest of that minute, for every name: a name with an id in it is a cardinality bomb, and the queue-level counters stay correct either way. |
 | `await queue.latency()` | Age (ms) of the next-to-run waiting job, `0` when nothing waits. Depth says how much is queued; latency says how far behind the workers are. |
-| `await queue.roots_counts()` / `get_jobs_roots(state, start, end)` | The same counts and pages with flow **children** left out, so a list reads as one row per piece of work rather than one per node ([Flows](flows.md)). |
+| `await queue.roots_counts()` / `get_jobs_roots(state, start, end)` | The same counts, and a `(total, page)` tuple, with flow **children** left out, so a list reads as one row per piece of work rather than one per node ([Flows](flows.md)). |
 | `await queue.lifetime_totals()` / `metrics_text()` | Counters that never reset, and the OpenMetrics rendering of them ([Operating](operating.md)). |
 
 The shapes those metric calls return are exported and typed: `MetricsPoint`,
@@ -264,10 +265,10 @@ The shapes those metric calls return are exported and typed: `MetricsPoint`,
 | Call | Does |
 |---|---|
 | `await queue.retry_job(job_id)` | Move one failed job back to the queue. Flow-aware: retrying a flow parent re-drives its whole failed subtree (failed children pulled along, completed ones kept); a retried child re-joins its parked parent's barrier ([Flows](flows.md)). |
-| `await queue.retry_all_failed(limit=1000)` | Re-queue every failed job (pipelined, one round trip per batch); returns how many were retried. |
+| `await queue.retry_all_failed(limit=1000)` | Re-queue up to `limit` failed jobs, newest first (pipelined, one round trip per batch); returns how many were retried. |
 | `await queue.promote_job(job_id)` | Run a delayed job now. |
 | `await queue.cancel_job(job_id)` | Stop a job wherever it is, leaving it in `cancelled`. One that has not started ends at once; a RUNNING one is asked, and its worker stops the processor where it awaits ([Processing](processing.md#cancellation)). A flow parent takes its subtree. False when there was nothing to stop. |
-| `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. A RUNNING job's processor is stopped too, so its worker slot frees at once rather than when the work happens to end; the job is removed, not `cancelled`. Removing a flow parent removes its whole subtree - children included, even running ones. |
+| `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. A RUNNING job's async processor is stopped too, so its worker slot frees at once rather than when the work happens to end (a sync processor's thread runs to its end); the job is removed, not `cancelled`. Removing a flow parent removes its whole subtree - children included, even running ones. |
 | `await queue.clean(state, limit=1000)` | Remove every job in a state (pipelined). |
 | `await queue.pause()` / `resume()` / `is_paused()` | Stop workers claiming new jobs (in-flight jobs finish); resume wakes idle workers. |
 | `await queue.clear_departed()` | Forget the stopped-worker history. Presence records prune themselves; this is the "I have read those" button. |
@@ -278,13 +279,16 @@ they're ordinary public API.
 
 ## Errors
 
-Everything toro raises subclasses `ToroError`: `JobFailedError` and
-`JobCancelledError` from `result()`, and `PartialFlushError` from a batch that half
-landed. A `ValueError` from an option is a programming error and stays one.
+toro's own errors subclass `ToroError`: `JobFailedError` and `JobCancelledError` from
+`result()`, `PartialFlushError` from a batch that half landed, and
+`IncompatibleDataModelError`. `result()` raises the builtin `TimeoutError` when it
+times out, and `RuntimeError` when its queue is closed under it; a job helper called
+outside a processor raises `RuntimeError` too. A `ValueError` from an option is a
+programming error and stays one.
 
 ## Lifecycle
 
-A `Queue` opens its Redis connection eagerly and starts no background work; the
+A `Queue` builds its connection pool when created and connects on first use; it starts no background work, and the
 first `result()` call starts a small shared event listener. Call
 `await queue.close()` when you're done with it (anyone still inside `result()`
 fails fast rather than waiting out their timeout).

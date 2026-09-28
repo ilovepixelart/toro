@@ -15,7 +15,7 @@ A vocabulary map, and an honest list of what has no equivalent here.
 | `max_retries`, `retry_backoff` | `attempts` and `backoff` ([Producing](producing.md)) |
 | `acks_late=True` | always on: a job is locked while it runs and recovered if its worker dies ([Reliability](reliability.md)) |
 | visibility timeout | `lock_duration`, renewed while the job runs. A slow job does not get delivered twice for being slow. |
-| `revoke()`, `AbortableTask` | `await queue.cancel_job(job_id)`, which stops a running job's processor where it awaits |
+| `revoke()`, `AbortableTask` | `await queue.cancel_job(job_id)`, which stops a running async processor where it awaits; a sync one ends when its thread returns |
 | `group`, `chain`, `chord` | **flows**: `add_flow(...)` with children, fan-in through `job.children_results()` ([Flows](flows.md)) |
 | beat, cron worker, scheduler process | `await queue.add_scheduler(...)`: the schedule lives in Redis and any worker mints the next occurrence ([Scheduling](scheduling.md)) |
 | prefetch count | `concurrency`, which is how many jobs a worker runs at once. Nothing is prefetched: a slot claims one job atomically when it is free. |
@@ -23,7 +23,7 @@ A vocabulary map, and an honest list of what has no equivalent here.
 | `rate_limit="10/s"` | `rate_limit={"max": 10, "duration": 1000}`, queue-wide across every worker |
 | priority queues, `x-max-priority` | `priority=` on the job, one global order |
 | unique task, `task_id` | `job_id=` for idempotency, `deduplication={"id", "ttl"}` for a throttle window |
-| flower, rq-dashboard, bull-board | [matador](https://github.com/ilovepixelart/matador) |
+| a separate monitoring dashboard | [matador](https://github.com/ilovepixelart/matador) |
 
 ## What has no equivalent
 

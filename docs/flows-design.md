@@ -99,10 +99,10 @@ async def process(job):
 Per-child `on_fail`, stored as a plain mutable field on the child's hash (so
 tooling *can* change it after enqueue - see lesson 7):
 
-| `on_fail`               | when this child terminally fails                       |
+| `on_fail`               | when this child terminally fails (or is cancelled)     |
 | ----------------------- | ------------------------------------------------------ |
-| `"fail_parent"` (default) | the parent fails **immediately and eagerly**, in the same Lua script, recursively up ancestors that also default; no worker on the parent required |
-| `"continue"`            | the failure is recorded in the parent's failures hash, the dependency cleared; the parent runs once all children settle and inspects `failed_children()` |
+| `"fail_parent"` (default) | the parent fails **immediately and eagerly**, in the same Lua script, recursively up ancestors that also default; no worker on the parent required. Ancestors of a *cancelled* child end `cancelled`, not failed |
+| `"continue"`            | the failure is recorded in the parent's failures hash (`:cfail`, or `:ccancel` for a cancelled child), the dependency cleared; the parent runs once all children settle and inspects `failed_children()` |
 
 There is deliberately **no "wait indefinitely" option** (lesson 3). Retries
 still happen first: "terminally fails" means after the child's own `attempts`
@@ -113,20 +113,22 @@ failed children along instead.
 
 ### Data model
 
-New job state `waiting-children` (a sixth `JobState`), backed by a per-queue
-ZSET (timestamp-scored, like `completed`/`failed`), surfaced in `counts()`,
+New job state `waiting-children` (a new `JobState`), backed by a per-queue
+timestamp-scored ZSET, surfaced in `counts()`,
 `get_jobs()`, `clean()` and the dashboard.
 
-Per parent job, three aux keys (joining `:lock` / `:logs`):
+Per parent job, these aux keys (joining `:lock` / `:logs`):
 
 | key             | type | content                                            |
 | --------------- | ---- | -------------------------------------------------- |
 | `{id}:deps`     | SET  | ids of children not yet settled (the barrier)      |
 | `{id}:results`  | HASH | child id → returnvalue JSON (completed children)   |
 | `{id}:cfail`    | HASH | child id → failed reason (`on_fail="continue"` children) |
+| `{id}:ccancel`  | HASH | child id → why it was stopped (cancelled `continue` children) |
+| `{id}:live`     | ZSET | on a root: an index of its flow's finished jobs while the flow runs, drained into retention when the root settles |
 
-Plus two hash fields: `parentId` on every child; `children` (static JSON id
-list) on every parent - the deps set shrinks, the dashboard tree needs the
+Plus hash fields: `parentId`, `rootId` and `onFail` on every child; `children`
+(static JSON id list) on every parent - the deps set shrinks, the dashboard tree needs the
 full picture.
 
 A SET rather than a counter: it's idempotent under re-delivery, inspectable
@@ -137,7 +139,8 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
 ### Mechanics
 
 - **`ADD_FLOW`** (new script): tree as JSON in ARGV, `cjson.decode`, walk
-  depth-first; leaves enqueue into `prioritized` (or `delayed`), interior
+  depth-first; leaves enqueue into `prioritized` (or `delayed`, or `held` behind
+  a `concurrency_key` another job holds), interior
   nodes land in `waiting-children` with their `:deps` set populated. Capped
   (~1000 nodes per flow) to bound script time, like `PROMOTE_BATCH`. One
   `added` increment of the node count and one announce (the root id) for
@@ -146,8 +149,8 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
   `_LIB` reserved ("to add markers-with-delay or grouping later, we change
   only these functions"):
   - `MOVE_TO_COMPLETED` of a child: `HSET parent:results`, `SREM parent:deps`;
-    on empty, move the parent from `waiting-children` through the shared
-    `enqueue()` at its stored priority.
+    on empty, move the parent from `waiting-children` through `takeKey` and the
+    shared `enqueue()` at its stored priority (into `held` if its key is taken).
   - `MOVE_TO_FAILED` terminal branch: apply `on_fail` - either record into
     `:cfail` + `SREM` (+ release if last), or fail the parent now through
     `recordFinished` (so `remove_on_fail` retention applies), publish the
@@ -158,8 +161,8 @@ A SET rather than a counter: it's idempotent under re-delivery, inspectable
     barriers historically break). The stall-escalated job itself is recorded
     through `recordFinished` too, which reads the job's own `remove_on_fail` - a
     queue whose only failures are crashes stays bounded like any other.
-- **Cleanup is structural** (lesson 5): `delJobs` and `REMOVE_JOB` know the
-  three aux keys, so every existing removal path (auto-removal
+- **Cleanup is structural** (lesson 5): `delJobs` and `REMOVE_JOB` know every
+  aux key, so every existing removal path (auto-removal
   keepCount/keepAge, manual remove, `clean()`) deletes them for free.
   Removing a parent removes its subtree; removing a child SREMs it from its
   parent's deps (and releases the parent if it was the last). Settle writes

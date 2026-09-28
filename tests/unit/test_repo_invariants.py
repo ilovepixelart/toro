@@ -93,3 +93,69 @@ def test_a_1_0_release_does_not_call_itself_alpha():
     assert int(_version().split(".")[0]) >= 1
     status = re.findall(r'"Development Status :: ([^"]+)"', (ROOT / "pyproject.toml").read_text())
     assert status == ["5 - Production/Stable"], status
+
+
+def _architecture() -> str:
+    return (DOCS / "architecture.md").read_text()
+
+
+def test_every_lua_script_has_a_row_in_the_architecture_doc():
+    """The script table in architecture.md is the only map of what runs inside Redis,
+    and it had fallen three scripts behind before this check existed."""
+    from toro import scripts
+
+    table = _architecture().split("And the scripts themselves:", 1)[1]
+    lua = [
+        name
+        for name, value in vars(scripts).items()
+        if not name.startswith("_") and isinstance(value, str) and "redis.call" in value
+    ]
+    assert lua, "found no scripts: the check would pass on anything"
+    missing = [name for name in lua if f"`{name}`" not in table]
+    assert not missing, f"scripts with no row in docs/architecture.md: {missing}"
+
+
+def test_every_routine_the_architecture_doc_names_exists():
+    """A renamed Lua routine left its old name in the routine table."""
+    from toro import scripts
+
+    doc = _architecture()
+    table = doc.split("The scripts share a small library of routines:", 1)[1].split(
+        "And the scripts", 1
+    )[0]
+    named = [
+        name
+        for row in re.findall(r"^\| ([^|]+) \|", table, re.MULTILINE)
+        for name in re.findall(r"`(\w+)`", row)
+    ]
+    assert named, "found no routines in the table: the check would pass on anything"
+    defined = set(re.findall(r"local function (\w+)", scripts._LIB))
+    stale = [name for name in named if name not in defined]
+    assert not stale, f"routines named in docs/architecture.md that scripts.py lacks: {stale}"
+
+
+def test_every_worker_event_is_in_the_lifecycle_table():
+    """`worker.on()` accepts any name, so an event missing from the table is one a
+    reader cannot know to subscribe to. The table had lost two."""
+    source = (ROOT / "toro" / "worker.py").read_text()
+    # the event argument of every _emit call, including `"a" if cond else "b"`
+    first_args = re.findall(r"_emit\(([^,]+),", source)
+    emitted = {name for arg in first_args for name in re.findall(r'"([a-z-]+)"', arg)}
+    assert emitted, "found no emitted events: the check would pass on anything"
+    section = (
+        (DOCS / "processing.md").read_text().split("## Lifecycle events", 1)[1].split("\n## ", 1)[0]
+    )
+    rows = set(re.findall(r"^\| `([a-z-]+)` \|", section, re.MULTILINE))
+    assert emitted <= rows, f"events with no row in processing.md: {sorted(emitted - rows)}"
+
+
+def test_every_redis_key_is_in_the_data_model_doc():
+    """keys.py is where every key name is computed; data-model.md is where a reader
+    looks one up. Two keys had reached the first without the second."""
+    source = (ROOT / "toro" / "keys.py").read_text()
+    suffixes = set(re.findall(r'f"\{self\.base\}([a-z][a-z-]*)', source))
+    suffixes |= {f"<jobId>:{s}" for s in re.findall(r'\{job_id\}:([a-z-]+)"', source)}
+    assert len(suffixes) > 10, f"found only {sorted(suffixes)}: the check would pass on anything"
+    doc = (DOCS / "data-model.md").read_text()
+    missing = sorted(s for s in suffixes if f"`{s}" not in doc)
+    assert not missing, f"keys with no entry in data-model.md: {missing}"
