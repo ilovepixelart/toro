@@ -23,7 +23,9 @@ While the job runs, a per-job **renewer** task extends the lock every
 lock another worker has since taken over. If a renewal finds the token gone, the
 worker emits `lock-lost` and stops renewing; the processor runs on, and its finish is
 refused by the same token guard. If the job was removed outright, the worker also
-cancels its processor.
+cancels its processor. A renewal that cannot reach Redis at all says nothing about the
+lock, so the worker keeps trying every interval; it gives up, with `lock-lost`, only
+once the lease from its last successful renewal has run out.
 
 ## Stalled recovery: mark and sweep
 

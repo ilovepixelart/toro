@@ -8,6 +8,7 @@ import asyncio
 import time
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from toro import JobFailedError, Queue, Worker, scripts
 
@@ -969,3 +970,73 @@ async def test_a_job_outliving_its_lock_duration_keeps_the_lock_by_renewing(
 
     assert completed == [job.id]
     assert lost == []
+
+
+@pytest.mark.parametrize("failing_call", [1, 8], ids=["first-renewal", "after-the-first-lease"])
+async def test_a_renewal_that_errors_once_keeps_renewing(q, run_worker, run_until, failing_call):
+    """A renewal that cannot reach Redis says nothing about the lock, which still has
+    most of its lease left. Read as a lost lock, renewing stops, the lock lapses under
+    a running job, and the stalled sweep hands it to a second run. The lease counts
+    from the last renewal that succeeded, so an error late in a long job is survived
+    too."""
+    completed: list[str] = []
+    lost: list[str] = []
+
+    async def proc(job):
+        await asyncio.sleep(1.2)  # the job's own work, twice the lock duration
+
+    async with run_worker(
+        q, proc, lock_duration=600, lock_renew_time=100, stalled_interval=0
+    ) as worker:
+        real_extend = worker._extend_lock
+        calls = {"n": 0}
+
+        async def blip_once(**kw):
+            calls["n"] += 1
+            if calls["n"] == failing_call:
+                raise RedisConnectionError("connection reset by peer")
+            return await real_extend(**kw)
+
+        worker._extend_lock = blip_once
+        worker.on("completed", lambda j, r: completed.append(j.id))
+        worker.on("lock-lost", lost.append)
+        job = await q.add("long", {})
+        assert await run_until(lambda: completed or lost, timeout=5)
+
+    assert lost == []
+    assert completed == [job.id]
+    assert calls["n"] > failing_call, "renewal gave up after the error"
+
+
+async def test_renewals_that_keep_erroring_give_up_when_the_lease_runs_out(
+    q, run_worker, run_until
+):
+    """Past the lease from the last good renewal the lock has expired in Redis, so the
+    worker says so: one lock-lost, not before the lease is up, and no more renewals."""
+    lost: list[float] = []
+    release = asyncio.Event()
+
+    async def proc(job):
+        await release.wait()
+
+    async with run_worker(
+        q, proc, lock_duration=600, lock_renew_time=100, stalled_interval=0
+    ) as worker:
+        calls = {"n": 0}
+
+        async def always_down(**kw):
+            calls["n"] += 1
+            raise RedisConnectionError("connection refused")
+
+        worker._extend_lock = always_down
+        started = asyncio.get_running_loop().time()
+        worker.on("lock-lost", lambda jid: lost.append(asyncio.get_running_loop().time() - started))
+        await q.add("long", {})
+        assert await run_until(lambda: lost, timeout=5)
+        calls_at_loss = calls["n"]
+        await asyncio.sleep(0.3)  # three more intervals: none may renew again
+        assert len(lost) == 1  # the job's refused finish, once released, is another
+        assert calls["n"] == calls_at_loss
+        release.set()
+
+    assert lost[0] >= 0.5, f"gave up after {lost[0]:.2f}s, inside the 0.6s lease"
