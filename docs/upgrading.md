@@ -4,9 +4,23 @@ Breaking changes by release, newest first, each with what to do about it.
 
 ## 1.0.0
 
-Nothing breaks, and nothing new ships. 1.0 is the promise rather than a feature:
-what is public, what may change under it, and what the stored keys mean. See
-[Versioning](versioning.md).
+Nothing new ships: 1.0 is the promise rather than a feature, what is public, what may
+change under it, and what the stored keys mean. See [Versioning](versioning.md).
+
+One thing breaks: input that 0.x accepted without checking now raises `ValueError`
+when the queue, the worker or the job is created. Each rule keeps a value from landing
+somewhere it cannot be read back, and each error names the rule it broke.
+
+| Now rejected | Where it was a problem |
+|---|---|
+| A queue name with `:`, or a prefix or queue name over 128 characters or with a control character | Two different (prefix, name) pairs could share one key namespace. |
+| A job name over 128 characters or with a control character | Names are metric labels and log fields. |
+| A custom `job_id` with `/`, a control character, or over 256 characters | An id is a path segment wherever it is shown; such a job could not be opened or removed. |
+| `delay`, `attempts`, `priority`, or a backoff or retention count or age that is fractional, negative, a bool or a string (a whole float such as `86_400 / 2` is still accepted) | The scripts take whole numbers; a fractional count used to keep everything or fail the finish inside Redis. |
+| A backoff `type` other than `"fixed"` or `"exponential"`, or a retention dict with keys other than `count` and `age` | An unknown backoff type ran as fixed, and other retention keys were never read. |
+
+What to do: create queues, workers and jobs with 1.0 in a test first. Anything that
+raises was being stored in a shape that could not be read back as meant.
 
 Two things appear in Redis. A queue gains a `meta` hash holding the data-model
 version, written by the first 1.0 write; `meta` therefore joins the reserved job ids,
