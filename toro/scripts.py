@@ -988,6 +988,19 @@ if parentId then
     redis.call("SADD", base .. parentId .. ":deps", ARGV[1])
   end
 end
+-- A parent retried after its children settled (under `continue`) has an empty
+-- barrier, yet the children that did not complete are being retried with it. It waits
+-- on each of them again, or it reruns beside them on last time's results. A completed
+-- child keeps its result, and a cancelled one was stopped on purpose.
+local children = redis.call("HGET", KEYS[4], "children")
+if children then
+  for _, cid in ipairs(cjson.decode(children)) do
+    local state = redis.call("HGET", base .. cid, "state")
+    if state and state ~= "completed" and state ~= "cancelled" then
+      redis.call("SADD", base .. ARGV[1] .. ":deps", cid)
+    end
+  end
+end
 if redis.call("SCARD", base .. ARGV[1] .. ":deps") > 0 then
   redis.call("HSET", KEYS[4], "state", "waiting-children")
   redis.call("ZADD", base .. "waiting-children", tonumber(ARGV[2]), ARGV[1])
