@@ -127,7 +127,7 @@ The scripts share a small library of routines:
 | `recordFinished` | Records a terminal job in `completed`/`failed`/`cancelled` and applies the job's own retention. Every way a job finishes comes through it, and it is the only writer to those sets. A child of a running flow is scored `LIVE + now`; a settling root places its subtree. |
 | `settleLive` / `reviveSubtree` | A settling root drains its `:live` index, scoring each entry one above its finish time; a retried root walks its children and scores every finished descendant live again. |
 | `removeFinished` | The trims' one remover: a job and, with it, the finished subtree of a flow it roots, returning how many went for the budget. |
-| `settleChildCompleted` / `settleChildFailed` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent - or fails it eagerly, per `on_fail`. |
+| `settleChildCompleted` / `settleChildGone` / `releaseParent` | A finishing flow child settles into its parent's `:deps` barrier; the last one releases the parent. A child that failed or was cancelled settles through `settleChildGone`, which fails or cancels the parent eagerly, or records the reason and lets it run, per `on_fail`. |
 | `keepFor` | The one place a `remove_on_complete` / `remove_on_fail` option is read. In Lua because two ways a job finishes have no worker behind them: a parent failed with its child, and a job the stalled sweep gives up on. |
 
 And the scripts themselves:
@@ -145,6 +145,8 @@ And the scripts themselves:
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
 | `PROMOTE_DELAYED` | promote loop | Move up to `PROMOTE_BATCH` (1000) due delayed jobs to `prioritized`. |
 | `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |
+| `STAMP_MODEL` | queue/worker | Stamp the queue's data-model version on first use and return the version it holds, so a newer model is refused. |
+| `LIST_ROOTS` / `ROOTS_COUNTS` | dashboard | Page and count one state's jobs without flow children (`get_jobs_roots`, `roots_counts`), exactly, in one round trip. |
 | `PROMOTE_JOB` / `RETRY_JOB` / `REMOVE_JOB` | dashboard | Run a delayed job now / re-enqueue a failed one (flow-aware: a parent with unsettled children re-parks, a child re-joins the barrier) / delete a job with its lock, logs and flow aux keys (a flow parent takes its subtree). |
 
 ### Lua → Python return protocol

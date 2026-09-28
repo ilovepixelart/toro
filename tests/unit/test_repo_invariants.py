@@ -85,3 +85,42 @@ def test_the_readme_and_the_docs_agree_on_what_this_is():
     readme = (ROOT / "README.md").read_text()
     assert "docs" in readme
     assert INDEX.read_text().count("README") >= 1
+
+
+def _architecture() -> str:
+    return (DOCS / "architecture.md").read_text()
+
+
+def test_every_lua_script_has_a_row_in_the_architecture_doc():
+    """The script table in architecture.md is the only map of what runs inside Redis,
+    and it had fallen three scripts behind before this check existed."""
+    from toro import scripts
+
+    table = _architecture().split("And the scripts themselves:", 1)[1]
+    lua = [
+        name
+        for name, value in vars(scripts).items()
+        if not name.startswith("_") and isinstance(value, str) and "redis.call" in value
+    ]
+    assert lua, "found no scripts: the check would pass on anything"
+    missing = [name for name in lua if f"`{name}`" not in table]
+    assert not missing, f"scripts with no row in docs/architecture.md: {missing}"
+
+
+def test_every_routine_the_architecture_doc_names_exists():
+    """A renamed Lua routine left its old name in the routine table."""
+    from toro import scripts
+
+    doc = _architecture()
+    table = doc.split("The scripts share a small library of routines:", 1)[1].split(
+        "And the scripts", 1
+    )[0]
+    named = [
+        name
+        for row in re.findall(r"^\| ([^|]+) \|", table, re.MULTILINE)
+        for name in re.findall(r"`(\w+)`", row)
+    ]
+    assert named, "found no routines in the table: the check would pass on anything"
+    defined = set(re.findall(r"local function (\w+)", scripts._LIB))
+    stale = [name for name in named if name not in defined]
+    assert not stale, f"routines named in docs/architecture.md that scripts.py lacks: {stale}"
