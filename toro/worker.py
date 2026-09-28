@@ -898,7 +898,12 @@ class Worker:
         cron = cast("str | None", template.get("cron") or None)
         now = _now_ms()
         when = next_run(max(now, slot), every=every, cron=cron)
-        await self.redis.zadd(self.keys.repeat, {scheduler_id: when})
+        # XX: only a schedule still registered moves on to its next slot. One removed
+        # between the reads above and this write would otherwise come back as an
+        # entry with no template behind it, and run once more.
+        moved = await self.redis.zadd(self.keys.repeat, {scheduler_id: when}, xx=True, ch=True)
+        if not moved:
+            return
         opts = json.loads(template["opts"])
         await self._add_scheduled(
             keys=[self.keys.delayed, self.keys.base],
