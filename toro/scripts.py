@@ -844,6 +844,7 @@ return {1}
 # ARGV[9] lockDuration(ms)
 # ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
 # ARGV[13] globalConcurrency (0 = no cap)  ARGV[14] the claim's processedOn ("" = unchecked)
+# ARGV[15] the failure's traceback ("" = none), written only past the guards
 # Returns -2/-3, else {outcome} or {outcome, nextHash, nextId}; outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
@@ -857,6 +858,7 @@ if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local attemptsMade = tonumber(ARGV[4])
 local maxAttempts = tonumber(ARGV[5])
 redis.call("HSET", KEYS[5], "failedReason", ARGV[2], "attemptsMade", attemptsMade)
+if ARGV[15] and ARGV[15] ~= "" then redis.call("HSET", KEYS[5], "stacktrace", ARGV[15]) end
 local outcome
 if attemptsMade < maxAttempts then
   local backoff = tonumber(ARGV[6])
@@ -906,6 +908,24 @@ end
 return {outcome}
 """
 )
+
+# Report a running job's progress. Guarded: a removed job's processor may still run
+# its cleanup, and a blind HSET recreated the hash as a stub with no state, which no
+# listing shows, nothing can remove, and whose custom id then refuses every add().
+# KEYS[1] job hash  KEYS[2] events channel  ARGV[1] progress (json)  ARGV[2] the event
+UPDATE_PROGRESS = """
+if redis.call("HEXISTS", KEYS[1], "opts") == 0 then return 0 end
+redis.call("HSET", KEYS[1], "progress", ARGV[1])
+redis.call("PUBLISH", KEYS[2], ARGV[2])
+return 1
+"""
+
+# Append a log line to a job that still exists, for the same reason.
+# KEYS[1] job hash  KEYS[2] logs list  ARGV[1] the line
+APPEND_LOG = """
+if redis.call("HEXISTS", KEYS[1], "opts") == 0 then return 0 end
+return redis.call("RPUSH", KEYS[2], ARGV[1])
+"""
 
 # Claim the queue's data model: stamp it when it is unmarked, and answer with what it
 # actually holds either way, so one round trip both adopts and checks.
@@ -1438,7 +1458,9 @@ def failed_args(
     global_concurrency: int,
     claim: str = "",
 ) -> list[str | int]:
-    """ARGV for MOVE_TO_FAILED (`claim`: the processedOn this run was claimed at)."""
+    """ARGV for MOVE_TO_FAILED, up to ARGV[14] (`claim`: the processedOn this run was
+    claimed at). The worker appends ARGV[15], the traceback.
+    """
     return [
         job_id,
         reason,

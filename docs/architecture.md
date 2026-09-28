@@ -145,6 +145,8 @@ And the scripts themselves:
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
 | `PROMOTE_DELAYED` | promote loop | Move up to `PROMOTE_BATCH` (1000) due delayed jobs to `prioritized`. |
 | `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |
+| `UPDATE_PROGRESS` | processor (`job.update_progress`) | Write progress and publish the `progress` event, only while the job hash exists: a removed job's cleanup cannot recreate it as a stub. |
+| `APPEND_LOG` | processor (`job.log`) | Append a log line, only while the job hash exists, for the same reason. |
 | `STAMP_MODEL` | queue/worker | Stamp the queue's data-model version on first use and return the version it holds, so a newer model is refused. |
 | `LIST_ROOTS` / `ROOTS_COUNTS` | dashboard | Page and count one state's jobs without flow children (`get_jobs_roots`, `roots_counts`), exactly, in one round trip. |
 | `PROMOTE_JOB` / `RETRY_JOB` / `REMOVE_JOB` | dashboard | Run a delayed job now / re-enqueue a failed one (flow-aware: a parent with unsettled children re-parks, a child re-joins the barrier) / delete a job with its lock, logs and flow aux keys (a flow parent takes its subtree). |
