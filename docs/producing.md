@@ -253,12 +253,17 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.departed_workers()` | Recent departures, newest first: graceful `stopped` or crashed `lost`. |
 | `await queue.metrics(minutes=60)` | Per-minute `{timestamp, added, completed, failed, ms}` points, oldest first, zero-filled for charting. Counters are written inside the same atomic scripts as the transitions (a count can never disagree with the state change it counts); `added` counts real inserts (dedup hits and id replays don't count), `failed` means terminal failures - retries don't count, stall-failures do. Buckets expire after 8 hours. |
 | `await queue.metrics_by_name(minutes=60)` | Per-job-name `{name, completed, failed, ms, p50, p95, p99}` totals over the window (percentiles of successful jobs), failures first - the triage order ("which job is responsible"), not the volume order. A name is a label, so once a minute's bucket holds 1024 fields the per-name breakdown stops for the rest of that minute, for every name: a name with an id in it is a cardinality bomb, and the queue-level counters stay correct either way. |
-| `await queue.latency()` | Age (ms) of the next-to-run waiting job, `0` when nothing waits. Depth says how much is queued; latency says how far behind the workers are. |
+| `await queue.latency()` | How long (ms) the next-to-run waiting job has been runnable (since its add, or the end of its delay), `0` when nothing waits. Depth says how much is queued; latency says how far behind the workers are. |
 | `await queue.roots_counts()` / `get_jobs_roots(state, start, end)` | The same counts, and a `(total, page)` tuple, with flow **children** left out, so a list reads as one row per piece of work rather than one per node ([Flows](flows.md)). |
 | `await queue.lifetime_totals()` / `metrics_text()` | Counters that never reset, and the OpenMetrics rendering of them ([Operating](operating.md)). |
 
 The shapes those metric calls return are exported and typed: `MetricsPoint`,
 `NameMetrics` and `FlowMetricsPoint`.
+
+Durations are kept in 26 geometric buckets (20 ms, each half again as wide as the
+last), so a percentile is an estimate within about a fifth of the true value. The
+top bucket has no ceiling: a job over about 5.6 minutes (336,683 ms) reads as about
+412 s whatever its length.
 
 ## Admin operations
 
