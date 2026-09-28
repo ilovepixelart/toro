@@ -133,3 +133,10 @@ async def test_an_occurrence_claimed_while_it_is_being_dropped_survives(q, monke
     await q.add_scheduler("nightly", every=37_000)
 
     assert await q.redis.hget(q.keys.job(old_id), "state") == "active"
+
+
+@pytest.mark.parametrize("cadence", [{}, {"every": 60_000, "cron": "0 3 * * *"}])
+async def test_a_schedule_takes_exactly_one_cadence(q, cadence):
+    with pytest.raises(ValueError, match="exactly one of `every` or `cron`"):
+        await q.add_scheduler("nightly", **cadence)
+    assert await q.schedulers() == []

@@ -32,3 +32,23 @@ def test_global_concurrency_is_stored_as_a_plain_int():
     stored = Worker("q", _noop, global_concurrency=_Limits.DB_POOL).global_concurrency
     assert type(stored) is int
     assert stored == 2
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"max": 0, "duration": 1000},
+        {"max": 5, "duration": 0},
+        {"max": -1, "duration": 1000},
+        {"max": 5},
+        {"duration": 1000},
+    ],
+)
+def test_rate_limit_validation(bad):
+    with pytest.raises(ValueError, match="rate_limit"):
+        Worker("q", _noop, rate_limit=bad)
+
+
+def test_rate_limit_stored():
+    w = Worker("q", _noop, rate_limit={"max": 5, "duration": 1000})
+    assert (w.rl_max, w.rl_duration) == (5, 1000)
