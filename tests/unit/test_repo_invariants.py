@@ -172,3 +172,12 @@ def test_ci_runs_the_suite_on_the_redis_version_the_docs_name_as_the_floor():
     assert f"('Redis', '{floor['v']} and later')" in site
     workflow = (ROOT / ".github" / "workflows" / "pr-check.yaml").read_text()
     assert f"image: redis:{floor['v']}-alpine" in workflow
+
+
+def test_ci_runs_the_suite_on_the_redis_py_floor_pyproject_declares():
+    """The lock pins one redis-py and every matrix cell installs that one, so the
+    floor in pyproject.toml was a claim no job checked."""
+    floor = re.search(r'"redis>=(?P<v>[\d.]+)"', (ROOT / "pyproject.toml").read_text())
+    assert floor, "pyproject.toml declares no redis-py floor"
+    workflow = (ROOT / ".github" / "workflows" / "pr-check.yaml").read_text()
+    assert f'redis_py: "{floor["v"]}"' in workflow

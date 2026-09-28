@@ -14,10 +14,12 @@ on:
 permissions:
   contents: read
 
-# A new push to the same branch/PR supersedes the previous run.
+# A new push to the same PR supersedes the previous run. A push to main never cancels
+# the previous merge's run: each merge commit needs a green run of its own, and a
+# release is tagged from one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -102,16 +104,29 @@ jobs:
             -Dsonar.test.exclusions=tests/**
             -Dsonar.coverage.exclusions=tests/**
 
-  redis-floor:
-    # docs/versioning.md names the oldest supported Redis; this runs the suite on it.
-    name: Tests (Redis 6.2)
+  floors:
+    # The matrix above runs the newest of everything the lock pins. These cells run
+    # the oldest the project claims to support: the Redis docs/versioning.md names,
+    # and the redis-py floor pyproject.toml declares (the lock pins one version, so
+    # no other cell ever installs the floor).
+    name: Tests (${{ matrix.floor }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - floor: Redis 6.2
+            image: redis:6.2-alpine
+            redis_py: ""
+          - floor: redis-py 5.0.1
+            image: redis:7-alpine
+            redis_py: "5.0.1"
     permissions:
       contents: read
     services:
       redis:
-        image: redis:6.2-alpine
+        image: ${{ matrix.image }}
         ports:
           - 6379:6379
         options: >-
@@ -133,5 +148,9 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked
 
+      - name: Install the redis-py floor
+        if: matrix.redis_py != ''
+        run: uv pip install "redis==${{ matrix.redis_py }}"
+
       - name: Tests (unit + integration)
-        run: uv run pytest -m "unit or integration"
+        run: uv run --no-sync pytest -m "unit or integration"
