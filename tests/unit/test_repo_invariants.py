@@ -159,3 +159,16 @@ def test_every_redis_key_is_in_the_data_model_doc():
     doc = (DOCS / "data-model.md").read_text()
     missing = sorted(s for s in suffixes if f"`{s}" not in doc)
     assert not missing, f"keys with no entry in data-model.md: {missing}"
+
+
+def test_ci_runs_the_suite_on_the_redis_version_the_docs_name_as_the_floor():
+    """The floor is a support claim, and a claim no job runs is a guess: every CI cell
+    ran Redis 7 while the docs and the site promised 6.2."""
+    floor = re.search(
+        r"\*\*Redis (?P<v>[\d.]+) and later\.\*\*", (DOCS / "versioning.md").read_text()
+    )
+    assert floor, "docs/versioning.md states no Redis floor"
+    site = (ROOT / "site" / "web" / "templates" / "index.html").read_text()
+    assert f"('Redis', '{floor['v']} and later')" in site
+    workflow = (ROOT / ".github" / "workflows" / "pr-check.yaml").read_text()
+    assert f"image: redis:{floor['v']}-alpine" in workflow

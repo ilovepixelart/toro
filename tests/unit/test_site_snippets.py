@@ -178,3 +178,15 @@ def test_the_states_on_the_page_are_the_states_toro_has():
     assert sorted(listed) == sorted(get_args(JobState)), (
         f"the page lists {sorted(listed)}, toro has {sorted(get_args(JobState))}"
     )
+
+
+def test_the_templates_carry_no_version_of_their_own():
+    """The version lives in pyproject.toml. Written into the templates as well, it
+    has to be edited by hand at every release, and 1.0.1 shipped with three copies."""
+    project = (SITE.parent / "pyproject.toml").read_text()
+    version = re.search(r'^version = "([^"]+)"', project, re.MULTILINE)
+    assert version, "pyproject has no version"
+    templates = sorted((SITE / "web" / "templates").rglob("*.html"))
+    assert templates, "found no templates: the check would pass on anything"
+    pinned = [str(t.relative_to(SITE)) for t in templates if version.group(1) in t.read_text()]
+    assert not pinned, f"{version.group(1)} is written into {pinned}"
