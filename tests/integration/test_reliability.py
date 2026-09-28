@@ -604,7 +604,7 @@ async def test_graceful_shutdown_finishes_inflight(q):
     t.cancel()
 
 
-async def test_zombie_worker_recovered_and_completed_once(q):
+async def test_zombie_worker_recovered_and_completed_once(q, run_until):
     """End to end: a hung worker's job is recovered and finished by another,
     and the zombie's late finish is rejected - exactly one completion."""
     await q.add("job", {"v": 1})
@@ -640,17 +640,20 @@ async def test_zombie_worker_recovered_and_completed_once(q):
     healthy.on("completed", lambda j, r: completed.append(j.id))
     zombie.on("lock-lost", lambda jid: lost.append(jid))
 
+    async def zombie_holds_it() -> bool:
+        return await q.redis.llen(q.keys.active) == 1
+
     zt = asyncio.create_task(zombie.run())
-    await asyncio.sleep(0.4)  # zombie grabs the job, then "hangs"
+    assert await run_until(zombie_holds_it)  # zombie grabs the job, then "hangs"
     ht = asyncio.create_task(healthy.run())
-    await asyncio.sleep(2.0)  # healthy recovers + completes it
+    assert await run_until(lambda: completed, timeout=10), "healthy never recovered the job"
 
     assert seen.count("B") == 1
-    assert completed == [next(iter(completed), None)] and len(completed) == 1
+    assert len(completed) == 1
     assert await q.redis.zcard(q.keys.completed) == 1
 
-    await asyncio.sleep(1.5)  # zombie wakes (~3.4s), tries to commit
-    assert lost  # its finish was rejected by the token guard
+    # the zombie wakes (~3s in) and tries to commit
+    assert await run_until(lambda: lost, timeout=10), "the zombie's late finish was not rejected"
     assert await q.redis.zcard(q.keys.completed) == 1  # still exactly one
 
     await zombie.stop()
