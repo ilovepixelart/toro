@@ -201,3 +201,60 @@ async def test_empty_state_is_zero_roots(q):
 async def test_unknown_state_raises(q):
     with pytest.raises(ValueError, match="unknown state"):
         await q.get_jobs_roots("nope", 0, 10)
+
+
+async def _page(q: Queue, start: int, end: int, *, chunk: int, deep: int) -> tuple[int, list[str]]:
+    """LIST_ROOTS on the completed set, newest first, with the walk's knobs exposed."""
+    total, ids = await q._list_roots(
+        keys=[q.keys.completed, q.keys.children, q.keys.roots_scratch],
+        args=[start, end, 1, chunk, deep],
+    )
+    return int(total), [i.decode() if isinstance(i, bytes) else i for i in ids]
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 500])
+@pytest.mark.parametrize("deep", [0, 10_000], ids=["diff", "walk"])
+async def test_a_page_of_roots_is_the_same_by_walk_and_by_diff(q, chunk, deep):
+    """With flows in the queue the roots are found by walking the state (or the
+    children index, whichever is smaller) in chunks; a page starting past `deep` is
+    diffed instead. Every chunk size and both paths must agree with the plain listing.
+    """
+    roots = await _seed_completed(q, 7, prefix="r")  # r0 oldest .. r6 newest
+    await _seed_completed(q, 12, parent="p", prefix="k")  # more children than roots
+    newest_first = list(reversed(roots))
+
+    assert await _page(q, 0, 2, chunk=chunk, deep=deep) == (7, newest_first[:3])
+    assert await _page(q, 3, -1, chunk=chunk, deep=deep) == (7, newest_first[3:])
+    assert await _page(q, -2, -1, chunk=chunk, deep=deep) == (7, newest_first[-2:])
+    assert await _page(q, 0, -2, chunk=chunk, deep=deep) == (7, newest_first[:-1])
+    assert await _page(q, 5, 2, chunk=chunk, deep=deep) == (7, [])
+    assert await _page(q, 9, 12, chunk=chunk, deep=deep) == (7, [])
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 500])
+async def test_roots_are_counted_by_the_smaller_side(q, chunk):
+    """Fewer children than roots walks the index; more walks the state. Both count."""
+    await _seed_completed(q, 12, prefix="r")
+    await _seed_completed(q, 3, parent="p", prefix="k")
+    fewer_children = await q._roots_counts_script(keys=_count_keys(q), args=[chunk])
+    await _seed_completed(q, 20, parent="p", prefix="m")
+    more_children = await q._roots_counts_script(keys=_count_keys(q), args=[chunk])
+
+    assert int(fewer_children[2]) == 12  # completed is the third count
+    assert int(more_children[2]) == 12
+    assert (await q.roots_counts())["completed"] == 12
+
+
+def _count_keys(q: Queue) -> list[str]:
+    k = q.keys
+    return [
+        k.prioritized,
+        k.delayed,
+        k.completed,
+        k.failed,
+        k.waiting_children,
+        k.active,
+        k.held,
+        k.children,
+        k.cancelled,
+    ]
