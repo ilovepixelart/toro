@@ -322,13 +322,24 @@ class Worker:
         if self.blocked_warning > 0:
             bg.append(asyncio.create_task(self._watchdog_loop()))
         self._tasks = [*self._process_tasks, *bg]
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             # return_exceptions: one freak task failure must not crash run() and
             # take every other slot down with it (each loop also guards itself).
-            results = await asyncio.gather(*self._tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, Exception):
-                    logger.error("worker task died: %r", res)
+            # Shielded so a cancellation of run() itself lands here first.
+            results = await asyncio.shield(asyncio.gather(*self._tasks, return_exceptions=True))
+        except asyncio.CancelledError:
+            # run() cancelled outright (a framework cancelling its tasks, Ctrl-C under
+            # asyncio.run): end the loops as stop() does without the grace period, and
+            # lower the flag first, so a slot can tell this from a job it was asked to
+            # cancel where the task's own cancellation count is not there to tell it.
+            self._running = False
+            for t in self._tasks:
+                t.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            return
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error("worker task died: %r", res)
 
     async def stop(self, grace_period: float | None = None) -> None:
         """Graceful shutdown: stop fetching new jobs, let in-flight jobs finish
@@ -665,7 +676,7 @@ class Worker:
             # and carries on through a shutdown. Cancelling the awaiting task cancels
             # the awaited one too, so the inner task cannot tell them apart; the
             # outer task's own pending-cancellation count can (3.11+, with the
-            # shutdown flag as the fallback).
+            # shutdown flag as the fallback: run() clears it before cancelling us).
             outer = asyncio.current_task()
             asked = getattr(outer, "cancelling", None)
             stopping = asked() > 0 if asked is not None else not self._running
