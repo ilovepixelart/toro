@@ -295,6 +295,7 @@ class Worker:
         # must not run a claim loop against a model it cannot read.
         await stamp_data_model(self._stamp, self.keys, self.name)
         self._running = True
+        self._state = "running"  # a worker run again after stop() is no longer draining
         self.started_at = _now_ms()
         await self._write_heartbeat()  # register at once so the worker shows up immediately
         # Subscribed BEFORE the first claim: a job this worker is running has to be one

@@ -126,6 +126,8 @@ async def test_a_stopped_worker_can_be_run_again(q, run_until):
     try:
         job = await q.add("again", {})
         assert await run_until(lambda: processed == [job.id], timeout=5)
+        mine = [entry for entry in await q.workers() if entry["id"] == w.token]
+        assert [entry["state"] for entry in mine] == ["running"]  # not still draining
     finally:
         await w.stop()
         await asyncio.wait({second}, timeout=3)
