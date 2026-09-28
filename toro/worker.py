@@ -618,15 +618,21 @@ class Worker:
             outer = asyncio.current_task()
             asked = getattr(outer, "cancelling", None)
             stopping = asked() > 0 if asked is not None else not self._running
-            if stopping or job.id not in self._cancelling:
+            if stopping:
                 raise
+            if job.id not in self._cancelling:
+                # Nobody cancelled this job and the worker is not stopping: the
+                # processor raised it itself (it awaited something that was
+                # cancelled), which is the processor failing like any other error.
+                stray = RuntimeError(
+                    "the processor raised CancelledError; the job was not cancelled"
+                )
+                return await self._processing_failed(job, stray)
             return await self._finish_cancelled(job)
         except Exception as exc:
-            if job.id in self._cancelling:
-                return await self._finish_cancelled(job)
-            await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
-            self._failed += 1
-            return await self._finish_failed(job, exc)
+            if job.id not in self._cancelling:
+                return await self._processing_failed(job, exc)
+            result = None  # a cleanup that raised while cancelled: committed below
         if job.id in self._cancelling:
             return await self._finish_cancelled(job)
         try:
@@ -636,9 +642,7 @@ class Worker:
             # end the job like any other error would. Left to escape the commit, the
             # job stays `active` holding its lock until the stalled sweep re-runs it,
             # burning an attempt on work that fails the same way every time.
-            await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
-            self._failed += 1
-            return await self._finish_failed(job, exc)
+            return await self._processing_failed(job, exc)
         self._processed += 1
         return committed
 
@@ -747,6 +751,14 @@ class Worker:
         job.returnvalue = result
         self._emit("completed", job, result)
         return self._next_from(res)
+
+    async def _processing_failed(
+        self, job: Job, exc: Exception
+    ) -> tuple[str, dict[str, str]] | None:
+        """Record the traceback being handled and fail the job with `exc`."""
+        await self.redis.hset(self.keys.job(job.id), "stacktrace", traceback.format_exc())
+        self._failed += 1
+        return await self._finish_failed(job, exc)
 
     async def _finish_failed(self, job: Job, exc: Exception) -> tuple[str, dict[str, str]] | None:
         res = await self._move_to_failed(
