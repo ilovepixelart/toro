@@ -556,6 +556,10 @@ local function settleChildGone(base, jobId, parentId, onFail, reason, now, reten
     end
     -- already settled (a sibling settled it first, or it was removed): stop
     if redis.call("ZREM", base .. "waiting-children", pid) == 0 then return end
+    -- the child that settled it leaves its barrier. Left there, a retry of the parent
+    -- waited on it forever once retention had removed it (remove_on_fail): the retry
+    -- re-adds only the children that still exist.
+    redis.call("SREM", base .. pid .. ":deps", cid)
     -- read BEFORE recordFinished (retention may DEL the hash)
     local pmeta = redis.call("HMGET", base .. pid, "parentId", "onFail", "name")
     if state == "cancelled" then
@@ -975,7 +979,10 @@ if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
 -- A retry is a decision to run this job again, so a cancellation that was asked for
 -- but never acted on goes with the failure it outlived. Left behind, it would stop
 -- the job at its next claim and leave it unrunnable: retry refuses a cancelled job.
-redis.call("HDEL", KEYS[4], "failedReason", "finishedOn", "cancel", "cancelReason")
+-- It gets a fresh stall budget too: kept, the count that failed it would fail it
+-- again at its next stall. (An automatic retry keeps it, see MOVE_TO_FAILED.)
+redis.call("HDEL", KEYS[4],
+  "failedReason", "finishedOn", "cancel", "cancelReason", "stalledCounter")
 local base = KEYS[6]
 -- A flow that runs again: its finished jobs are live until it settles once more. Only
 -- a ROOT revives the subtree. A descendant retried under a running root finds its flow

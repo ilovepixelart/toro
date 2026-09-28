@@ -90,7 +90,8 @@ Two different counters bound two different failure modes:
   configured) until attempts run out, then the job fails with your exception.
 - `stalledCounter` vs `max_stalled_count` - *the worker failed*: nobody renewed
   the lock. Decided by the sweep; bounds how many times an apparently
-  worker-killing job is allowed to take a worker down with it.
+  worker-killing job is allowed to take a worker down with it. An automatic retry
+  keeps the count; `retry_job` (and `retry_all_failed`, `retry_flow`) starts it over.
 
 ## Knobs
 

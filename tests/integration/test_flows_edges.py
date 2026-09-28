@@ -975,3 +975,29 @@ async def test_a_retried_parent_does_not_wait_on_a_cancelled_child(q, run_worker
         release.set()
 
     assert (await q.get_job(child_id)).state == "cancelled"
+
+
+async def test_retrying_a_parent_whose_failed_child_was_removed_by_retention_runs_it(
+    q, run_worker, run_until
+):
+    """A child with remove_on_fail=True fails its parent and is removed at once. The
+    parent's barrier still named it, so a retried parent waited on a job that no
+    longer exists and never ran; `retry_job` answered True all the same."""
+    ran: list[str] = []
+
+    async def proc(job):
+        ran.append(job.name)
+        if job.name == "part":
+            raise RuntimeError("part failed")
+        return "report done"
+
+    parent = await q.add_flow("report", {}, children=[c("part", {}, remove_on_fail=True)])
+    async with run_worker(q, proc):
+        assert await run_until(_count_is(q, "failed", 1))
+        (child_id,) = (await q.get_job(parent.id)).children_ids
+        assert await q.get_job(child_id) is None  # retention removed the failed child
+
+        assert await q.retry_job(parent.id) is True
+        assert await run_until(_count_is(q, "completed", 1))
+
+    assert (await q.get_job(parent.id)).returnvalue == "report done"
