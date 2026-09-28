@@ -15,7 +15,7 @@ from typing import Any, ParamSpec, TypedDict, TypeVar, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
-from redis.exceptions import WatchError
+from redis.exceptions import ResponseError, WatchError
 
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
@@ -860,8 +860,15 @@ class Queue:
         return out
 
     async def get_job(self, job_id: str) -> Job | None:
-        h = _str_dict(await self.redis.hgetall(self.keys.job(job_id)))
-        if not h:
+        try:
+            h = _str_dict(await self.redis.hgetall(self.keys.job(job_id)))
+        except ResponseError as exc:
+            if "WRONGTYPE" not in str(exc):
+                raise
+            return None  # one of the queue's own keys (`failed`, `active`, ...), not a job
+        # A job's hash is stamped when it is added; a hash without the stamp is one of
+        # the queue's own (a scheduler template, `meta`), not a job.
+        if not h or "timestamp" not in h:
             return None
         return Job.from_hash(job_id, h)
 
@@ -1041,7 +1048,9 @@ class Queue:
         return self._percentiles_from(await self._metric_buckets(minutes), "fh:")
 
     async def latency(self) -> int:
-        """Age (ms) of the next-to-run waiting job - 0 when nothing is waiting.
+        """How long (ms) the next-to-run waiting job has been runnable - 0 when
+        nothing is waiting. A job added with a delay becomes runnable when the delay
+        passes, not when it is added.
 
         The queue-health headline number: depth says how much is queued,
         latency says how far behind the workers actually are.
@@ -1049,10 +1058,11 @@ class Queue:
         head = _str_list(await self.redis.zrange(self.keys.prioritized, 0, 0))
         if not head:
             return 0
-        ts = await self.redis.hget(self.keys.job(head[0]), "timestamp")
+        ts, opts = await self.redis.hmget(self.keys.job(head[0]), "timestamp", "opts")
         if not ts:  # the head job was removed between the two reads
             return 0
-        return max(0, _now_ms() - int(ts))
+        delay = (json.loads(opts).get("delay") or 0) if opts else 0
+        return max(0, _now_ms() - int(ts) - int(delay))
 
     async def workers(self, *, stale_after: int = 30_000) -> list[dict[str, Any]]:
         """Live workers, from the presence records their heartbeats write. An entry
@@ -1149,8 +1159,15 @@ class Queue:
         if state == "active":
             ids = await self.redis.lrange(self.keys.active, start, end)
         elif state in FINISHED_STATES:
-            count = -1 if end < 0 else end - start + 1  # -1: to the end, as ZRANGE reads it
-            ids = await self._newest_finished(self._finished_zset(state), start, count)
+            key = self._finished_zset(state)
+            if start < 0 or end < 0:
+                # a negative index counts from the end of the listing, as ZRANGE reads it
+                total = await self.redis.zcard(key)
+                start = max(0, total + start) if start < 0 else start
+                end = total + end if end < 0 else end
+            if end < start:
+                return []
+            ids = await self._newest_finished(key, start, end - start + 1)
         else:
             ids = await self.redis.zrange(self._state_zset(state), start, end)
         return await self._hydrate_ids(_str_list(ids))
