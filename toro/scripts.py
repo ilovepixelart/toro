@@ -1351,19 +1351,87 @@ return #jobs
 # call, so a single fixed key is safe (scripts never interleave).
 # KEYS[1] state zset  KEYS[2] children zset  KEYS[3] scratch zset
 # ARGV[1] start  ARGV[2] stop (inclusive)  ARGV[3] rev (1 = ZREVRANGE)
-LIST_ROOTS = """
-local total = redis.call("ZDIFFSTORE", KEYS[3], 2, KEYS[1], KEYS[2])
-local ids = {}
-if total > 0 then
-  if ARGV[3] == "1" then
-    ids = redis.call("ZREVRANGE", KEYS[3], ARGV[1], ARGV[2])
-  else
-    ids = redis.call("ZRANGE", KEYS[3], ARGV[1], ARGV[2])
+# The roots scripts read a state set in chunks of this many ids (one ZMSCORE each),
+# and a page starting this deep in the roots diffs the whole state instead.
+ROOTS_CHUNK = 500
+ROOTS_DEEP = 10_000
+
+_ROOTS_LIB = """
+-- A root is a job that is not in the children index. Diffing a whole state set
+-- against the index (ZDIFFSTORE) costs the size of the state on every call, and a
+-- dashboard asks on every refresh: 500k waiting jobs held Redis for 100 ms each
+-- time. Without flows the index is empty and every job is a root. Otherwise the
+-- roots are counted by walking whichever of the state and the index is smaller, in
+-- chunks, asking the other for membership (ZMSCORE, Redis 6.2).
+local function walk(zset, chunk, fn)
+  local total = redis.call("ZCARD", zset)
+  local pos = 0
+  while pos < total do
+    fn(redis.call("ZRANGE", zset, pos, pos + chunk - 1))
+    pos = pos + chunk
   end
-  redis.call("DEL", KEYS[3])
+end
+local function present(zset, ids)
+  local n = 0
+  for _, score in ipairs(redis.call("ZMSCORE", zset, unpack(ids))) do
+    if score then n = n + 1 end
+  end
+  return n
+end
+local function countRoots(state, ch, chunk)
+  local n = redis.call("ZCARD", state)
+  local nChildren = redis.call("ZCARD", ch)
+  if n == 0 or nChildren == 0 then return n end
+  local children = 0
+  if nChildren <= n then
+    walk(ch, chunk, function(ids) children = children + present(state, ids) end)
+  else
+    walk(state, chunk, function(ids) children = children + present(ch, ids) end)
+  end
+  return n - children
+end
+"""
+
+LIST_ROOTS = (
+    _ROOTS_LIB
+    + """
+-- KEYS: state, children index, scratch. ARGV: start, stop (inclusive, negative from
+-- the end), newest first, chunk, deep. The page is walked to in the state's own order,
+-- skipping children; one starting past `deep` roots diffs the whole state instead.
+local state, ch, sc = KEYS[1], KEYS[2], KEYS[3]
+local start, stop = tonumber(ARGV[1]), tonumber(ARGV[2])
+local cmd = ARGV[3] == "1" and "ZREVRANGE" or "ZRANGE"
+local chunk, deep = tonumber(ARGV[4]), tonumber(ARGV[5])
+if redis.call("ZCARD", ch) == 0 then
+  return {redis.call("ZCARD", state), redis.call(cmd, state, start, stop)}
+end
+local total = countRoots(state, ch, chunk)
+if start < 0 then start = math.max(0, total + start) end
+if stop < 0 then stop = total + stop end
+if total == 0 or start > stop or start >= total then return {total, {}} end
+if start >= deep then
+  redis.call("ZDIFFSTORE", sc, 2, state, ch)
+  local ids = redis.call(cmd, sc, start, stop)
+  redis.call("DEL", sc)
+  return {total, ids}
+end
+local ids, seen, pos = {}, 0, 0
+local n = redis.call("ZCARD", state)
+local want = stop - start + 1
+while pos < n and #ids < want do
+  local members = redis.call(cmd, state, pos, pos + chunk - 1)
+  local scores = redis.call("ZMSCORE", ch, unpack(members))
+  for i, jid in ipairs(members) do
+    if not scores[i] then
+      if seen >= start and #ids < want then ids[#ids + 1] = jid end
+      seen = seen + 1
+    end
+  end
+  pos = pos + #members
 end
 return {total, ids}
 """
+)
 
 # Exact roots-only count per state - the root-first counterpart of counts().
 # Each ZSET state is diffed against the children index in turn through one shared
@@ -1372,21 +1440,22 @@ return {total, ids}
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] completed  KEYS[4] failed
 # KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] held
 # KEYS[8] children  KEYS[9] scratch  KEYS[10] cancelled
-ROOTS_COUNTS = """
-local ch = KEYS[8]
-local sc = KEYS[9]
-local function rc(k)
-  local n = redis.call("ZDIFFSTORE", sc, 2, k, ch)
-  redis.call("DEL", sc)
-  return n
-end
+ROOTS_COUNTS = (
+    _ROOTS_LIB
+    + """
+-- KEYS: prioritized, delayed, completed, failed, waiting-children, active (a LIST),
+-- held, children index, cancelled. ARGV: chunk.
+local ch, chunk = KEYS[8], tonumber(ARGV[1])
+local function rc(k) return countRoots(k, ch, chunk) end
 local active = 0
+local flows = redis.call("ZCARD", ch) > 0
 for _, jid in ipairs(redis.call("LRANGE", KEYS[6], 0, -1)) do
-  if redis.call("ZSCORE", ch, jid) == false then active = active + 1 end
+  if not flows or redis.call("ZSCORE", ch, jid) == false then active = active + 1 end
 end
 return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS[7]),
-        rc(KEYS[10]), active}
+        rc(KEYS[9]), active}
 """
+)
 
 
 # The ARGV of the scripts with many parameters, in the order their headers document.

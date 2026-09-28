@@ -1215,9 +1215,10 @@ class Queue:
         the parent's tree - and return (exact total roots, hydrated page).
 
         Roots-only and unbounded: paging deep needs no scan cap. `start`/`end`
-        are inclusive like get_jobs(); `end < 0` means "to the end". The ZSET
-        states diff against the children index in one atomic script (order
-        preserved); `active` is a small LIST, filtered in Python.
+        are inclusive like get_jobs(); `end < 0` means "to the end". One atomic
+        script walks the ZSET state in its order past the children (or diffs it
+        against the children index, for a page deep in); `active` is a small LIST,
+        filtered in Python.
         """
         if state == "active":
             ids = _str_list(await self.redis.lrange(self.keys.active, 0, -1))
@@ -1227,14 +1228,15 @@ class Queue:
         zset, newest = self._roots_zset(state)
         total, ids = await self._list_roots(
             keys=[zset, self.keys.children, self.keys.roots_scratch],
-            args=[start, end, 1 if newest else 0],
+            args=[start, end, 1 if newest else 0, scripts.ROOTS_CHUNK, scripts.ROOTS_DEEP],
         )
         return int(total), await self._hydrate_ids(_str_list(ids))
 
     async def roots_counts(self) -> dict[str, int]:
         """Exact roots-only count per state - the root-first counterpart of
-        counts(). One atomic script diffs each state set against the children
-        index (`active`, a LIST, is counted by membership). `wait` is the
+        counts(). One atomic script counts each state's members outside the children
+        index, walking whichever of the two is smaller (`active`, a LIST, is counted
+        by membership). `wait` is the
         prioritized set; `waiting-children` is the parked flow parents (each a
         root unless itself nested).
         """
@@ -1248,9 +1250,9 @@ class Queue:
                 self.keys.active,
                 self.keys.held,
                 self.keys.children,
-                self.keys.roots_scratch,
                 self.keys.cancelled,
             ],
+            args=[scripts.ROOTS_CHUNK],
         )
         (wait, delayed, completed, failed, waiting_children, held, cancelled, active) = (
             int(x) for x in res
