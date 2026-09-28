@@ -336,7 +336,7 @@ class Worker:
             for t in self._tasks:
                 t.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
-            return
+            raise  # a cancelled run() ends cancelled, as any task does
         for res in results:
             if isinstance(res, Exception):
                 logger.error("worker task died: %r", res)
