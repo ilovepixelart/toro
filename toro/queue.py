@@ -183,6 +183,25 @@ def _percentile(buckets: list[int], q: float) -> int:
 SETTLED = f"({scripts.LIVE_SCORE}"
 
 
+def _interval_ms(every: object) -> int:
+    """Return a scheduler's `every` as the whole milliseconds the worker reads back.
+
+    Stored as given, a float ("60000.0") or a bool ("True") could not be read back by
+    the worker, and the schedule ended at its first run. A whole float came through
+    arithmetic and means the int; a string of digits has always worked and still
+    does. 0 would otherwise surface as a confusing "needs either" error and a negative
+    interval as garbage grid math.
+    """
+    if isinstance(every, str) and every.isdigit():
+        every = int(every)
+    if isinstance(every, float) and every.is_integer():
+        every = int(every)
+    if isinstance(every, bool) or not isinstance(every, int) or every <= 0:
+        msg = f"`every` must be a positive whole number of milliseconds, not {every!r}"
+        raise ValueError(msg)
+    return every
+
+
 class Queue:
     """The producer side: add jobs, schedule them, and inspect queue state."""
 
@@ -697,10 +716,8 @@ class Queue:
             )
         if (every is None) == (cron is None):
             raise ValueError("pass exactly one of `every` or `cron`")
-        if every is not None and int(every) <= 0:
-            # 0 would otherwise surface as a confusing "needs either" error and a
-            # negative interval as garbage grid math - fail clearly at the source.
-            raise ValueError("`every` must be a positive number of milliseconds")
+        if every is not None:
+            every = _interval_ms(every)
         if cron is not None and not valid_cron(cron):
             # fail at enqueue, not later inside a worker's _schedule_next (a silent
             # scheduler that errors on the backend)

@@ -226,3 +226,37 @@ async def test_a_retried_occurrence_does_not_start_a_second_chain(
         assert await run_until(lambda: len(attempts) == 2)
 
     assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+
+
+async def test_a_whole_float_interval_runs_like_the_int(q, run_worker, run_until):
+    """An interval that came through arithmetic (`30 * 60 * 1000 / 2`) is a float with
+    nothing after the point. Stored as "60000.0", the worker could not read it back:
+    the first pickup failed before the processor ran, the chain ended, and
+    schedulers() raised for the whole queue."""
+    await q.add_scheduler("tick", every=60_000.0)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert (await q.schedulers())[0]["every"] == 60_000
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+
+
+@pytest.mark.parametrize("every", [1000.5, True], ids=["fractional", "bool"])
+async def test_an_interval_that_is_not_whole_is_refused(q, every):
+    """A fraction of a millisecond or a bool is no interval; accepted, it killed the
+    schedule at its first run. It is refused where it is given, and nothing is kept."""
+    with pytest.raises(ValueError, match="positive whole number"):
+        await q.add_scheduler("tick", every=every)
+    assert await q.schedulers() == []
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == []
+
+
+async def test_a_numeric_string_interval_still_works(q):
+    """A string of digits has always worked end to end, so it keeps working."""
+    await q.add_scheduler("tick", every="60000")
+    assert (await q.schedulers())[0]["every"] == 60_000
