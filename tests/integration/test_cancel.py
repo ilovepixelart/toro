@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from toro import FlowChild, JobCancelledError, Queue, Worker, scripts
+from toro import FlowChild, JobCancelledError, JobFailedError, Queue, Worker, scripts
 from toro.job import Job
 
 PREFIX = "torotest"
@@ -900,7 +900,7 @@ async def test_a_worker_shutting_down_does_not_swallow_its_own_cancellation(q):
     # the processor is still running: nothing has cancelled IT
     inner: asyncio.Task = asyncio.create_task(asyncio.sleep(60))
     worker._processors[job.id] = (inner, "")
-    worker._cancelling.add(job.id)
+    worker._cancelling[job.id] = inner
 
     settling = asyncio.create_task(worker._outcome(job, inner))
     await asyncio.sleep(0.1)
@@ -967,3 +967,101 @@ async def test_a_cancellation_nobody_asked_for_fails_the_job_and_keeps_the_slot(
 
 async def _completed(q: Queue, job_id: str) -> bool:
     return await _state(q, job_id) == "completed"
+
+
+async def test_a_re_added_id_is_not_cancelled_by_its_previous_runs_request(
+    q, run_worker, run_until
+):
+    """remove_job() cancels the run in flight. The same id added again while that run
+    is still unwinding runs in the worker's other slot, and the request meant for the
+    first run committed it cancelled: its result was dropped, and a cancelled event
+    fired for a job nobody cancelled."""
+    started = asyncio.Event()
+    unwinding = asyncio.Event()
+
+    async def proc(job):
+        if not started.is_set():
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await unwinding.wait()  # the first run's cleanup outlives the second run
+                raise
+        return "second"
+
+    async with run_worker(q, proc, concurrency=2, stalled_interval=0) as w:
+        await q.add("order", {}, job_id="order-1")
+        await asyncio.wait_for(started.wait(), 5)
+        assert await q.remove_job("order-1")
+        job = await q.add("order", {}, job_id="order-1")
+        try:
+            assert await q.result(job.id, timeout=5) == "second"
+        finally:
+            unwinding.set()
+        assert await run_until(lambda: not w._cancelling)  # the first run's own entry
+
+
+async def test_a_re_added_id_can_still_be_cancelled_while_its_previous_run_unwinds(
+    q, run_worker, run_until
+):
+    """The request for the first run must not stand in for the second: cancel_job() on
+    the re-added id was taken as already asked while the first run was unwinding, and
+    the second run carried on."""
+    runs = 0
+    unwinding = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def proc(job):
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await unwinding.wait()  # the first run's cleanup outlives the request
+                raise
+        second_started.set()
+        await asyncio.sleep(30)
+
+    async with run_worker(q, proc, concurrency=2, stalled_interval=0):
+        await q.add("order", {}, job_id="order-1")
+        assert await run_until(lambda: runs == 1)
+        assert await q.remove_job("order-1")
+        job = await q.add("order", {}, job_id="order-1")
+        await asyncio.wait_for(second_started.wait(), 5)
+        try:
+            await q.cancel_job("order-1")
+            with pytest.raises(JobCancelledError):
+                await q.result(job.id, timeout=5)
+        finally:
+            unwinding.set()
+
+
+async def test_a_re_added_ids_own_cancelled_error_is_still_its_failure(q, run_worker, run_until):
+    """A processor that raises CancelledError itself fails the job. While the first run
+    of the id unwound from a real request, the second run's stray CancelledError was
+    taken for that request and committed cancelled."""
+    runs = 0
+    unwinding = asyncio.Event()
+
+    async def proc(job):
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await unwinding.wait()  # the first run's cleanup outlives the second run
+                raise
+        raise asyncio.CancelledError  # the second run's own doing
+
+    async with run_worker(q, proc, concurrency=2, stalled_interval=0):
+        await q.add("order", {}, job_id="order-1")
+        assert await run_until(lambda: runs == 1)
+        assert await q.remove_job("order-1")
+        job = await q.add("order", {}, job_id="order-1", attempts=1)
+        try:
+            with pytest.raises(JobFailedError, match="raised CancelledError"):
+                await q.result(job.id, timeout=5)
+        finally:
+            unwinding.set()
