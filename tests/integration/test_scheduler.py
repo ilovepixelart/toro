@@ -140,3 +140,39 @@ async def test_a_schedule_takes_exactly_one_cadence(q, cadence):
     with pytest.raises(ValueError, match="exactly one of `every` or `cron`"):
         await q.add_scheduler("nightly", **cadence)
     assert await q.schedulers() == []
+
+
+async def test_an_occurrence_run_early_still_schedules_the_next(q, run_worker, run_until):
+    """Promoting an occurrence runs it before its slot. The next one follows its slot,
+    not the clock: counted from `now` it lands on the running occurrence's own id,
+    nothing new is enqueued, and the schedule never runs again."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert runs == [first]
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+    assert (await q.schedulers())[0]["next"] == slot + 60_000
+
+
+async def test_an_occurrence_run_late_skips_to_the_next_slot_after_now(
+    q, run_worker, run_until, monkeypatch
+):
+    """A late pickup (workers were down) schedules the next slot after the clock, so
+    the missed slots are skipped rather than fired one after another as a backlog."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    monkeypatch.setattr("toro.worker._now_ms", lambda: slot + 150_000)  # 2.5 slots late
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 180_000}"]
