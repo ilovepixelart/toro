@@ -796,24 +796,17 @@ if meta[4] and not meta[3] then
 end
 -- a flow child settles into its parent here, atomically with its own commit
 if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2], now) end
--- The result rides along with the event so a waiter needs no second round trip, and
--- it is decoded and re-encoded as part of ONE cjson document, so a return value full
--- of JSON metacharacters cannot corrupt the message.
---
--- Only while it is small. Decoding and re-encoding is O(size) on the single Redis
--- thread, inside a script that has already written: a large enough value crosses the
--- busy threshold, every other client on the server is refused, and SCRIPT KILL
--- answers UNKILLABLE. A value too deep for cjson fails the encode instead, and the
--- publish never happens at all. Either way the event goes without it and the waiter
--- reads the value from the hash, where this script has already put it.
-local completedMsg = {jobId = ARGV[1], event = "completed"}
+-- A small result rides along with the event so a waiter needs no second round trip,
+-- as a string holding the JSON text stored above (`resultJson`). Only escaped, never
+-- parsed: decoding and re-encoding it rounded numbers to 14 digits, turned [] into
+-- {}, and cost O(size) of parsing on the Redis thread. A large result is announced
+-- without it, and the waiter reads it from the hash.
 if ARGV[11] == "1" then
-  local okr, resultDoc = pcall(cjson.decode, ARGV[2])
-  if okr then completedMsg.result = resultDoc end
+  redis.call("PUBLISH", KEYS[10],
+    cjson.encode({jobId = ARGV[1], event = "completed", resultJson = ARGV[2]}))
+else
+  redis.call("PUBLISH", KEYS[10], cjson.encode({jobId = ARGV[1], event = "completed"}))
 end
-local oke, encoded = pcall(cjson.encode, completedMsg)
-if not oke then encoded = cjson.encode({jobId = ARGV[1], event = "completed"}) end
-redis.call("PUBLISH", KEYS[10], encoded)
 if ARGV[5] == "1" then
   local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                           ARGV[4], tonumber(ARGV[6]), ARGV[3],
