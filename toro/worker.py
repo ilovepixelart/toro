@@ -798,22 +798,24 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=scripts.failed_args(
-                job_id=job.id,
-                reason=str(exc),
-                now=_now_ms(),
-                attempts_made=job.attempts_made,
-                max_attempts=job.opts.attempts,
-                backoff=self._backoff_delay(job),
-                token=self.token,
-                fetch=self._fetch_flag(),
-                lock_duration=self.lock_duration,
-                rl_max=self.rl_max,
-                rl_duration=self.rl_duration,
-                global_concurrency=self.global_concurrency,
-                claim=_claim(job),
-                stacktrace=stacktrace,
-            ),
+            args=[
+                *scripts.failed_args(
+                    job_id=job.id,
+                    reason=str(exc),
+                    now=_now_ms(),
+                    attempts_made=job.attempts_made,
+                    max_attempts=job.opts.attempts,
+                    backoff=self._backoff_delay(job),
+                    token=self.token,
+                    fetch=self._fetch_flag(),
+                    lock_duration=self.lock_duration,
+                    rl_max=self.rl_max,
+                    rl_duration=self.rl_duration,
+                    global_concurrency=self.global_concurrency,
+                    claim=_claim(job),
+                ),
+                stacktrace,  # ARGV[15], written only past the guards
+            ],
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             await self._finish_lost(job.id)

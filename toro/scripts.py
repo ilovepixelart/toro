@@ -1457,9 +1457,10 @@ def failed_args(
     rl_duration: int,
     global_concurrency: int,
     claim: str = "",
-    stacktrace: str = "",
 ) -> list[str | int]:
-    """ARGV for MOVE_TO_FAILED (`claim`: the processedOn this run was claimed at)."""
+    """ARGV for MOVE_TO_FAILED, up to ARGV[14] (`claim`: the processedOn this run was
+    claimed at). The worker appends ARGV[15], the traceback.
+    """
     return [
         job_id,
         reason,
@@ -1475,5 +1476,4 @@ def failed_args(
         METRICS_RETENTION_MS,
         global_concurrency,
         claim,
-        stacktrace,
     ]
