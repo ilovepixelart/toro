@@ -7,6 +7,7 @@ import asyncio
 import json
 
 import pytest
+from redis.asyncio.client import Pipeline
 
 from toro import Queue
 
@@ -112,3 +113,30 @@ async def test_changing_a_schedule_leaves_a_running_occurrence_alone(q):
     await q.add_scheduler("nightly", every=37_000)
 
     assert await q.redis.hget(q.keys.job(old_id), "state") == "active"
+
+
+async def test_an_occurrence_claimed_while_it_is_being_dropped_survives(q, monkeypatch):
+    """The state is read, then removed in a transaction watching the job's hash. A
+    worker claiming the occurrence between those two steps writes that hash, so the
+    removal aborts and the claimed run is left alone, with no error for the caller."""
+    await q.add_scheduler("nightly", every=60_000)
+    (old_id,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    read_state = Pipeline.hget
+
+    async def claim_after_the_read(pipe, *args):
+        state = await read_state(pipe, *args)
+        await q.redis.hset(q.keys.job(old_id), "state", "active")  # the worker's claim
+        return state
+
+    monkeypatch.setattr(Pipeline, "hget", claim_after_the_read)
+
+    await q.add_scheduler("nightly", every=37_000)
+
+    assert await q.redis.hget(q.keys.job(old_id), "state") == "active"
+
+
+@pytest.mark.parametrize("cadence", [{}, {"every": 60_000, "cron": "0 3 * * *"}])
+async def test_a_schedule_takes_exactly_one_cadence(q, cadence):
+    with pytest.raises(ValueError, match="exactly one of `every` or `cron`"):
+        await q.add_scheduler("nightly", **cadence)
+    assert await q.schedulers() == []

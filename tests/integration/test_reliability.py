@@ -717,3 +717,32 @@ async def test_a_job_that_finishes_between_sweep_passes_is_not_recovered(q, run_
     counts = await q.counts()
     assert (counts["completed"], counts["wait"]) == (1, 0), counts
     assert runs == [job.id]
+
+
+async def test_a_renewal_that_finds_another_workers_lock_reports_lock_lost(
+    q, run_worker, run_until
+):
+    """A takeover (another worker re-claimed the job after a stall) leaves the hash
+    and replaces the lock token. The renewal emits `lock-lost` once and stops
+    renewing, and the processor is not cancelled: it runs on, and only its finish is
+    dropped."""
+    release = asyncio.Event()
+    ran_to_the_end: list[str] = []
+
+    async def proc(job):
+        await release.wait()
+        ran_to_the_end.append(job.id)
+
+    job = await q.add("long", {})
+    lost: list[str] = []
+    async with run_worker(q, proc, lock_duration=30_000, lock_renew_time=50) as worker:
+        worker.on("lock-lost", lost.append)
+        assert await run_until(lambda: q.redis.exists(q.keys.lock(job.id)))
+        await q.redis.set(q.keys.lock(job.id), "another-worker", px=30_000)
+
+        assert await run_until(lambda: lost, timeout=2)
+        await asyncio.sleep(0.2)  # four more renew intervals: none may renew or re-emit
+        assert lost == [job.id]
+        assert await q.redis.get(q.keys.lock(job.id)) == "another-worker"
+        release.set()
+        assert await run_until(lambda: ran_to_the_end, timeout=2)

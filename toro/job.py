@@ -81,8 +81,9 @@ def _whole(value: object, what: str, *, minimum: int = 0) -> int:
     """
     if isinstance(value, bool):  # an int subclass: `attempts=True` would mean 1
         msg = f"{what} must be a whole number >= {minimum}, not {value!r}"
-        raise ValueError(msg)  # noqa: TRY004 - an option's shape is a value error here,
-        # as it is for every other option: a caller catching ValueError catches them all
+        # An option's shape is a value error here, as it is for every other option: a
+        # caller catching ValueError catches them all.
+        raise ValueError(msg)  # noqa: TRY004
     # A float that IS whole is a config value that came through arithmetic
     # (`86_400 / 2`), and refusing it teaches nothing. A fractional one is a mistake
     # the scripts cannot carry out: a rank is an integer.

@@ -58,3 +58,11 @@ async def test_progress_and_log_require_a_worker_context():
         await job.update_progress(50)
     with pytest.raises(RuntimeError):
         await job.log("nope")
+
+
+@pytest.mark.parametrize("helper", ["children_results", "failed_children", "cancelled_children"])
+async def test_the_children_helpers_require_a_worker_context(helper):
+    # They read the parent's result hashes through the processor's connection.
+    job = Job(id="1", name="x", data={})
+    with pytest.raises(RuntimeError, match=f"{helper}\\(\\) is only available"):
+        await getattr(job, helper)()
