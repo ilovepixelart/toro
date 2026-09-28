@@ -639,16 +639,28 @@ class Queue:
             if fut.done():
                 continue
             if event == "completed":
-                if "result" in data:
-                    fut.set_result(data["result"])
-                else:
-                    # too large or too deep to travel in the event: read it back from
-                    # the hash, where the finish script already wrote it
-                    self._read_back(job_id, fut)
+                self._complete(job_id, fut, data)
             elif event == "cancelled":
                 fut.set_exception(JobCancelledError(job_id, data.get("reason")))
             else:
                 fut.set_exception(JobFailedError(data.get("reason")))
+
+    def _complete(self, job_id: str, fut: asyncio.Future[Any], event: dict[str, Any]) -> None:
+        """Resolve a waiter from a completion event.
+
+        From the result's JSON text when it travelled with it, the decoded `result` a
+        worker before 1.0.3 sends, or else a read of the job's hash, where the finish
+        script already wrote it.
+        """
+        if "resultJson" in event:
+            try:
+                fut.set_result(json.loads(event["resultJson"]))
+            except (ValueError, RecursionError):
+                self._read_back(job_id, fut)
+        elif "result" in event:
+            fut.set_result(event["result"])
+        else:
+            self._read_back(job_id, fut)
 
     def _read_back(self, job_id: str, fut: asyncio.Future[Any]) -> None:
         """Resolve a waiter from the job's stored return value.

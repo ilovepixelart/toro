@@ -160,3 +160,29 @@ async def test_promote_drains_more_than_one_full_batch(q, run_worker, run_until)
     counts = await q.counts()
     assert counts["delayed"] == 0
     assert counts["completed"] == n
+
+
+async def test_a_worker_before_1_0_3_still_resolves_its_waiters(q, run_until):
+    """During a rolling upgrade an older worker still sends the decoded `result`, not
+    the stored text: the waiter takes it as it comes."""
+    waiting = asyncio.create_task(q.result("old-worker", timeout=5))
+    assert await run_until(lambda: _waiting(q, "old-worker"))
+
+    await _publish(q, "old-worker", result={"n": 7})
+
+    assert await waiting == {"n": 7}
+
+
+async def test_result_text_that_does_not_parse_falls_back_to_the_hash(q, run_until):
+    """The event is only the fast path: when its copy of the result cannot be read,
+    the waiter reads the value from the job's hash, where the finish wrote it."""
+    await q.redis.hset(
+        q.keys.job("unreadable"),
+        mapping={"id": "unreadable", "state": "active", "returnvalue": json.dumps([1, 2])},
+    )
+    waiting = asyncio.create_task(q.result("unreadable", timeout=5))
+    assert await run_until(lambda: _waiting(q, "unreadable"))
+
+    await _publish(q, "unreadable", resultJson="{not json")
+
+    assert await waiting == [1, 2]

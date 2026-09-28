@@ -13,7 +13,10 @@ completed with nobody told.
 
 import asyncio
 import contextlib
+import json
 import sys
+
+import pytest
 
 BIG = 2 * 1024 * 1024  # bigger than anything that belongs in an event
 PREFIX = "torotest"
@@ -107,4 +110,55 @@ async def test_a_small_result_still_travels_with_its_event(q, run_worker, run_un
         with contextlib.suppress(asyncio.CancelledError):
             await listening
 
-    assert any('"result"' in m for m in seen), "the value did not travel with the event"
+    assert any('"resultJson"' in m for m in seen), "the value did not travel with the event"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [12345678901234567, 0.1 + 0.2, {"items": []}, {"a": [[], {}], "b": 2**63}],
+    ids=["17-digit-int", "float", "empty-list", "nested-empties"],
+)
+async def test_a_result_reaches_its_waiter_exactly_as_returned(q, run_worker, value):
+    """The waiter gets what the processor returned, the same value `get_job` reads
+    back. Decoded and re-encoded by cjson on the way into the event, a 17-digit int
+    came back as a float at 14 significant digits and an empty list as an object."""
+    listening, seen = await _events(q)
+
+    async def proc(job):
+        return value
+
+    try:
+        async with run_worker(q, proc):
+            job = await q.add("exact", {})
+            got = await q.result(job.id, timeout=20)
+    finally:
+        listening.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listening
+
+    assert got == value
+    assert type(got) is type(value)
+    assert (await q.get_job(job.id)).returnvalue == value
+    assert any('"completed"' in m and job.id in m for m in seen)
+
+
+async def test_the_event_carries_the_stored_text_byte_for_byte(q, run_worker):
+    """The event's copy of the result is the text the hash stores, escaped into a
+    string and never parsed on the way, so no reader sees a re-encoded value."""
+    listening, seen = await _events(q)
+
+    async def proc(job):
+        return {"id": 12345678901234567, "items": [], "x": 0.1 + 0.2}
+
+    try:
+        async with run_worker(q, proc):
+            job = await q.add("exact", {})
+            await q.result(job.id, timeout=20)
+    finally:
+        listening.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listening
+
+    stored = await q.redis.hget(q.keys.job(job.id), "returnvalue")
+    events = [json.loads(m) for m in seen if '"completed"' in m]
+    assert [e["resultJson"] for e in events if e["jobId"] == job.id] == [stored]
