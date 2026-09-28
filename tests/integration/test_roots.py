@@ -175,6 +175,15 @@ async def test_active_roots_exclude_running_children(q):
     assert total == 1 and [j.id for j in jobs] == ["r1"]
 
 
+async def test_a_running_plain_job_is_an_active_root(q):
+    """An active job outside the children index is a root and counts; the count
+    must not come from the children it excludes."""
+    await q.redis.hset(q.keys.job("r1"), mapping={"id": "r1", "name": "root", "state": "active"})
+    await q.redis.rpush(q.keys.active, "r1")
+
+    assert (await q.roots_counts())["active"] == 1
+
+
 def _state_is(q: Queue, job_id: str, state: str):
     async def check():
         job = await q.get_job(job_id)
