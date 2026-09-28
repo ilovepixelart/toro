@@ -178,7 +178,12 @@ async def test_result_text_that_does_not_parse_falls_back_to_the_hash(q, run_unt
     the waiter reads the value from the job's hash, where the finish wrote it."""
     await q.redis.hset(
         q.keys.job("unreadable"),
-        mapping={"id": "unreadable", "state": "active", "returnvalue": json.dumps([1, 2])},
+        mapping={
+            "id": "unreadable",
+            "state": "active",
+            "timestamp": int(time.time() * 1000),  # every job hash carries its add time
+            "returnvalue": json.dumps([1, 2]),
+        },
     )
     waiting = asyncio.create_task(q.result("unreadable", timeout=5))
     assert await run_until(lambda: _waiting(q, "unreadable"))
