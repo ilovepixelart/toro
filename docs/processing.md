@@ -207,6 +207,8 @@ N connections, an API that allows N requests in flight. A rate limit bounds job
 | `stalled` | `job_id` | The sweep recovered one of this queue's jobs. |
 | `lock-lost` | `job_id` | This worker's lock was taken over; its result was dropped. |
 | `rate-limited` | `retry_ms` | A claim hit the rate limit. |
+| `cancelled` | `job` | A job this worker was running stopped after `cancel_job()` and committed as cancelled. |
+| `blocked` | `lag, jobs` | The event loop was blocked past `blocked_warning`: `lag` in seconds, `jobs` the ids in flight. See [When the loop is blocked](#when-the-loop-is-blocked). |
 
 These are this worker's own hooks. Cross-process consumers (dashboards,
 `result()`) use the pub/sub events channel instead - see [Concepts](concepts.md).

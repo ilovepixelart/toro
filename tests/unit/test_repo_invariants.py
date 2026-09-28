@@ -124,3 +124,18 @@ def test_every_routine_the_architecture_doc_names_exists():
     defined = set(re.findall(r"local function (\w+)", scripts._LIB))
     stale = [name for name in named if name not in defined]
     assert not stale, f"routines named in docs/architecture.md that scripts.py lacks: {stale}"
+
+
+def test_every_worker_event_is_in_the_lifecycle_table():
+    """`worker.on()` accepts any name, so an event missing from the table is one a
+    reader cannot know to subscribe to. The table had lost two."""
+    source = (ROOT / "toro" / "worker.py").read_text()
+    # the event argument of every _emit call, including `"a" if cond else "b"`
+    first_args = re.findall(r"_emit\(([^,]+),", source)
+    emitted = {name for arg in first_args for name in re.findall(r'"([a-z-]+)"', arg)}
+    assert emitted, "found no emitted events: the check would pass on anything"
+    section = (
+        (DOCS / "processing.md").read_text().split("## Lifecycle events", 1)[1].split("\n## ", 1)[0]
+    )
+    rows = set(re.findall(r"^\| `([a-z-]+)` \|", section, re.MULTILINE))
+    assert emitted <= rows, f"events with no row in processing.md: {sorted(emitted - rows)}"

@@ -103,9 +103,8 @@ events channel:
   subscribes to refresh live as state changes.
 
 `Worker.on(event, fn)` lets a worker react to its own lifecycle with in-process
-callbacks (`completed`, `failed`, `cancelled`, `retrying`, `stalled`, `lock-lost`,
-`rate-limited`) - separate from the pub/sub channel above. See
-[Processing jobs](processing.md).
+callbacks, separate from the pub/sub channel above. The events and their arguments
+are listed in [Processing jobs](processing.md#lifecycle-events).
 
 ## Reliability in one sentence
 
