@@ -154,6 +154,10 @@ def _claim(job: Job) -> str:
 class Worker:
     """The consumer side: claims jobs, runs the processor, and recovers stalls."""
 
+    # Set by stop(), cleared when run() returns: a stop() that lands before run() is
+    # past its startup round trips finds nothing to cancel, so run() has to look.
+    _stop_requested: bool = False
+
     def __init__(
         self,
         name: str,
@@ -281,15 +285,27 @@ class Worker:
 
     async def run(self) -> None:
         """Start processing until stop() is called. Awaitable forever."""
+        try:
+            await self._run()
+        finally:
+            self._stop_requested = False  # a stopped worker may be run again
+
+    async def _run(self) -> None:
         # Before anything is claimed: a worker writes more than a producer does, and
         # must not run a claim loop against a model it cannot read.
         await stamp_data_model(self._stamp, self.keys, self.name)
         self._running = True
+        self._state = "running"  # a worker run again after stop() is no longer draining
         self.started_at = _now_ms()
         await self._write_heartbeat()  # register at once so the worker shows up immediately
         # Subscribed BEFORE the first claim: a job this worker is running has to be one
         # it can hear a cancellation for, or the request waits out a lock renewal.
         cancels = await self._subscribe_cancels()
+        if self._stop_requested:
+            # stop() landed during the round trips above, with nothing yet to cancel
+            # and after its own cleanup: undo what startup redid, and go no further.
+            await self._abandon_startup()
+            return
         self._process_tasks = [
             asyncio.create_task(self._process_loop()) for _ in range(self.concurrency)
         ]
@@ -317,6 +333,7 @@ class Worker:
         (up to `grace_period` seconds), then cancel the rest and disconnect.
         """
         grace = self.grace_period if grace_period is None else grace_period
+        self._stop_requested = True
         self._running = False
         # Flip to "stopping" (shown as "draining" in the dashboard) and flush it now, so
         # this worker reads as shutting down in real time (a later vanish = graceful, not crash).
@@ -424,6 +441,18 @@ class Worker:
         pipe.pexpire(self.keys.worker(self.token), PRESENCE_TTL_MS)
         pipe.zremrangebyscore(self.keys.workers, "-inf", now - PRESENCE_TTL_MS)
         await pipe.execute()
+
+    async def _abandon_startup(self) -> None:
+        """Take back what run() set up after stop() had already cleaned up: the cancel
+        subscription and the presence record the first heartbeat wrote (stop() already
+        recorded the departure), then close the connections those reopened.
+        """
+        self._running = False
+        await self._close_cancel_pubsub()
+        with contextlib.suppress(Exception):
+            await self.redis.zrem(self.keys.workers, self.token)
+            await self.redis.delete(self.keys.worker(self.token))
+        await self.redis.aclose(close_connection_pool=self._owns_connection)
 
     async def _deregister(self) -> None:
         await self._record_departure("stopped")  # graceful shutdown
