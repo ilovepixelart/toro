@@ -1040,3 +1040,48 @@ async def test_renewals_that_keep_erroring_give_up_when_the_lease_runs_out(
         release.set()
 
     assert lost[0] >= 0.5, f"gave up after {lost[0]:.2f}s, inside the 0.6s lease"
+
+
+async def test_a_run_that_lost_its_lock_cannot_commit_over_its_own_workers_rerun(
+    q, run_worker, run_until
+):
+    """A lock is a claim, not a worker. When run 1 of a job loses its lock and the
+    stalled sweep hands the job to another slot of the SAME worker, run 1's late
+    finish must be refused like any stale run's: committed, it marked the job done
+    while run 2 was still executing it."""
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    started: list[int] = []
+    lost: list[str] = []
+
+    async def proc(job):
+        started.append(job.attempts_made)
+        if job.attempts_made == 1:
+            await release_first.wait()
+        else:
+            await release_second.wait()
+        return f"run {job.attempts_made}"
+
+    job = await q.add("x", {})
+    async with run_worker(q, proc, concurrency=2, stalled_interval=0) as worker:
+        worker.on("lock-lost", lost.append)
+        assert await run_until(lambda: started == [1])
+        await q.redis.delete(q.keys.lock(job.id))  # run 1's lock expired
+        await worker.check_stalled(throttle_ms=0)  # mark
+        await worker.check_stalled(throttle_ms=0)  # recover: back to wait
+        assert await run_until(lambda: started == [1, 2])  # the other slot took it
+
+        release_first.set()
+        assert await run_until(lambda: lost == [job.id])
+        assert (await q.get_job(job.id)).state == "active"  # run 2 still owns it
+        # and the worker still tracks run 2: reported by its heartbeat, cancellable
+        assert job.id in worker._current
+        assert job.id in worker._processors
+
+        release_second.set()
+        assert await run_until(lambda: _completed_with(q, job.id, "run 2"))
+
+
+async def _completed_with(q, job_id: str, value: str) -> bool:
+    job = await q.get_job(job_id)
+    return job is not None and job.state == "completed" and job.returnvalue == value

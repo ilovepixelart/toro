@@ -20,7 +20,7 @@ def _inline_flag(returnvalue: str) -> str:
         rl_duration=0,
         global_concurrency=0,
     )
-    return str(args[-1])
+    return str(args[10])  # ARGV[11], the inline flag
 
 
 @pytest.mark.parametrize(

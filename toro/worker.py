@@ -146,6 +146,11 @@ def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
     return int(delay)
 
 
+def _claim(job: Job) -> str:
+    """Return the processedOn a run was claimed at, which its finish must still find."""
+    return "" if job.processed_on is None else str(job.processed_on)
+
+
 class Worker:
     """The consumer side: claims jobs, runs the processor, and recovers stalls."""
 
@@ -586,9 +591,12 @@ class Worker:
         try:
             nxt = await self._outcome(job, task)
         finally:
-            self._current.discard(job_id)
-            self._processors.pop(job_id, None)
-            self._cancelling.discard(job_id)
+            # Only this run's own entries: another slot may have re-claimed the job
+            # after this run lost its lock, and that run is still going.
+            if self._processors.get(job_id, (None, ""))[0] is task:
+                self._current.discard(job_id)
+                self._processors.pop(job_id)
+                self._cancelling.discard(job_id)
             if renewer is not None:
                 renewer.cancel()
         return nxt
@@ -697,7 +705,7 @@ class Worker:
                 self.keys.base,
                 self.keys.events,
             ],
-            args=[job.id, _now_ms(), self.token, scripts.METRICS_RETENTION_MS],
+            args=[job.id, _now_ms(), self.token, scripts.METRICS_RETENTION_MS, _claim(job)],
         )
         if int(res) < 0:
             # its lock is gone, so nothing was committed: a removal took the job, or
@@ -745,6 +753,7 @@ class Worker:
                 rl_max=self.rl_max,
                 rl_duration=self.rl_duration,
                 global_concurrency=self.global_concurrency,
+                claim=_claim(job),
             ),
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
@@ -792,6 +801,7 @@ class Worker:
                 rl_max=self.rl_max,
                 rl_duration=self.rl_duration,
                 global_concurrency=self.global_concurrency,
+                claim=_claim(job),
             ),
         )
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
