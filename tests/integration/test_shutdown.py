@@ -132,3 +132,33 @@ async def test_a_stopped_worker_can_be_run_again(q, run_until):
         await w.stop()
         await asyncio.wait({second}, timeout=3)
         second.cancel()
+
+
+async def test_cancelling_run_directly_ends_the_worker(q):
+    """A framework that cancels its tasks on shutdown, or Ctrl-C under asyncio.run(),
+    cancels run() without stop(). The job in flight stays active for the stalled sweep,
+    as one cut off past stop()'s grace period does. On Python 3.10, which cannot tell a
+    task's own cancellation from one it asked for, the worker instead failed the job
+    with a reason of its own and went on claiming, so the cancellation never landed."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(30)
+
+    w = Worker(q.name, proc, prefix=PREFIX, stalled_interval=0, grace_period=0)
+    task = asyncio.create_task(w.run())
+    try:
+        job = await q.add("cut-off", {})
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=3)  # not wait_for: see above
+        assert task in done, "run() carried on after being cancelled"
+        assert (await q.get_job(job.id)).state == "active"  # left to the sweep, not failed
+    finally:
+        # stop() first: it lowers the flag and cancels the loops whatever run() did, so
+        # a run() that absorbed its cancellation can still end, and the wait is bounded.
+        await w.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)

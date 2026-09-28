@@ -275,6 +275,9 @@ async def process(job):
   normally does not complete the job: the worker knows it asked this one to stop, so
   the job still ends `cancelled` and the return value is thrown away. The same holds
   for a cleanup that raises on the way out, which is not a failure to retry.
+- **A `CancelledError` the processor raises itself** (it awaited something that was
+  cancelled from elsewhere) is the processor failing, and the job fails with that
+  reason like any other error.
 - Workers hear a cancellation over a channel of their own and act at once. A worker
   that missed the message finds it at its next lock renewal instead, so the delay is
   bounded by `lock_renew_time`. With `renew_locks=False` there is no renewal, and a
@@ -290,4 +293,7 @@ await worker.stop()        # or stop(grace_period=10)
 period, cancels whatever remains (those jobs' locks expire and the sweep
 recovers them; each recovery counts toward `max_stalled_count`, which is never reset,
 so at the default of 1 a job cut off a second time is failed instead), deregisters presence, and closes the
-connection. Pair `run()`/`stop()` with your framework's startup/shutdown hooks.
+connection. Pair `run()`/`stop()` with your framework's startup/shutdown hooks. A
+`run()` cancelled outright (a framework cancelling its tasks, Ctrl-C under
+`asyncio.run()`) ends the loops at once and leaves the jobs in flight to the stalled
+sweep; `stop()` is what gives them the grace period.
