@@ -139,3 +139,15 @@ def test_every_worker_event_is_in_the_lifecycle_table():
     )
     rows = set(re.findall(r"^\| `([a-z-]+)` \|", section, re.MULTILINE))
     assert emitted <= rows, f"events with no row in processing.md: {sorted(emitted - rows)}"
+
+
+def test_every_redis_key_is_in_the_data_model_doc():
+    """keys.py is where every key name is computed; data-model.md is where a reader
+    looks one up. Two keys had reached the first without the second."""
+    source = (ROOT / "toro" / "keys.py").read_text()
+    suffixes = set(re.findall(r'f"\{self\.base\}([a-z][a-z-]*)', source))
+    suffixes |= {f"<jobId>:{s}" for s in re.findall(r'\{job_id\}:([a-z-]+)"', source)}
+    assert len(suffixes) > 10, f"found only {sorted(suffixes)}: the check would pass on anything"
+    doc = (DOCS / "data-model.md").read_text()
+    missing = sorted(s for s in suffixes if f"`{s}" not in doc)
+    assert not missing, f"keys with no entry in data-model.md: {missing}"
