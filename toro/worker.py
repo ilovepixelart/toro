@@ -241,12 +241,14 @@ class Worker:
         self._cancelled = 0
         self._current: set[str] = set()
         # The processor task of each running job, so a cancellation can reach it, and
-        # the jobs whose cancellation THIS worker asked for: a CancelledError that is
-        # not in here is the worker shutting down, which must not commit a cancel.
         # job id -> (its processor's task, the claim it is running). The claim fences
         # a cancellation against an id that has been reused since the request was made.
         self._processors: dict[str, tuple[asyncio.Task[Any], str]] = {}
-        self._cancelling: set[str] = set()
+        # job id -> the run THIS worker asked to stop: a CancelledError in a run that is
+        # not in here is the worker shutting down, which must not commit a cancel. Keyed
+        # to the run, not the id alone: another slot can claim the id again while the
+        # cancelled run is still unwinding, and that run was not asked to stop.
+        self._cancelling: dict[str, asyncio.Task[Any]] = {}
         # Held on the instance, not inside the listener: stop() cancels that task while
         # it waits on a message, so a close in its own `finally` may never be reached,
         # and a caller-owned pool is not disconnected for us. Same shape as Queue.
@@ -605,7 +607,8 @@ class Worker:
             if self._processors.get(job_id, (None, ""))[0] is task:
                 self._current.discard(job_id)
                 self._processors.pop(job_id)
-                self._cancelling.discard(job_id)
+            if self._cancelling.get(job_id) is task:
+                del self._cancelling[job_id]
             if renewer is not None:
                 renewer.cancel()
         return nxt
@@ -639,8 +642,8 @@ class Worker:
             stopping = asked() > 0 if asked is not None else not self._running
             if stopping:
                 raise
-            if job.id not in self._cancelling:
-                # Nobody cancelled this job and the worker is not stopping: the
+            if self._cancelling.get(job.id) is not task:
+                # Nobody cancelled this run and the worker is not stopping: the
                 # processor raised it itself (it awaited something that was
                 # cancelled), which is the processor failing like any other error.
                 stray = RuntimeError(
@@ -649,10 +652,10 @@ class Worker:
                 return await self._processing_failed(job, stray)
             return await self._finish_cancelled(job)
         except Exception as exc:
-            if job.id not in self._cancelling:
+            if self._cancelling.get(job.id) is not task:
                 return await self._processing_failed(job, exc)
             result = None  # a cleanup that raised while cancelled: committed below
-        if job.id in self._cancelling:
+        if self._cancelling.get(job.id) is task:
             return await self._finish_cancelled(job)
         try:
             committed = await self._finish_completed(job, result)
@@ -683,15 +686,15 @@ class Worker:
 
         A SYNC processor is recorded and not interrupted: see the comment below.
         """
-        if job_id in self._cancelling:
-            return
         running = self._processors.get(job_id)
         if running is None:
             return
         task, mine = running
+        if self._cancelling.get(job_id) is task:
+            return
         if task.done() or (claim is not None and claim != mine):
             return
-        self._cancelling.add(job_id)
+        self._cancelling[job_id] = task
         if not self._async_processor:
             # A thread cannot be interrupted, so cancelling the await would free this
             # slot and commit a terminal state that hands on the concurrency key,
