@@ -311,3 +311,31 @@ async def test_the_sweep_leaves_a_schedule_whose_occurrence_is_still_queued(q, m
 
     assert await q.redis.zrange(q.keys.delayed, 0, -1) == [first]
     assert (await q.schedulers())[0]["next"] == slot
+
+
+async def test_removing_a_schedule_as_its_next_occurrence_is_minted_leaves_nothing(
+    q, run_worker, run_until
+):
+    """remove_scheduler() landing between _schedule_next's reads and its ZADD: the id
+    went back into the repeat set with the next slot and one more occurrence was
+    enqueued from the template in hand, so schedulers() listed a schedule with no
+    template, and it ran once more, until someone removed it again."""
+    await q.add_scheduler("tick", every=200)
+    removed = asyncio.Event()
+
+    async with run_worker(q, lambda job: None, stalled_interval=0) as w:
+        real_zadd = w.redis.zadd
+
+        async def zadd_after_removal(key, mapping, **kw):
+            if key == q.keys.repeat and not removed.is_set():
+                await q.remove_scheduler("tick")  # lands between the reads and the write
+                removed.set()
+            return await real_zadd(key, mapping, **kw)
+
+        w.redis.zadd = zadd_after_removal  # this worker's client only
+        assert await run_until(removed.is_set, timeout=5)
+        await asyncio.sleep(0.3)  # whatever the worker still minted has landed by now
+
+    assert await q.schedulers() == []
+    assert await q.redis.zcard(q.keys.repeat) == 0
+    assert (await q.counts())["delayed"] == 0
