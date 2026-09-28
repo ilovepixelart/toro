@@ -9,6 +9,7 @@ written against.
 from __future__ import annotations
 
 import hashlib
+import tomllib
 from pathlib import Path
 from textwrap import dedent
 
@@ -29,6 +30,8 @@ MATADOR_URL = "https://github.com/ilovepixelart/matador"
 # relative URL, and canonical wherever the page is rendered from. The trailing
 # slash is load-bearing, since the head appends asset paths to it.
 SITE_URL = "https://ilovepixelart.github.io/toro/"
+# The version the page shows, read from the one place a release writes it.
+VERSION = tomllib.loads((HERE.parent.parent / "pyproject.toml").read_text())["project"]["version"]
 
 _templates = Jinja2Templates(directory=str(HERE / "templates"))
 
@@ -60,7 +63,11 @@ def _asset_v() -> str:
 
 
 _templates.env.globals.update(
-    asset_v=_asset_v, docs_url=DOCS_URL, matador_url=MATADOR_URL, site_url=SITE_URL
+    asset_v=_asset_v,
+    docs_url=DOCS_URL,
+    matador_url=MATADOR_URL,
+    site_url=SITE_URL,
+    version=VERSION,
 )
 
 # The use-case browser. Every snippet is lifted from toro's README, so the page
