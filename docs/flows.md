@@ -218,7 +218,8 @@ pcts = await queue.flow_percentiles(minutes=60)  # end-to-end p50/p95/p99 (ms)
 finishing - which the per-job duration never captures (a flow that fans out
 wide finishes long after any single job's runtime). The dashboard charts this
 as a throughput strip on the active tab. Both reads zero-fill and share the
-8h metrics retention.
+8h metrics retention, and the percentiles share the per-job duration buckets: a
+flow over about 5.6 minutes reads as about 412 s whatever its length.
 
 ## Limits
 
