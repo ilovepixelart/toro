@@ -190,3 +190,13 @@ def test_the_templates_carry_no_version_of_their_own():
     assert templates, "found no templates: the check would pass on anything"
     pinned = [str(t.relative_to(SITE)) for t in templates if version.group(1) in t.read_text()]
     assert not pinned, f"{version.group(1)} is written into {pinned}"
+
+
+def test_a_version_bump_redeploys_the_site():
+    """The page prints the version it reads from pyproject.toml, so a release that
+    changes only pyproject.toml has to redeploy it. Deployed on `site/**` alone, the
+    page kept showing the previous version after every release."""
+    pages = (SITE.parent / ".github" / "workflows" / "pages.yml").read_text()
+    paths = re.search(r"paths: \[(?P<paths>[^\]]*)\]", pages)
+    assert paths, "pages.yml no longer filters its push trigger by path"
+    assert '"pyproject.toml"' in paths["paths"]
