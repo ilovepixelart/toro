@@ -260,3 +260,14 @@ async def test_a_numeric_string_interval_still_works(q):
     """A string of digits has always worked end to end, so it keeps working."""
     await q.add_scheduler("tick", every="60000")
     assert (await q.schedulers())[0]["every"] == 60_000
+
+
+async def test_updating_a_schedule_updates_its_pending_occurrence(q):
+    """Re-registering an id with the same cadence but new data updates the schedule
+    in place, the occurrence already queued included. Left as it was, it ran once
+    more with the old name, data and options, a whole interval after the update."""
+    await q.add_scheduler("report", every=3_600_000, name="v1", data={"v": 1}, priority=1)
+    await q.add_scheduler("report", every=3_600_000, name="v2", data={"v": 2}, priority=5)
+
+    pending = await q.get_jobs("delayed", 0, -1)
+    assert [(j.name, j.data, j.opts.priority) for j in pending] == [("v2", {"v": 2}, 5)]

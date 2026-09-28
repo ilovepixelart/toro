@@ -742,7 +742,9 @@ class Queue:
         when = next_run(_now_ms(), every=every, cron=cron)
         previous = await self.redis.zscore(self.keys.repeat, scheduler_id)
         await self.redis.zadd(self.keys.repeat, {scheduler_id: when})
-        if previous is not None and int(previous) != when:
+        if previous is not None:
+            # replaced even when the cadence is unchanged: the queued occurrence carries
+            # the old name, data and options, and would run with them once more
             await self._drop_pending_occurrence(f"repeat:{scheduler_id}:{int(previous)}")
         await self._enqueue_occurrence(scheduler_id, when, template)
         return scheduler_id
