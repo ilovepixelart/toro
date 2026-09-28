@@ -382,3 +382,15 @@ async def test_a_stalled_out_job_honors_its_remove_on_fail(q, option, size, kept
 
     assert await q.redis.zcard(q.keys.failed) == size
     assert bool(await q.redis.exists(q.keys.job(jid))) is kept
+
+
+@pytest.mark.parametrize(
+    ("raw", "parsed"),
+    [("0", 0), ("3", 3), ("2.7", 2), ("-1", -1), ("nan", -1), ("inf", -1), ("x", -1)],
+)
+async def test_a_retention_bound_of_zero_is_a_bound(q, raw, parsed):
+    """A keep count or age of 0 means keep none, a real bound; only a negative,
+    NaN, infinite or unreadable value means "no bound" (-1). Read through the
+    script's own parser, which every retention path shares."""
+    lua = scripts._LIB + "\nreturn whole(ARGV[1])"
+    assert await q.redis.eval(lua, 0, raw) == parsed

@@ -432,3 +432,31 @@ async def test_removing_a_running_job_frees_its_cap_slot_at_once(q):
         release.set()
         await w.stop(grace_period=1)
         task.cancel()
+
+
+async def test_an_uncapped_claim_wakes_the_next_idle_worker(q, run_until):
+    """Jobs added while no worker waits leave one marker, so it wakes one worker.
+    Without a cap, the claim re-arms it while jobs still wait, and the next worker
+    starts at once instead of after its block_timeout."""
+    await q.add("first", {})
+    await q.add("second", {})
+    started: list[str] = []
+    release = asyncio.Event()
+
+    async def proc(job):
+        started.append(job.id)
+        await release.wait()
+
+    opts = {"prefix": PREFIX, "block_timeout": 5.0, "stalled_interval": 0}
+    workers = [Worker(q.name, proc, concurrency=1, **opts) for _ in range(2)]
+    tasks = [asyncio.create_task(w.run()) for w in workers]
+    try:
+        assert await run_until(lambda: len(started) == 2, timeout=1.5), (
+            f"{len(started)} of 2 started: the second worker waited out its block_timeout"
+        )
+    finally:
+        release.set()
+        for w in workers:
+            await w.stop()
+        for t in tasks:
+            t.cancel()
