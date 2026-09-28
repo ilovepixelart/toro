@@ -84,3 +84,31 @@ async def test_a_cron_that_never_comes_round_leaves_nothing_behind(q):
 
     assert await q.schedulers() == []
     assert await q.redis.exists(q.keys.scheduler("impossible")) == 0
+
+
+async def test_changing_a_schedule_replaces_its_pending_occurrence(q):
+    """Re-registering an id updates the schedule, so the occurrence it had pending
+    goes: left in place it would still run at the old time, schedule its own
+    successor, and outlive remove_scheduler, which only knows the new one."""
+    await q.add_scheduler("nightly", every=60_000)
+    # Two cadences whose next slots differ. Were they ever to coincide, both would be
+    # one occurrence id and this run would prove nothing, but it could not fail.
+    await q.add_scheduler("nightly", every=37_000)
+
+    pending = await q.redis.zrange(q.keys.delayed, 0, -1)
+    assert len(pending) == 1, pending
+
+    await q.remove_scheduler("nightly")
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == []
+
+
+async def test_changing_a_schedule_leaves_a_running_occurrence_alone(q):
+    """Only an occurrence that has not started is dropped: one a worker is already
+    running finishes as it would have."""
+    await q.add_scheduler("nightly", every=60_000)
+    (old_id,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    await q.redis.hset(q.keys.job(old_id), "state", "active")  # as a claim leaves it
+
+    await q.add_scheduler("nightly", every=37_000)
+
+    assert await q.redis.hget(q.keys.job(old_id), "state") == "active"
