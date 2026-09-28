@@ -9,7 +9,6 @@ from redis.asyncio.client import PubSub
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import TimeoutError as RedisTimeoutError
 
 # How long an idle worker slot blocks on the marker by default. It lives here, not
 # in worker.py, because every connection toro builds is sized for it: a Queue's
@@ -79,8 +78,11 @@ def connect(
         health_check_interval=30,
         socket_keepalive=True,
         socket_timeout=blocking_timeout + READ_MARGIN,
-        retry=Retry(ExponentialBackoff(), retries=3),
-        retry_on_error=[RedisConnectionError, RedisTimeoutError],
+        # A timed-out reply is not retried: the command may have run, and a re-sent
+        # script runs again (one add() became two jobs). redis-py retries timeouts
+        # by default, so the list is set rather than extended.
+        retry=Retry(ExponentialBackoff(), retries=3, supported_errors=(RedisConnectionError,)),
+        retry_on_error=[RedisConnectionError],
     )
     return aioredis.Redis(connection_pool=pool)
 
