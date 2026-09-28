@@ -559,9 +559,11 @@ class Worker:
             cfail_key=self.keys.cfail(job_id),
             ccancel_key=self.keys.ccancel(job_id),
         )
-        # A scheduler job mints its successor on first pickup, so the schedule
-        # stays on time regardless of how long (or whether) this run succeeds.
-        if fields.get("schedulerId") and job.attempts_made == 1:
+        # A scheduler job mints its successor when it is picked up, so the schedule
+        # stays on time regardless of how long (or whether) this run succeeds. Any
+        # attempt may do it (see _schedule_next): a first attempt that died before
+        # minting leaves it to the run that recovers it.
+        if fields.get("schedulerId"):
             await self._schedule_next(fields["schedulerId"], job_id)
         renewer = asyncio.create_task(self._renew_loop(job_id)) if self.renew_locks else None
         self._current.add(job_id)  # so the heartbeat reports what we're running
@@ -796,12 +798,15 @@ class Worker:
         own id, and enqueue nothing.
         """
         template = await self.redis.hgetall(self.keys.scheduler(scheduler_id))
-        if not template or await self.redis.zscore(self.keys.repeat, scheduler_id) is None:
+        scheduled = await self.redis.zscore(self.keys.repeat, scheduler_id)
+        if not template or scheduled is None:
             return  # scheduler was removed - stop the chain
+        slot = int(occurrence_id.rsplit(":", 1)[1])
+        if int(scheduled) != slot:
+            return  # the chain has moved past this occurrence: an earlier attempt minted
         every = int(template["every"]) if template.get("every") else None
         cron = cast("str | None", template.get("cron") or None)
         now = _now_ms()
-        slot = int(occurrence_id.rsplit(":", 1)[1])
         when = next_run(max(now, slot), every=every, cron=cron)
         await self.redis.zadd(self.keys.repeat, {scheduler_id: when})
         opts = json.loads(template["opts"])

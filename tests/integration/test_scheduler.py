@@ -9,7 +9,7 @@ import json
 import pytest
 from redis.asyncio.client import Pipeline
 
-from toro import Queue
+from toro import Queue, Worker
 
 PREFIX = "torotest"
 
@@ -176,3 +176,53 @@ async def test_an_occurrence_run_late_skips_to_the_next_slot_after_now(
         assert await run_until(lambda: runs)
 
     assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 180_000}"]
+
+
+async def test_an_occurrence_recovered_after_a_crash_still_schedules_the_next(
+    q, run_worker, run_until
+):
+    """A worker that dies between claiming an occurrence and enqueuing the next leaves
+    the chain to the run that recovers it. That run is a second attempt, so enqueuing
+    only on a first attempt ended the schedule for good."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    doomed = Worker(q.name, lambda job: None, prefix=PREFIX, connection=q.redis)
+    assert await doomed._acquire() is not None  # claimed, and the worker dies here
+    await q.redis.delete(q.keys.lock(first))
+    await doomed.check_stalled(throttle_ms=0)  # mark
+    assert await doomed.check_stalled(throttle_ms=0) == ([], [first])  # recover
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert runs == [first]
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+
+
+async def test_a_retried_occurrence_does_not_start_a_second_chain(
+    q, run_worker, run_until, monkeypatch
+):
+    """The first attempt enqueued the next occurrence; a retry after the clock moved
+    past it must not enqueue another at a later slot, which would run the schedule
+    twice from then on."""
+    await q.add_scheduler("tick", every=60_000, attempts=2)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    clock = {"now": slot + 10}
+    monkeypatch.setattr("toro.worker._now_ms", lambda: clock["now"])
+    attempts: list[int] = []
+
+    async def proc(job):
+        attempts.append(job.attempts_made)
+        if len(attempts) == 1:
+            clock["now"] = slot + 70_000  # past the next slot before the retry
+            raise RuntimeError("first attempt fails")
+
+    async with run_worker(q, proc):
+        assert await run_until(lambda: len(attempts) == 2)
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
