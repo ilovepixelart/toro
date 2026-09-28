@@ -31,9 +31,12 @@ async def test_stop_during_a_finish_round_trip_keeps_the_claimed_job(q, run_unti
     task = asyncio.create_task(w.run())
     try:
         assert await run_until(lambda: "a" in done)
-        await asyncio.sleep(0.3)  # room for the loop to either process `b` or drop it
-        assert done == ["a", "b"]
-        assert await q.redis.llen(q.keys.active) == 0
+        assert await run_until(lambda: done == ["a", "b"]), f"`b` was dropped: {done}"
+
+        async def active_empty() -> bool:
+            return await q.redis.llen(q.keys.active) == 0
+
+        assert await run_until(active_empty)
     finally:
         await w.stop(grace_period=1)
         task.cancel()
