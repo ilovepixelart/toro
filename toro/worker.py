@@ -37,9 +37,9 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from . import scripts
-from ._replies import _str_list
+from ._replies import _scored, _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, confirm_subscribed, connect, read_timeout
-from .job import Backoff, Job, JobContext
+from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
 from .queue import stamp_data_model
 from .scheduler import next_run
@@ -947,11 +947,31 @@ class Worker:
                     )
                     if int(promoted) < scripts.PROMOTE_BATCH:
                         break
+                await self._resume_orphaned_schedules()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - best-effort background sweep
                 pass
             await asyncio.sleep(1.0)
+
+    async def _resume_orphaned_schedules(self) -> None:
+        """Enqueue the next occurrence of a schedule whose queued one was dropped.
+
+        Only a picked-up occurrence enqueues the next, so one cancelled, removed or
+        cleaned out before its slot ended the schedule silently, while schedulers()
+        still listed it. Only remove_scheduler ends a schedule: a slot that has passed
+        with no occurrence behind it is picked up here, at the next slot after now.
+        """
+        overdue = _scored(
+            await self.redis.zrangebyscore(self.keys.repeat, "-inf", _now_ms(), withscores=True)
+        )
+        for scheduler_id, score in overdue:
+            occurrence_id = f"repeat:{scheduler_id}:{int(score)}"
+            # gone, or finished without enqueuing a successor (a cancelled one never
+            # ran); one still queued or running enqueues it when it is picked up
+            state = await self.redis.hget(self.keys.job(occurrence_id), "state")
+            if state is None or state in FINISHED_STATES:
+                await self._schedule_next(scheduler_id, occurrence_id)
 
     async def _stalled_loop(self) -> None:
         while self._running:

@@ -45,12 +45,18 @@ repeat:<schedulerId>:<dueMillis>
 That id makes enqueueing idempotent - the same occurrence can never exist twice,
 no matter how many workers or producers race to create it.
 
-The chain sustains itself: when a worker *first picks up* an occurrence, it
-mints the successor before running the handler. The schedule therefore stays on
-time regardless of how long the run takes, whether it fails, or how many retries
-follow - retries re-run *that occurrence*, they never shift the cadence. If the
-scheduler was removed in the meantime, no successor is minted and the chain
-ends.
+The chain sustains itself: when a worker picks up an occurrence, it mints the
+successor before running the handler, at the next slot after the occurrence's own
+slot (or after now, if the pickup is late). The schedule therefore stays on time
+regardless of how long the run takes, whether it fails, or how many retries follow -
+retries re-run *that occurrence*, they never shift the cadence, and only one attempt
+mints. A run recovered after its worker died before minting mints instead, and an
+occurrence promoted to run early still mints the slot after its own. If the
+scheduler was removed in the meantime, no successor is minted and the chain ends.
+
+Only `remove_scheduler` ends a schedule. Dropping its queued occurrence
+(`cancel_job`, `remove_job`, `clean("delayed")`) skips that one run: once its slot
+has passed, a worker's promote sweep enqueues the next slot after now.
 
 ## Managing schedules
 

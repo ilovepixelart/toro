@@ -271,3 +271,43 @@ async def test_updating_a_schedule_updates_its_pending_occurrence(q):
 
     pending = await q.get_jobs("delayed", 0, -1)
     assert [(j.name, j.data, j.opts.priority) for j in pending] == [("v2", {"v": 2}, 5)]
+
+
+@pytest.mark.parametrize("drop", ["cancel_job", "remove_job", "clean"])
+async def test_a_schedule_outlives_its_pending_occurrence_being_dropped(
+    q, run_worker, run_until, monkeypatch, drop
+):
+    """Only remove_scheduler ends a schedule. Its queued occurrence is the only thing
+    that enqueues the next one, so dropping it (cancelled, removed, or cleaned out
+    of `delayed` from a dashboard) used to end the schedule silently while
+    schedulers() still listed it. The worker's sweep enqueues the next slot."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    if drop == "clean":
+        assert await q.clean("delayed") == 1
+    else:
+        assert await getattr(q, drop)(first) is True
+    monkeypatch.setattr("toro.worker._now_ms", lambda: slot + 1)  # the slot has passed
+
+    async with run_worker(q, lambda job: None):
+        assert await run_until(lambda: q.redis.zcard(q.keys.delayed), timeout=5)
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+    assert (await q.schedulers())[0]["next"] == slot + 60_000
+
+
+async def test_the_sweep_leaves_a_schedule_whose_occurrence_is_still_queued(q, monkeypatch):
+    """A slot that has passed with its occurrence still queued (not yet promoted or
+    claimed) is a healthy chain: the occurrence enqueues the next when it runs, and
+    the sweep adding one too would run the schedule twice."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    monkeypatch.setattr("toro.worker._now_ms", lambda: slot + 1)
+    worker = Worker(q.name, lambda job: None, prefix=PREFIX, connection=q.redis)
+
+    await worker._resume_orphaned_schedules()
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [first]
+    assert (await q.schedulers())[0]["next"] == slot
