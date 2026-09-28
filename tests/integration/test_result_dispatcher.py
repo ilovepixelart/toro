@@ -186,3 +186,44 @@ async def test_result_text_that_does_not_parse_falls_back_to_the_hash(q, run_unt
     await _publish(q, "unreadable", resultJson="{not json")
 
     assert await waiting == [1, 2]
+
+
+async def test_a_message_that_is_not_an_object_does_not_disturb_waiters(q, run_until):
+    """Anything can be published on the channel. A JSON array, number or null used to
+    raise inside the dispatcher and fail every waiter at once."""
+    waiting = asyncio.create_task(q.result("steady", timeout=5))
+    assert await run_until(lambda: _waiting(q, "steady"))
+
+    for raw in ("[1, 2]", "42", "null"):
+        await q.redis.publish(q.keys.events, raw)
+    await _publish(q, "steady", resultJson=json.dumps("ok"))
+
+    assert await waiting == "ok"
+
+
+async def test_close_ends_a_read_back_still_in_flight(q, run_until, monkeypatch):
+    """A read-back started before close() carried on after it and used the closed
+    client, which redis-py quietly reconnects: a connection nothing would close."""
+    held = asyncio.Event()
+    real_get_job = q.get_job
+
+    async def slow_get_job(job_id):
+        if asyncio.current_task() in q._read_backs:
+            await held.wait()  # only the read-back is held, in flight when close() runs
+        return await real_get_job(job_id)
+
+    monkeypatch.setattr(q, "get_job", slow_get_job)
+    waiting = asyncio.create_task(q.result("read-back", timeout=5))
+    assert await run_until(lambda: _waiting(q, "read-back"))
+    await _publish(q, "read-back")  # nothing inline: the waiter reads the hash
+    assert await run_until(lambda: q._read_backs)
+    in_flight = set(q._read_backs)
+    try:
+        # Bounded: a close() that waited for the read-back instead of ending it would
+        # wait for `held`, set only below, and hang the suite instead of failing here.
+        await asyncio.wait_for(q.close(), 5)
+        assert all(task.done() for task in in_flight)
+    finally:
+        held.set()
+    with pytest.raises(RuntimeError, match="queue closed"):
+        await waiting

@@ -814,7 +814,9 @@ if meta[3] then settleChildCompleted(KEYS[8], ARGV[1], meta[3], ARGV[2], now) en
 -- parsed: decoding and re-encoding it rounded numbers to 14 digits, turned [] into
 -- {}, and cost O(size) of parsing on the Redis thread. A large result is announced
 -- without it, and the waiter reads it from the hash.
-if ARGV[11] == "1" then
+-- Over the limit it is read back from the hash, unless retention already removed
+-- the hash (remove_on_complete): then the event is the only copy left.
+if ARGV[11] == "1" or redis.call("EXISTS", KEYS[3]) == 0 then
   redis.call("PUBLISH", KEYS[10],
     cjson.encode({jobId = ARGV[1], event = "completed", resultJson = ARGV[2]}))
 else

@@ -650,6 +650,8 @@ class Queue:
             data = json.loads(raw)
         except ValueError:
             return
+        if not isinstance(data, dict):
+            return  # anyone can publish here: an array or a number is not an event
         event = data.get("event")
         if event not in ("completed", "failed", "cancelled"):
             return  # non-terminal (e.g. "added", "progress")
@@ -1540,6 +1542,13 @@ class Queue:
                 for fut in waiters:
                     if not fut.done():
                         fut.set_exception(RuntimeError("queue closed while waiting for a result"))
+            # A read-back still in flight would use the client after the close below,
+            # and redis-py quietly reconnects it: a connection nothing would close.
+            # Its waiter already failed above, so there is nothing left to wait for.
+            read_backs = list(self._read_backs)
+            for task in read_backs:
+                task.cancel()
+            await asyncio.gather(*read_backs, return_exceptions=True)
         finally:
             await self.redis.aclose(close_connection_pool=self._owns_connection)
 
