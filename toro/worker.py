@@ -37,9 +37,9 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from . import scripts
-from ._replies import _str_list
+from ._replies import _scored, _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, confirm_subscribed, connect, read_timeout
-from .job import Backoff, Job, JobContext
+from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
 from .queue import stamp_data_model
 from .scheduler import next_run
@@ -559,10 +559,12 @@ class Worker:
             cfail_key=self.keys.cfail(job_id),
             ccancel_key=self.keys.ccancel(job_id),
         )
-        # A scheduler job mints its successor on first pickup, so the schedule
-        # stays on time regardless of how long (or whether) this run succeeds.
-        if fields.get("schedulerId") and job.attempts_made == 1:
-            await self._schedule_next(fields["schedulerId"])
+        # A scheduler job mints its successor when it is picked up, so the schedule
+        # stays on time regardless of how long (or whether) this run succeeds. Any
+        # attempt may do it (see _schedule_next): a first attempt that died before
+        # minting leaves it to the run that recovers it.
+        if fields.get("schedulerId"):
+            await self._schedule_next(fields["schedulerId"], job_id)
         renewer = asyncio.create_task(self._renew_loop(job_id)) if self.renew_locks else None
         self._current.add(job_id)  # so the heartbeat reports what we're running
 
@@ -787,15 +789,25 @@ class Worker:
         self._emit("failed" if res[0] == scripts.OUTCOME_FAILED else "retrying", job, exc)
         return self._next_from(res)
 
-    async def _schedule_next(self, scheduler_id: str) -> None:
-        """Enqueue the next occurrence of a scheduler (idempotent, stops if removed)."""
+    async def _schedule_next(self, scheduler_id: str, occurrence_id: str) -> None:
+        """Enqueue the next occurrence of a scheduler (idempotent, stops if removed).
+
+        The next slot follows this occurrence's own slot, the time in its id, as well
+        as the clock: an occurrence run early (promoted, or claimed by a worker whose
+        clock is ahead) would otherwise compute its own slot again, collide with its
+        own id, and enqueue nothing.
+        """
         template = await self.redis.hgetall(self.keys.scheduler(scheduler_id))
-        if not template or await self.redis.zscore(self.keys.repeat, scheduler_id) is None:
+        scheduled = await self.redis.zscore(self.keys.repeat, scheduler_id)
+        if not template or scheduled is None:
             return  # scheduler was removed - stop the chain
+        slot = int(occurrence_id.rsplit(":", 1)[1])
+        if int(scheduled) != slot:
+            return  # the chain has moved past this occurrence: an earlier attempt minted
         every = int(template["every"]) if template.get("every") else None
         cron = cast("str | None", template.get("cron") or None)
         now = _now_ms()
-        when = next_run(now, every=every, cron=cron)
+        when = next_run(max(now, slot), every=every, cron=cron)
         await self.redis.zadd(self.keys.repeat, {scheduler_id: when})
         opts = json.loads(template["opts"])
         await self._add_scheduled(
@@ -935,11 +947,31 @@ class Worker:
                     )
                     if int(promoted) < scripts.PROMOTE_BATCH:
                         break
+                await self._resume_orphaned_schedules()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - best-effort background sweep
                 pass
             await asyncio.sleep(1.0)
+
+    async def _resume_orphaned_schedules(self) -> None:
+        """Enqueue the next occurrence of a schedule whose queued one was dropped.
+
+        Only a picked-up occurrence enqueues the next, so one cancelled, removed or
+        cleaned out before its slot ended the schedule silently, while schedulers()
+        still listed it. Only remove_scheduler ends a schedule: a slot that has passed
+        with no occurrence behind it is picked up here, at the next slot after now.
+        """
+        overdue = _scored(
+            await self.redis.zrangebyscore(self.keys.repeat, "-inf", _now_ms(), withscores=True)
+        )
+        for scheduler_id, score in overdue:
+            occurrence_id = f"repeat:{scheduler_id}:{int(score)}"
+            # gone, or finished without enqueuing a successor (a cancelled one never
+            # ran); one still queued or running enqueues it when it is picked up
+            state = await self.redis.hget(self.keys.job(occurrence_id), "state")
+            if state is None or state in FINISHED_STATES:
+                await self._schedule_next(scheduler_id, occurrence_id)
 
     async def _stalled_loop(self) -> None:
         while self._running:

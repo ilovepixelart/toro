@@ -9,7 +9,7 @@ import json
 import pytest
 from redis.asyncio.client import Pipeline
 
-from toro import Queue
+from toro import Queue, Worker
 
 PREFIX = "torotest"
 
@@ -140,3 +140,174 @@ async def test_a_schedule_takes_exactly_one_cadence(q, cadence):
     with pytest.raises(ValueError, match="exactly one of `every` or `cron`"):
         await q.add_scheduler("nightly", **cadence)
     assert await q.schedulers() == []
+
+
+async def test_an_occurrence_run_early_still_schedules_the_next(q, run_worker, run_until):
+    """Promoting an occurrence runs it before its slot. The next one follows its slot,
+    not the clock: counted from `now` it lands on the running occurrence's own id,
+    nothing new is enqueued, and the schedule never runs again."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert runs == [first]
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+    assert (await q.schedulers())[0]["next"] == slot + 60_000
+
+
+async def test_an_occurrence_run_late_skips_to_the_next_slot_after_now(
+    q, run_worker, run_until, monkeypatch
+):
+    """A late pickup (workers were down) schedules the next slot after the clock, so
+    the missed slots are skipped rather than fired one after another as a backlog."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    monkeypatch.setattr("toro.worker._now_ms", lambda: slot + 150_000)  # 2.5 slots late
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 180_000}"]
+
+
+async def test_an_occurrence_recovered_after_a_crash_still_schedules_the_next(
+    q, run_worker, run_until
+):
+    """A worker that dies between claiming an occurrence and enqueuing the next leaves
+    the chain to the run that recovers it. That run is a second attempt, so enqueuing
+    only on a first attempt ended the schedule for good."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    doomed = Worker(q.name, lambda job: None, prefix=PREFIX, connection=q.redis)
+    assert await doomed._acquire() is not None  # claimed, and the worker dies here
+    await q.redis.delete(q.keys.lock(first))
+    await doomed.check_stalled(throttle_ms=0)  # mark
+    assert await doomed.check_stalled(throttle_ms=0) == ([], [first])  # recover
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert runs == [first]
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+
+
+async def test_a_retried_occurrence_does_not_start_a_second_chain(
+    q, run_worker, run_until, monkeypatch
+):
+    """The first attempt enqueued the next occurrence; a retry after the clock moved
+    past it must not enqueue another at a later slot, which would run the schedule
+    twice from then on."""
+    await q.add_scheduler("tick", every=60_000, attempts=2)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    clock = {"now": slot + 10}
+    monkeypatch.setattr("toro.worker._now_ms", lambda: clock["now"])
+    attempts: list[int] = []
+
+    async def proc(job):
+        attempts.append(job.attempts_made)
+        if len(attempts) == 1:
+            clock["now"] = slot + 70_000  # past the next slot before the retry
+            raise RuntimeError("first attempt fails")
+
+    async with run_worker(q, proc):
+        assert await run_until(lambda: len(attempts) == 2)
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+
+
+async def test_a_whole_float_interval_runs_like_the_int(q, run_worker, run_until):
+    """An interval that came through arithmetic (`30 * 60 * 1000 / 2`) is a float with
+    nothing after the point. Stored as "60000.0", the worker could not read it back:
+    the first pickup failed before the processor ran, the chain ended, and
+    schedulers() raised for the whole queue."""
+    await q.add_scheduler("tick", every=60_000.0)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    assert await q.promote_job(first) is True
+    runs: list[str] = []
+
+    async with run_worker(q, lambda job: runs.append(job.id)):
+        assert await run_until(lambda: runs)
+
+    assert (await q.schedulers())[0]["every"] == 60_000
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+
+
+@pytest.mark.parametrize("every", [1000.5, True], ids=["fractional", "bool"])
+async def test_an_interval_that_is_not_whole_is_refused(q, every):
+    """A fraction of a millisecond or a bool is no interval; accepted, it killed the
+    schedule at its first run. It is refused where it is given, and nothing is kept."""
+    with pytest.raises(ValueError, match="positive whole number"):
+        await q.add_scheduler("tick", every=every)
+    assert await q.schedulers() == []
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == []
+
+
+async def test_a_numeric_string_interval_still_works(q):
+    """A string of digits has always worked end to end, so it keeps working."""
+    await q.add_scheduler("tick", every="60000")
+    assert (await q.schedulers())[0]["every"] == 60_000
+
+
+async def test_updating_a_schedule_updates_its_pending_occurrence(q):
+    """Re-registering an id with the same cadence but new data updates the schedule
+    in place, the occurrence already queued included. Left as it was, it ran once
+    more with the old name, data and options, a whole interval after the update."""
+    await q.add_scheduler("report", every=3_600_000, name="v1", data={"v": 1}, priority=1)
+    await q.add_scheduler("report", every=3_600_000, name="v2", data={"v": 2}, priority=5)
+
+    pending = await q.get_jobs("delayed", 0, -1)
+    assert [(j.name, j.data, j.opts.priority) for j in pending] == [("v2", {"v": 2}, 5)]
+
+
+@pytest.mark.parametrize("drop", ["cancel_job", "remove_job", "clean"])
+async def test_a_schedule_outlives_its_pending_occurrence_being_dropped(
+    q, run_worker, run_until, monkeypatch, drop
+):
+    """Only remove_scheduler ends a schedule. Its queued occurrence is the only thing
+    that enqueues the next one, so dropping it (cancelled, removed, or cleaned out
+    of `delayed` from a dashboard) used to end the schedule silently while
+    schedulers() still listed it. The worker's sweep enqueues the next slot."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    if drop == "clean":
+        assert await q.clean("delayed") == 1
+    else:
+        assert await getattr(q, drop)(first) is True
+    monkeypatch.setattr("toro.worker._now_ms", lambda: slot + 1)  # the slot has passed
+
+    async with run_worker(q, lambda job: None):
+        assert await run_until(lambda: q.redis.zcard(q.keys.delayed), timeout=5)
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+    assert (await q.schedulers())[0]["next"] == slot + 60_000
+
+
+async def test_the_sweep_leaves_a_schedule_whose_occurrence_is_still_queued(q, monkeypatch):
+    """A slot that has passed with its occurrence still queued (not yet promoted or
+    claimed) is a healthy chain: the occurrence enqueues the next when it runs, and
+    the sweep adding one too would run the schedule twice."""
+    await q.add_scheduler("tick", every=60_000)
+    (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
+    slot = int(first.rsplit(":", 1)[1])
+    monkeypatch.setattr("toro.worker._now_ms", lambda: slot + 1)
+    worker = Worker(q.name, lambda job: None, prefix=PREFIX, connection=q.redis)
+
+    await worker._resume_orphaned_schedules()
+
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [first]
+    assert (await q.schedulers())[0]["next"] == slot
