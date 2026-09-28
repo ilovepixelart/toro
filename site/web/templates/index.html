@@ -52,9 +52,9 @@ app.mount(
     "/admin/queues",
     create_app(
         ["emails", "billing"],
-        url="redis://localhost:6379",
+        connection=redis,  # the host client: a mounted app never runs its own shutdown
         dependencies=[Depends(admin)],
-        can_mutate=lambda r: r.user.is_staff,
+        can_mutate=lambda r: getattr(r.state, "role", None) == "admin",
     ),
 )''' %}
 
@@ -174,7 +174,7 @@ app.mount(
           A process that disappears stops renewing, and the next sweep puts its jobs back.') }}
       <div class="{{ lede }}">
         {{ blurbs([
-          ('The lock proves the worker is alive', 'A renewer refreshes it every lock_renew_time, so a lock expires only when the process actually stopped.'),
+          ('The lock proves the worker is alive', 'A renewer refreshes it every lock_renew_time, so a lock expires when renewal stops: the process died, or its event loop was blocked past lock_duration.'),
           ('Recovery is a sweep, not a timeout', 'Every worker looks for jobs whose lock expired and re-enqueues them at their stored priority, throttled so the fleet sweeps about once per interval.'),
           ('The result commits once', 'A late finish from the dead process is rejected by its token: the handler may run twice, the job settles once.'),
         ], 'max-w-[56ch]') }}
@@ -198,14 +198,14 @@ app.mount(
 <section class="{{ band }}">
   <div class="{{ pad }}">
     {{ heading('Features', 'Everything a queue is expected to have',
-       'None of this is an add-on or a plugin. It is in the library, documented, and enforced inside
-        the same atomic scripts that move jobs between states.') }}
+       'None of this is an add-on or a plugin. It is in the library and documented, and every state
+        change it makes runs inside the same atomic scripts that move jobs between states.') }}
     <div class="{{ lede }} grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-8">
       {% for title, body in [
-        ('Retries with backoff', 'Fixed or exponential, per job, with a ceiling. A failed attempt goes back with its history intact.'),
+        ('Retries with backoff', 'Fixed or exponential, per job, bounded by the attempt count. A failed attempt goes back with its logs and attempt count kept.'),
         ('Priorities and delays', 'Enqueue ahead of the queue, or for later. Delayed jobs promote themselves when due.'),
         ('Cron and repeatable', 'Every occurrence schedules the next, so a missed tick cannot compound into a storm.'),
-        ('Deduplication', 'A custom id makes add() idempotent: the second one is ignored rather than queued twice.'),
+        ('Deduplication', 'A custom id makes add() idempotent while that job is kept: a second one is ignored rather than queued twice.'),
         ('Rate limits', 'A cap across every worker on the queue, not per process, spent only once a job is actually claimed.'),
         ('Concurrency keys', 'Serialise jobs that touch the same thing while everything else keeps flowing.'),
         ('Global concurrency', 'One ceiling on active jobs across every worker, released even when a worker crashes.'),
@@ -213,7 +213,7 @@ app.mount(
         ('Metrics', 'Per-minute counters and lifetime totals in Redis, exported as OpenMetrics for Prometheus.'),
         ('Sync or async processors', 'A plain def runs in a thread pool the worker owns, sized to its concurrency, so the loop stays free to renew locks.'),
         ('Transactional enqueue', 'Collect jobs while a database transaction is open and send them in one pipelined write once it commits.'),
-        ('Cancellation', 'cancel_job stops a running job at its next await, so finally blocks run and it lands in cancelled rather than failed.'),
+        ('Cancellation', 'cancel_job stops a running async job at its next await, so finally blocks run and it lands in cancelled rather than failed.'),
       ] %}
         <div>
           <h3 class="text-sm font-semibold">{{ title }}</h3>
@@ -283,7 +283,7 @@ app.mount(
     <dl class="{{ lede }} grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-10 gap-y-8">
       {% for term, value in [
           ('Version', '1.0.0, frozen API'), ('Python', '3.10 to 3.13'),
-          ('Redis', '6.2 and later'), ('Tests', '860+, on real Redis'),
+          ('Redis', '6.2 and later'), ('Tests', '860+, most on real Redis'),
           ('Dependencies', 'redis, croniter'), ('Licence', 'MIT')] %}
         <div>
           <dt class="text-xs uppercase tracking-wider text-muted">{{ term }}</dt>

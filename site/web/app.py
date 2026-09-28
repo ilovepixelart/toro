@@ -82,7 +82,7 @@ EXAMPLES: dict[str, tuple[str, str]] = {
     "dedup": (
         "Idempotent enqueue",
         dedent("""\
-            # a second add with the same id is ignored, not queued twice
+            # a second add with the same id is ignored while the first is kept
             await queue.add("charge", data, job_id="order-1234")"""),
     ),
     "cron": (
@@ -94,7 +94,7 @@ EXAMPLES: dict[str, tuple[str, str]] = {
     "ratelimit": (
         "Rate limit",
         dedent("""\
-            # at most 100 jobs a second across every worker on the queue
+            # 100 jobs a second on average, across every worker on the queue
             worker = Worker(
                 "emails", process,
                 rate_limit={"max": 100, "duration": 1000},
