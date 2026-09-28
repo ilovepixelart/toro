@@ -2,6 +2,25 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 1.0.1
+
+Nothing breaks. Two fixes.
+
+**A retried flow parent waits for the children retried with it.** A parent whose
+`on_fail="continue"` child failed, and which then failed in its own processor, went
+straight back to `wait` when the flow was retried, and ran beside the child being
+retried, on the results it had last time. It now waits for every child that has not
+completed or been cancelled, through `retry_job`, `retry_flow` and `retry_all_failed`
+alike.
+
+**Changing a schedule's cadence replaces its pending occurrence.** Registering an
+existing scheduler id with a different `every` or `cron` left the occurrence already
+pending under the old cadence: it still ran, scheduled its own successor, and survived
+`remove_scheduler`. It is now removed while it has not started; one already running
+finishes.
+
+The package is now marked `Development Status :: 5 - Production/Stable`.
+
 ## 1.0.0
 
 Nothing new ships: 1.0 is the promise rather than a feature, what is public, what may
