@@ -312,6 +312,49 @@ async def test_full_cap_does_not_wake_a_parked_worker(q):
     await w.redis.aclose()
 
 
+async def test_a_sweep_that_fails_nothing_does_not_wake_a_parked_worker(q):
+    """A stall sweep wakes a worker only when it failed a job for good, freeing a
+    slot. One that failed nothing freed nothing: with the cap full, a worker woken
+    then can only be turned away."""
+    await q.add("held", {})
+    await q.add("waiting", {})
+    w = Worker(q.name, _noop, prefix=PREFIX, global_concurrency=1)
+    assert await w._acquire() is not None  # the cap is full, one job still waits
+
+    await q.redis.delete(q.keys.marker)
+    await w.check_stalled(throttle_ms=0)  # mark
+    failed, recovered = await w.check_stalled(throttle_ms=0)  # sweep
+    assert (failed, recovered) == ([], [])
+    assert await q.redis.zcard(q.keys.marker) == 0
+    await w.redis.aclose()
+
+
+async def test_a_claim_of_the_last_waiting_job_does_not_rearm_the_marker(q):
+    """Without a cap a claim re-arms the marker only while jobs still wait. Taking
+    the last one leaves nothing for a woken worker to claim."""
+    await q.add("only", {})
+    w = Worker(q.name, _noop, prefix=PREFIX)
+
+    await q.redis.delete(q.keys.marker)
+    assert await w._acquire() is not None
+    assert await q.redis.zcard(q.keys.prioritized) == 0
+    assert await q.redis.zcard(q.keys.marker) == 0
+    await w.redis.aclose()
+
+
+async def test_a_draining_finish_with_nothing_waiting_leaves_no_marker(q):
+    """A finish without fetch-next hands its freed slot on by arming the marker, but
+    only when a job waits for it; with none, no worker should be woken."""
+    await q.add("only", {})
+    w = Worker(q.name, _noop, prefix=PREFIX)  # not running: finishes with fetch=0
+    first = await w._acquire()
+
+    await q.redis.delete(q.keys.marker)
+    assert await w._finish_completed(Job.from_hash(*first), {"ok": 1}) is None
+    assert await q.redis.zcard(q.keys.marker) == 0
+    await w.redis.aclose()
+
+
 async def test_missing_cap_argument_is_an_error(q):
     """A limit must never fail open. A caller that omits the cap gets a script
     error, not a claim that quietly ignores the limit."""

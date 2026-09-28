@@ -292,6 +292,28 @@ async def test_result_reports_a_cancellation(q):
         await q.result(job.id, timeout=5)
 
 
+async def test_a_waiter_hears_a_running_job_being_cancelled(q, run_worker):
+    """CN-008: a caller already waiting on a running job is told by the event its
+    worker publishes when it commits the cancellation. Nothing re-reads the job
+    after that, so without the event the waiter sits out its whole timeout."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    async with run_worker(q, proc, concurrency=2):
+        job = await q.add("long", {})
+        await asyncio.wait_for(started.wait(), 10)
+        waiting = asyncio.create_task(job.result(timeout=10))
+        await asyncio.sleep(0.2)  # it is registered and waiting
+
+        assert await q.cancel_job(job.id) is True
+
+        with pytest.raises(JobCancelledError):
+            await asyncio.wait_for(waiting, 3)
+
+
 async def test_a_worker_does_not_listen_to_the_job_firehose(q, run_worker, run_until):
     """CN-010: `events` carries a message per job. A worker subscribed there parses
     every one of them to catch a cancellation, which measured as a 7% throughput cost

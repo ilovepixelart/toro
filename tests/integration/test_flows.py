@@ -69,6 +69,20 @@ async def test_nested_flow_parks_interior_nodes(q):
     assert len(mid["children"]) == 2
 
 
+async def test_a_runnable_leaf_reads_wait(q):
+    """A leaf queued by add_flow is in `wait` and says so. With no state on its hash
+    it reads as nothing, and a cancel of its flow, which stops each node by the state
+    it is in, leaves it queued to run for a parent that is gone."""
+    parent = await q.add_flow("report", {}, children=[c("fetch", {})])
+    (leaf_id,) = (await q.get_job(parent.id)).children_ids
+
+    assert (await q.get_job(leaf_id)).state == "wait"
+
+    assert await q.cancel_job(parent.id) is True
+    assert (await q.get_job(leaf_id)).state == "cancelled"
+    assert leaf_id not in await q.redis.zrange(q.keys.prioritized, 0, -1)
+
+
 async def test_waiting_children_jobs_are_listable(q):
     parent = await q.add_flow("report", {}, children=[c("fetch", {})])
     listed = await q.get_jobs("waiting-children")

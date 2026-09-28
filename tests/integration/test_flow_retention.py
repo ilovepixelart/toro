@@ -293,6 +293,28 @@ async def test_a_cascade_spends_the_trim_budget(q, run_worker, run_until):
     assert await _count_state(q, "completed", 3)
 
 
+async def test_a_cascade_charges_only_the_jobs_it_removes(q, run_worker, run_until):
+    """FR-004: the root's cascade takes its children, whose listings the same trim then
+    reaches with no hash behind them. Those cost nothing: charged one each, 500 stale
+    listings on top of the 501 jobs the cascade removed would spend the budget before
+    the plain jobs behind them."""
+    width = 500
+
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=16):
+        root = await q.add_flow("report", {}, children=[c("part", {"i": i}) for i in range(width)])
+        assert await run_until(lambda: _settled(q, root.id), timeout=60)
+        plain = [await q.add("plain", {}) for _ in range(2)]
+        for job in plain:
+            await job.result(timeout=10)
+        assert await _count_state(q, "completed", width + 3)
+
+        # keep one: the root, its children and both plain jobs are over the bound
+        await (await q.add("unrelated", {}, remove_on_complete=1)).result(timeout=10)
+
+    assert await _present(q, [job.id for job in plain]) == 0, "the plain jobs outlived the trim"
+    assert await _count_state(q, "completed", 1)
+
+
 async def test_orphans_are_ordinary_jobs(q, run_worker, run_until):
     """FR-006: a child that finishes after its parent was failed eagerly belongs to no
     running flow: scored at its finish time and trimmed like any job."""
@@ -553,6 +575,23 @@ async def test_the_cascade_keeps_what_is_kept_forever(q, run_worker, run_until):
     assert await _gone(q, root.id)
     assert await _present(q, [bad]) == 1, "a job kept forever went with its root"
     assert (await _scores(q, [bad]))[bad] < LIVE_SCORE
+
+
+async def test_the_cascade_takes_a_job_with_an_age_bound_of_zero(q, run_worker, run_until):
+    """An age of 0 is a bound, not "keep everything": a child carrying it goes with
+    its root like any other."""
+    async with run_worker(q, _holding(asyncio.Event(), "none"), concurrency=4):
+        root = await q.add_flow("report", {}, children=[c("a", {}, remove_on_complete={"age": 0})])
+        assert await run_until(lambda: _settled(q, root.id), timeout=10)
+        child = (await _tree_ids(q, root.id))[0]
+        assert await _count_state(q, "completed", 2)
+
+        # a bound of two: one job too many, and the one oldest is the root
+        await (await q.add("unrelated", {}, remove_on_complete=2)).result(timeout=10)
+
+    assert await _gone(q, root.id)
+    assert await _gone(q, child), "a child with an age bound of 0 outlived its root"
+    assert await _count_state(q, "completed", 1)
 
 
 async def test_the_live_boundary_is_exact(q):

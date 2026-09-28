@@ -327,6 +327,33 @@ async def test_pause_and_resume(q):
     t.cancel()
 
 
+async def test_a_job_claimed_before_a_pause_completes_while_paused(q, run_worker, run_until):
+    """pause() stops new claims, not the work in hand: the running job's finish commits
+    and its fetch of the next job comes back empty. A paused fetch that answered as if
+    it had claimed something breaks the finish script after its commit, and the worker
+    never reports the completion."""
+    release = asyncio.Event()
+    started: list[str] = []
+    completed: list[str] = []
+
+    async def proc(job):
+        started.append(job.id)
+        await release.wait()
+
+    job = await q.add("running", {})
+    await q.add("next", {})
+    async with run_worker(q, proc, concurrency=1, stalled_interval=0) as w:
+        w.on("completed", lambda j, r: completed.append(j.id))
+        assert await run_until(lambda: started)
+        await q.pause()
+        release.set()
+        assert await run_until(lambda: completed, timeout=2)
+
+    assert completed == [job.id]
+    counts = await q.counts()
+    assert (counts["completed"], counts["wait"]) == (1, 1), counts
+
+
 async def test_custom_job_id_is_idempotent(q):
     """A custom job_id dedupes: re-adding the same id is ignored, not duplicated."""
     j1 = await q.add("welcome", {"to": "ada"}, job_id="order-42")
@@ -548,6 +575,121 @@ async def test_a_finish_that_fetches_the_next_job_pays_the_limiter(q, outcome):
     assert 60_000 < await q.redis.pttl(q.keys.limiter) <= 61_000  # duration + 1 s
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_rate_limited_fetch_next_rearms_the_marker(q, outcome):
+    """A finish whose fetch of the next job is turned away by the limiter leaves that
+    job waiting and arms the marker, so a worker wakes to claim it once a token frees.
+    Without the marker the job waits for an unrelated add to wake anyone."""
+    cur = await q.add("cur", {})
+    nxt = await q.add("nxt", {})
+    w = Worker(
+        QUEUE, _noop, prefix=PREFIX, rate_limit={"max": 1, "duration": 60_000}, connection=q.redis
+    )
+    await _claim(q, cur.id, w.token)
+    now = _now_ms()
+    await q.redis.hset(q.keys.limiter, mapping={"tokens": 0, "ts": now})  # the bucket is spent
+    await q.redis.delete(q.keys.marker)
+
+    limit = {"fetch": "1", "lock_duration": 30000, "rl_max": 1, "rl_duration": 60_000}
+    if outcome == "completed":
+        await w._move_to_completed(
+            keys=[
+                q.keys.active,
+                q.keys.completed,
+                q.keys.job(cur.id),
+                q.keys.lock(cur.id),
+                q.keys.prioritized,
+                q.keys.marker,
+                q.keys.stalled,
+                q.keys.base,
+                q.keys.pc,
+                q.keys.events,
+                q.keys.meta_paused,
+                q.keys.limiter,
+            ],
+            args=scripts.completed_args(
+                job_id=cur.id,
+                returnvalue="{}",
+                now=now,
+                token=w.token,
+                global_concurrency=0,
+                **limit,
+            ),
+        )
+    else:
+        await w._move_to_failed(
+            keys=[
+                q.keys.active,
+                q.keys.prioritized,
+                q.keys.delayed,
+                q.keys.failed,
+                q.keys.job(cur.id),
+                q.keys.lock(cur.id),
+                q.keys.marker,
+                q.keys.stalled,
+                q.keys.base,
+                q.keys.pc,
+                q.keys.events,
+                q.keys.meta_paused,
+                q.keys.limiter,
+            ],
+            args=scripts.failed_args(
+                job_id=cur.id,
+                reason="boom",
+                now=now,
+                attempts_made=1,
+                max_attempts=1,
+                backoff=0,
+                token=w.token,
+                global_concurrency=0,
+                **limit,
+            ),
+        )
+
+    assert (await q.counts())[outcome] == 1
+    assert await q.redis.zscore(q.keys.prioritized, nxt.id) is not None  # not claimed
+    assert await q.redis.zcard(q.keys.marker) == 1
+
+
+async def test_a_rate_limit_of_one_lets_exactly_one_job_through(q, run_worker, run_until):
+    """A bucket of max=1 starts full: its single token is spendable at once, and
+    spending it leaves the rest waiting out the duration."""
+    for i in range(3):
+        await q.add("job", {"i": i})
+    done: list[str] = []
+
+    async def proc(job):
+        done.append(job.id)
+
+    async with run_worker(q, proc, rate_limit={"max": 1, "duration": 60_000}, stalled_interval=0):
+        assert await run_until(lambda: done, timeout=2)
+        await asyncio.sleep(0.3)  # the other two must NOT run: nothing to wait for
+
+    counts = await q.counts()
+    assert (counts["completed"], counts["wait"]) == (1, 2), counts
+
+
+async def test_a_rate_limited_claim_waits_only_for_the_missing_part_of_a_token(q, monkeypatch):
+    """The retry is the time until the bucket holds one whole token again: with half a
+    token refilled, half the per-token interval is left, not one and a half."""
+    for i in range(3):
+        await q.add("job", {"i": i})
+    clock = {"now": 1_700_000_000_000}
+    monkeypatch.setattr("toro.worker._now_ms", lambda: clock["now"])
+    w = Worker(
+        QUEUE, _noop, prefix=PREFIX, rate_limit={"max": 2, "duration": 1000}, connection=q.redis
+    )
+    waits: list[int] = []
+    w.on("rate-limited", waits.append)
+
+    assert await w._acquire() is not None
+    assert await w._acquire() is not None  # the bucket of 2 is empty
+    clock["now"] += 250  # half a token back at 2 per second
+    assert await w._acquire() is None
+
+    assert waits == [250]
+
+
 async def test_rate_limit_disabled_runs_everything(q):
     """No limiter → all jobs flow through promptly (guards the rlMax=0 fast path)."""
     for i in range(8):
@@ -719,6 +861,61 @@ async def test_a_job_that_finishes_between_sweep_passes_is_not_recovered(q, run_
     assert runs == [job.id]
 
 
+async def test_a_renewal_clears_the_stalled_mark(q):
+    """A renewal proves the worker alive, so it takes the job off the sweep's marked
+    set. A lock lost after it is a fresh stall, marked on the next pass rather than
+    recovered at once on a mark the renewal already answered."""
+    job = await q.add("x", {})
+    jid = job.id
+    w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
+    await _claim(q, jid, w.token)
+    await w.check_stalled(throttle_ms=0)  # pass 1: marks the running job
+
+    renewed = await w._extend_lock(
+        keys=[q.keys.lock(jid), q.keys.stalled, q.keys.job(jid)], args=[w.token, 30000, jid]
+    )
+    assert renewed == 1
+    await q.redis.delete(q.keys.lock(jid))  # the worker dies right after renewing
+
+    failed, recovered = await w.check_stalled(throttle_ms=0)  # pass 2: only marks again
+    assert (failed, recovered) == ([], [])
+    assert jid in await q.redis.lrange(q.keys.active, 0, -1)
+
+
+async def test_a_sweep_inside_the_throttle_window_does_nothing(q):
+    """Workers sharing a queue sweep at most once per stalled_interval between them:
+    the first pass takes the throttle key, and a second pass inside the window does
+    nothing, even with a lockless job it could otherwise recover."""
+    job = await q.add("x", {})
+    jid = job.id
+    w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
+    await q.redis.zrem(q.keys.prioritized, jid)
+    await q.redis.rpush(q.keys.active, jid)  # a dead worker's job: on `active`, no lock
+
+    assert await w.check_stalled() == ([], [])  # marks it and starts the window
+    assert await w.check_stalled() == ([], [])  # inside the window: no recovery
+    assert jid in await q.redis.lrange(q.keys.active, 0, -1)
+
+
+async def test_a_recovered_job_waits_again_at_its_own_priority(q):
+    """Recovery puts a job back exactly as it was queued: state `wait`, and its stored
+    priority, so an urgent job does not fall behind a less urgent one by stalling."""
+    urgent = await q.add("urgent", {}, priority=10)
+    other = await q.add("other", {}, priority=5)
+    w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
+    # a worker claimed the urgent job and died: active, no lock
+    await q.redis.zrem(q.keys.prioritized, urgent.id)
+    await q.redis.hset(q.keys.job(urgent.id), "state", "active")
+    await q.redis.rpush(q.keys.active, urgent.id)
+
+    await w.check_stalled(throttle_ms=0)  # mark
+    failed, recovered = await w.check_stalled(throttle_ms=0)  # recover
+    assert (failed, recovered) == ([], [urgent.id])
+
+    assert (await q.get_job(urgent.id)).state == "wait"
+    assert await q.redis.zrange(q.keys.prioritized, 0, -1) == [urgent.id, other.id]
+
+
 async def test_a_renewal_that_finds_another_workers_lock_reports_lock_lost(
     q, run_worker, run_until
 ):
@@ -746,3 +943,29 @@ async def test_a_renewal_that_finds_another_workers_lock_reports_lock_lost(
         assert await q.redis.get(q.keys.lock(job.id)) == "another-worker"
         release.set()
         assert await run_until(lambda: ran_to_the_end, timeout=2)
+
+
+async def test_a_job_outliving_its_lock_duration_keeps_the_lock_by_renewing(
+    q, run_worker, run_until
+):
+    """lock_duration bounds a silent worker, not a long job: renewals every
+    lock_renew_time keep the lock, so a job running over three lock durations still
+    commits. A renewal misread as a lost lock stops renewing, the lock lapses and the
+    finish is dropped."""
+
+    async def proc(job):
+        await asyncio.sleep(1)  # the job's own work, over three lock durations
+        return "done"
+
+    completed: list[str] = []
+    lost: list[str] = []
+    async with run_worker(
+        q, proc, lock_duration=300, lock_renew_time=100, stalled_interval=0
+    ) as worker:
+        worker.on("completed", lambda j, r: completed.append(j.id))
+        worker.on("lock-lost", lost.append)
+        job = await q.add("long", {})
+        assert await run_until(lambda: completed, timeout=3)
+
+    assert completed == [job.id]
+    assert lost == []

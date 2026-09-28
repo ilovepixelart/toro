@@ -64,3 +64,26 @@ async def test_clean_prunes_the_oldest_first(q):
     # What survives is the NEWEST 500 - clean drops old history, not fresh results.
     left = await q.redis.zrange(q.keys.completed, 0, -1)
     assert set(left) == {f"j{i}" for i in range(1000, 1500)}
+
+
+async def test_a_promoted_job_keeps_its_priority(q):
+    """promote_job queues a job at its own priority, ahead of a less urgent one that
+    was waiting first. Queued at the default priority, it lines up behind it."""
+    first = await q.add("first", {})
+    urgent = await q.add("urgent", {}, delay=60_000, priority=10)
+
+    assert await q.promote_job(urgent.id) is True
+
+    assert [j.id for j in await q.get_jobs("wait")] == [urgent.id, first.id]
+
+
+async def test_a_retried_job_keeps_its_priority(q):
+    """retry_job queues a job at its own priority, ahead of a less urgent one that
+    was waiting first. Queued at the default priority, it lines up behind it."""
+    first = await q.add("first", {})
+    await _seed_finished(q, "failed", 1)
+    await q.redis.hset(q.keys.job("j0"), "priority", 10)
+
+    assert await q.retry_job("j0") is True
+
+    assert [j.id for j in await q.get_jobs("wait")] == ["j0", first.id]

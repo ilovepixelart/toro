@@ -265,3 +265,40 @@ async def test_cap_holds_under_random_ops(q, seed):
     await _check_invariants(q)
     settled = (await q.counts())["waiting-children"] == 0
     assert settled, "a flow never settled -> " + await _settle_diagnostic(q)
+
+
+# ---- removal without a readable state ----------------------------------------------
+
+# Every collection REMOVE_JOB sweeps when a job's `state` cannot say where it lives.
+_SWEPT_ZSETS = (
+    "prioritized",
+    "delayed",
+    "completed",
+    "failed",
+    "waiting_children",
+    "held",
+    "cancelled",
+)
+
+
+async def test_removing_a_job_with_no_state_sweeps_every_collection(q):
+    """Covers a hash corrupted by hand: with its `state` field gone, removal cannot
+    know where the job lives and has to take it out of every collection, or a stray
+    id outlives its hash and is handed to a worker or listed with nothing behind it.
+    The id is planted in all of them so each sweep step is on the hook."""
+    job = await q.add("j", {})
+    await q.redis.hdel(q.keys.job(job.id), "state")
+    for name in _SWEPT_ZSETS:
+        await q.redis.zadd(getattr(q.keys, name), {job.id: 1})
+    await q.redis.lpush(q.keys.active, job.id)
+
+    assert await q.remove_job(job.id) is True
+
+    present = {
+        name
+        for name in _SWEPT_ZSETS
+        if await q.redis.zscore(getattr(q.keys, name), job.id) is not None
+    }
+    if job.id in await q.redis.lrange(q.keys.active, 0, -1):
+        present.add("active")
+    assert present == set()

@@ -10,6 +10,7 @@ import time
 import pytest
 from redis.exceptions import ResponseError
 
+import toro.queue
 from toro import FlowChild, Queue, Worker, scripts
 
 PREFIX = "torotest"
@@ -594,3 +595,50 @@ async def test_a_removal_with_no_clock_changes_nothing(q):
     assert await _state(q, behind.id) == "held"  # and nobody was handed the key
     assert await q.redis.get(q.keys.concurrency("k")) == holder.id
     assert await q.redis.zrange(q.keys.held_for("k"), 0, -1) == [behind.id]
+
+
+async def test_a_job_released_when_it_is_due_goes_to_the_queue(q, monkeypatch):
+    """CK-003: a job with no delay handed the key in the same millisecond it was added
+    is due, not early. Treated as early it is parked in `delayed` for nothing, and
+    waits on the promote sweep instead of a worker."""
+    monkeypatch.setattr(toro.queue, "_now_ms", lambda: 1_700_000_000_000)
+    holder = await q.add("holder", {}, concurrency_key="k")
+    behind = await q.add("behind", {}, concurrency_key="k")
+
+    assert await q.remove_job(holder.id) is True
+
+    assert await _state(q, behind.id) == "wait"
+    assert behind.id in await q.redis.zrange(q.keys.prioritized, 0, -1)
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == []
+
+
+async def test_a_released_job_with_time_left_is_delayed(q):
+    """CK-003: a delayed job handed the key before its delay is up goes back to
+    `delayed` and says so. Left reading `held`, it is listed as waiting on a key it
+    already holds, and a cancel looks for it in the held set and misses the delayed
+    one."""
+    holder = await q.add("holder", {}, concurrency_key="k")
+    behind = await q.add("behind", {}, delay=60_000, concurrency_key="k")
+
+    assert await q.remove_job(holder.id) is True
+
+    assert (await q.get_job(behind.id)).state == "delayed"
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [behind.id]
+    assert await q.cancel_job(behind.id) is True
+    assert await q.redis.zrange(q.keys.delayed, 0, -1) == []
+
+
+async def test_a_released_occurrence_is_due_at_its_own_time(q):
+    """CK-005: an occurrence held on a key goes back to `delayed` at the time its
+    schedule gave it. Its stored delay is measured from its creation; one measured
+    from the epoch would park it decades out."""
+    holder = await q.add("holder", {}, concurrency_key="k")
+    await q.add_scheduler("tick", every=60_000, concurrency_key="k")
+    when = int(await q.redis.zscore(q.keys.repeat, "tick"))
+    occurrence = f"repeat:tick:{when}"
+    assert await _state(q, occurrence) == "held"
+
+    assert await q.remove_job(holder.id) is True
+
+    assert await _state(q, occurrence) == "delayed"
+    assert await q.redis.zscore(q.keys.delayed, occurrence) == when

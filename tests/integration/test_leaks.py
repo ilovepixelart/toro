@@ -7,6 +7,8 @@ background tasks. The fuzzer checks orphans mid-run; this pins the end state.
 import asyncio
 import contextlib
 
+import pytest
+
 from toro import FlowChild as c  # noqa: N813
 from toro import Queue, Worker
 from toro.job import Job
@@ -76,6 +78,42 @@ async def test_failed_then_autoremoved_leaves_no_keys(q):
     assert await _leaked_keys(q) == []
 
 
+@pytest.mark.parametrize(
+    ("succeed", "opts"),
+    [(True, {}), (False, {"attempts": 1}), (False, {"attempts": 3, "backoff": 5000})],
+    ids=["completed", "failed", "retry-with-backoff"],
+)
+async def test_a_retained_finish_leaves_no_lock(q, succeed, opts):
+    """The finish script drops the lock itself. Without that, a job kept in its state
+    set holds a lock key nothing renews or deletes until it expires."""
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+    job = await q.add("j", {}, **opts)
+
+    loaded = await w._acquire()
+    assert await q.redis.exists(q.keys.lock(job.id)) == 1
+    claimed = Job.from_hash(loaded[0], loaded[1])
+    if succeed:
+        await w._finish_completed(claimed, {"ok": 1})
+    else:
+        await w._finish_failed(claimed, RuntimeError("boom"))
+
+    assert await q.redis.exists(q.keys.job(job.id)) == 1  # retained
+    assert await q.redis.exists(q.keys.lock(job.id)) == 0
+
+
+async def test_a_cancelled_running_job_leaves_no_lock(q):
+    """Committing a cancellation drops the lock, as every other finish does."""
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+    job = await q.add("j", {})
+    loaded = await w._acquire()
+    assert await q.cancel_job(job.id) is True  # running: only asks the worker to stop
+
+    await w._finish_cancelled(Job.from_hash(loaded[0], loaded[1]))
+
+    assert await q.redis.hget(q.keys.job(job.id), "state") == "cancelled"
+    assert await q.redis.exists(q.keys.lock(job.id)) == 0
+
+
 # ---- a whole flow leaves nothing behind --------------------------------------------
 
 
@@ -126,6 +164,28 @@ async def test_roots_queries_leave_no_scratch_key(q):
     await q.roots_counts()
 
     # ZDIFFSTORE writes the scratch then DELs it inside the same atomic script
+    assert await q.redis.exists(q.keys.roots_scratch) == 0
+
+
+async def test_a_roots_page_leaves_no_scratch_key(q):
+    """A page of roots on its own: the state holds a root, so the diff writes the
+    scratch, and nothing after this call would clear it."""
+    await q.add_flow("p", {}, children=[c("a", {})])
+    await q.add("solo", {})
+
+    total, roots = await q.get_jobs_roots("wait", 0, 10)
+
+    assert (total, [j.name for j in roots]) == (1, ["solo"])
+    assert await q.redis.exists(q.keys.roots_scratch) == 0
+
+
+async def test_roots_counts_leave_no_scratch_key_after_the_last_state(q):
+    """`cancelled` is the last state counted, so a cancelled root is what leaves the
+    scratch written at the end of the call."""
+    job = await q.add("doomed", {})
+    assert await q.cancel_job(job.id) is True
+
+    assert (await q.roots_counts())["cancelled"] == 1
     assert await q.redis.exists(q.keys.roots_scratch) == 0
 
 

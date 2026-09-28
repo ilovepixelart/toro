@@ -345,6 +345,23 @@ async def test_completed_flow_counts_once_with_duration(q, run_worker, run_until
     assert pcts["p50"] > 0
 
 
+async def test_flow_duration_is_the_roots_wall_clock_since_enqueue(q, run_worker, run_until):
+    """The flow histogram records root finish minus the root's enqueue time. Reading
+    that as zero, or adding the two timestamps, still lands a count in some bucket,
+    so only a median in the band of the real wall clock tells them apart."""
+
+    async def proc(job):
+        if job.name == "leaf":
+            await asyncio.sleep(0.1)
+
+    async with run_worker(q, proc):
+        await q.add_flow("report", {}, children=[c("leaf", {})])
+        assert await run_until(lambda: _count(q, "completed", 2))
+
+    p50 = (await q.flow_percentiles(minutes=2))["p50"]
+    assert 50 < p50 < 10_000, p50  # ~100ms flow: not bucket 0, not the top bucket
+
+
 async def test_nested_flow_counts_once_at_the_root(q, run_worker, run_until):
     async with run_worker(q, _noop):
         # root -> mid -> leaf: two interior parents, but still ONE flow
@@ -383,6 +400,37 @@ async def test_parent_processor_failure_counts_one_flow_failed(q, run_worker, ru
     points = await q.flow_metrics(minutes=2)
     assert sum(p["failed"] for p in points) == 1
     assert sum(p["completed"] for p in points) == 0  # the flow did NOT complete
+
+
+async def test_failed_job_duration_is_its_processing_time(q, run_worker, run_until):
+    """A terminal failure records processedOn to now as its duration. Taking the
+    start as now records 0 ms; adding the timestamps records a date's worth."""
+
+    async def slow_boom(job):
+        await asyncio.sleep(0.05)
+        raise RuntimeError("boom")
+
+    async with run_worker(q, slow_boom):
+        await q.add("m", {}, attempts=1)
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    ms = sum(p["ms"] for p in await q.metrics(minutes=2))
+    assert 40 <= ms < 10_000, ms  # one ~50ms attempt
+
+
+async def test_regular_job_failure_records_no_flow_failure(q, run_worker, run_until):
+    """Only a flow root (a job with children and no parent) counts as a failed flow;
+    a plain job failing for good is a job failure, not a flow failure."""
+
+    async def boom(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, boom):
+        await q.add("solo", {}, attempts=1)
+        assert await run_until(lambda: _count(q, "failed", 1))
+
+    points = await q.flow_metrics(minutes=2)
+    assert sum(p["failed"] for p in points) == 0
 
 
 async def test_regular_jobs_record_no_flow_metrics(q, run_worker, run_until):
@@ -477,6 +525,25 @@ async def test_the_per_name_breakdown_stops_at_1024_fields(q, fields_before, cou
         await q.redis.eval(lua, 1, base, now)
         assert (await q.redis.hget(bucket, "completed:report") is not None) is counted
         assert await q.redis.hget(f"{base}totals", "completed") == "1"
+    finally:
+        await q.redis.delete(bucket, f"{base}totals")
+
+
+async def test_a_zero_duration_writes_no_per_name_duration_field(q):
+    """A finish with no measurable duration adds nothing to `ms:<name>`, as it adds
+    nothing to the queue-level `ms`. Writing the zero would still create the field,
+    one more per name in a bucket whose field count is capped."""
+    base = f"{PREFIX}:zerodur:"
+    now = 60_000 * 7
+    bucket = f"{base}metrics:{now}"
+    lua = (
+        scripts._LIB
+        + '\nrecordMetrics(KEYS[1], "completed", tonumber(ARGV[1]), 0, 60000, "report")'
+    )
+    try:
+        await q.redis.eval(lua, 1, base, now)
+        assert await q.redis.hget(bucket, "completed:report") == "1"
+        assert await q.redis.hget(bucket, "ms:report") is None
     finally:
         await q.redis.delete(bucket, f"{base}totals")
 

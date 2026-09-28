@@ -153,6 +153,48 @@ async def test_count_and_age_trims_share_one_budget(q):
     assert await q.redis.zcard(q.keys.completed) == n + 1 - 1000
 
 
+async def test_an_age_bound_keeps_what_finished_within_it(q):
+    """An age bound trims what finished BEFORE `now - age`: the job that just finished
+    is inside it and stays. A cutoff in the future would trim the job with itself."""
+    await _finish_one(q, remove_on_complete={"age": 3600})
+
+    kept = await q.redis.zrange(q.keys.completed, 0, -1)
+    assert len(kept) == 1
+    assert await q.redis.exists(q.keys.job(kept[0])) == 1
+
+
+async def test_an_age_bound_of_zero_trims_what_finished_before(q):
+    """An age of 0 is a bound (keep nothing older than now), not "no bound": the job
+    finished a day ago goes, the one finishing now is not older than now and stays."""
+    await _seed_finished(q, "completed", 1)
+
+    await _finish_one(q, remove_on_complete={"age": 0})
+
+    assert await q.redis.zcard(q.keys.completed) == 1
+    assert not await q.redis.exists(q.keys.job("completed0"))
+
+
+async def test_a_count_of_zero_with_an_age_is_not_remove_at_once(q):
+    """`{"count": 0, "age": 0}` bounds by both: the job is recorded, and only a later
+    finish, once it is older than now, trims it. Only `count: 0` with no age (or `True`)
+    removes the job the moment it finishes."""
+    await _finish_one(q, remove_on_complete={"count": 0, "age": 0})
+
+    kept = await q.redis.zrange(q.keys.completed, 0, -1)
+    assert len(kept) == 1
+    assert await q.redis.exists(q.keys.job(kept[0])) == 1
+
+
+async def test_a_count_of_zero_beside_an_age_bounds_by_age_only(q):
+    """A count of 0 alongside an age trims by age alone: nothing here is an hour old,
+    so both jobs stay. Counting would keep none, the job just finished included."""
+    await _finish_one(q)
+
+    await _finish_one(q, remove_on_complete={"count": 0, "age": 3600})
+
+    assert await q.redis.zcard(q.keys.completed) == 2
+
+
 async def _flaky(job):
     if job.name == "boom":
         raise RuntimeError(job.name)
