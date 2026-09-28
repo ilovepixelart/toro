@@ -101,7 +101,8 @@ events channel:
   16 KiB travels inside the event, as the JSON text the job's hash stores, so the
   waiter needs no second round trip and gets exactly what the processor returned; a
   larger one is read back from the job's hash instead, which is where it was written
-  either way.
+  either way. A job that removes itself on completion has no hash left to read, so
+  its result travels in the event whatever its size.
 - **A dashboard** (such as [matador](https://github.com/ilovepixelart/matador))
   subscribes to refresh live as state changes.
 

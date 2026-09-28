@@ -18,6 +18,8 @@ import sys
 
 import pytest
 
+from toro import scripts
+
 BIG = 2 * 1024 * 1024  # bigger than anything that belongs in an event
 PREFIX = "torotest"
 
@@ -162,3 +164,21 @@ async def test_the_event_carries_the_stored_text_byte_for_byte(q, run_worker):
     stored = await q.redis.hget(q.keys.job(job.id), "returnvalue")
     events = [json.loads(m) for m in seen if '"completed"' in m]
     assert [e["resultJson"] for e in events if e["jobId"] == job.id] == [stored]
+
+
+async def test_a_large_result_reaches_its_waiter_after_the_job_removed_itself(
+    q, run_worker, run_until
+):
+    """Over the inline limit the waiter reads the value back from the job's hash, but
+    remove_on_complete=True deletes that hash in the same script: the waiter got None.
+    With nothing to read back, the result travels with the event however large."""
+    big = {"blob": "x" * (scripts.MAX_INLINE_RESULT_BYTES + 1)}
+
+    async def proc(job):
+        return big
+
+    job = await q.add("big", {}, remove_on_complete=True)
+    waiting = asyncio.create_task(q.result(job.id, timeout=20))
+    assert await run_until(lambda: job.id in q._result_waiters)  # subscribed before any run
+    async with run_worker(q, proc):
+        assert await waiting == big
