@@ -243,6 +243,8 @@ class Worker:
         self._processed = 0
         self._failed = 0
         self._cancelled = 0
+        # Background loops in a failure episode: named so each one warns once.
+        self._failing: set[str] = set()
         self._current: set[str] = set()
         # The processor task of each running job, so a cancellation can reach it, and
         # job id -> (its processor's task, the claim it is running). The claim fences
@@ -284,6 +286,21 @@ class Worker:
                 # A user callback must never hurt the worker: the job outcome is
                 # already committed by the time events fire, so log and move on.
                 logger.exception("%r event handler raised", event)
+
+    def _loop_failed(self, what: str, exc: Exception) -> None:
+        """One warning per failure episode: a loop retries every interval, and a Redis
+        outage would otherwise fill the log at that rate. Silence is not an option
+        either: a worker whose sweeps had failed for an hour looked healthy.
+        """
+        if what in self._failing:
+            return
+        self._failing.add(what)
+        logger.warning("%s failed and is retried every interval: %r", what, exc)
+
+    def _loop_recovered(self, what: str) -> None:
+        if what in self._failing:
+            self._failing.discard(what)
+            logger.info("%s recovered", what)
 
     async def run(self) -> None:
         """Start processing until stop() is called. Awaitable forever."""
@@ -411,8 +428,14 @@ class Worker:
     async def _heartbeat_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.heartbeat_interval / 1000)
-            with contextlib.suppress(Exception):
+            try:
                 await self._write_heartbeat()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._loop_failed("the heartbeat", exc)
+            else:
+                self._loop_recovered("the heartbeat")
 
     async def _write_heartbeat(self) -> None:
         """Flush this worker's presence record and register it as live."""
@@ -1017,8 +1040,10 @@ class Worker:
                 await self._resume_orphaned_schedules()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # pragma: no cover - best-effort background sweep
-                pass
+            except Exception as exc:
+                self._loop_failed("the delayed-job sweep", exc)
+            else:
+                self._loop_recovered("the delayed-job sweep")
             await asyncio.sleep(1.0)
 
     async def _resume_orphaned_schedules(self) -> None:
@@ -1047,8 +1072,10 @@ class Worker:
                 failed, recovered = await self.check_stalled()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # pragma: no cover - best-effort background sweep
+            except Exception as exc:
+                self._loop_failed("the stalled-job sweep", exc)
                 continue
+            self._loop_recovered("the stalled-job sweep")
             for job_id in recovered:
                 self._emit("stalled", job_id)
             for job_id in failed:
