@@ -1085,3 +1085,29 @@ async def test_a_run_that_lost_its_lock_cannot_commit_over_its_own_workers_rerun
 async def _completed_with(q, job_id: str, value: str) -> bool:
     job = await q.get_job(job_id)
     return job is not None and job.state == "completed" and job.returnvalue == value
+
+
+async def _stall(q, job_id: str) -> None:
+    """A worker claimed the job and died: in `active`, marked active, no lock."""
+    await q.redis.zrem(q.keys.prioritized, job_id)
+    await q.redis.hset(q.keys.job(job_id), "state", "active")
+    await q.redis.rpush(q.keys.active, job_id)
+
+
+async def test_a_retried_job_gets_a_fresh_stall_budget(q):
+    """Retrying a job that failed for stalling is a decision to run it again, with
+    max_stalled_count stalls to spend like any fresh run. Kept, the old count failed
+    it again at its very next stall."""
+    job = await q.add("x", {})
+    w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)  # max_stalled_count=1
+    for _ in range(2):  # the first stall is recovered, the second fails it
+        await _stall(q, job.id)
+        await w.check_stalled(throttle_ms=0)  # mark
+        await w.check_stalled(throttle_ms=0)  # recover or fail
+    assert (await q.get_job(job.id)).state == "failed"
+
+    assert await q.retry_job(job.id) is True
+    await _stall(q, job.id)
+    await w.check_stalled(throttle_ms=0)  # mark
+
+    assert await w.check_stalled(throttle_ms=0) == ([], [job.id])  # recovered, not failed
