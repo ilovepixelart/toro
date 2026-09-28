@@ -23,7 +23,7 @@ A vocabulary map, and an honest list of what has no equivalent here.
 | `rate_limit="10/s"` | `rate_limit={"max": 10, "duration": 1000}`, queue-wide across every worker |
 | priority queues, `x-max-priority` | `priority=` on the job, one global order |
 | unique task, `task_id` | `job_id=` for idempotency, `deduplication={"id", "ttl"}` for a throttle window |
-| flower, rq-dashboard, bull-board | [matador](https://github.com/ilovepixelart/matador) |
+| a separate monitoring dashboard | [matador](https://github.com/ilovepixelart/matador) |
 
 ## What has no equivalent
 
