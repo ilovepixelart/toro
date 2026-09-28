@@ -64,6 +64,10 @@ async def test_a_reply_that_times_out_does_not_run_the_script_twice(q):
     port = proxy.sockets[0].getsockname()[1]
     conn = connect(f"redis://localhost:{port}", blocking_timeout=0.1)
     proxied = Queue(q.name, prefix=PREFIX, connection=conn)
+    # Cached first: an EVALSHA the server answers NOSCRIPT enqueues nothing, and the
+    # proxy would swallow that reply just the same, so the file run alone (or after
+    # SCRIPT FLUSH) would see one timeout and zero jobs.
+    await q.redis.script_load(scripts.ADD_JOB)
     try:
         with pytest.raises(RedisTimeoutError):
             await proxied.add("once", {})

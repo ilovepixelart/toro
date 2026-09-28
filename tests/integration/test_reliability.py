@@ -798,6 +798,9 @@ async def test_zombie_worker_recovered_and_completed_once(q, run_until):
     # the zombie wakes (~3s in) and tries to commit
     assert await run_until(lambda: lost, timeout=10), "the zombie's late finish was not rejected"
     assert await q.redis.zcard(q.keys.completed) == 1  # still exactly one
+    # and nothing ran the job a second time meanwhile (the same id would keep zcard at 1)
+    assert seen.count("B") == 1
+    assert len(completed) == 1
 
     await zombie.stop()
     await healthy.stop()
@@ -950,9 +953,10 @@ async def test_a_job_outliving_its_lock_duration_keeps_the_lock_by_renewing(
     q, run_worker, run_until
 ):
     """lock_duration bounds a silent worker, not a long job: renewals every
-    lock_renew_time keep the lock, so a job running over three lock durations still
+    lock_renew_time keep the lock, so a job running well past its lock duration still
     commits. A renewal misread as a lost lock stops renewing, the lock lapses and the
-    finish is dropped."""
+    finish is dropped. The lock is long enough that one stalled loop turn between two
+    renewals cannot lapse it by itself."""
 
     async def proc(job):
         await asyncio.sleep(1)  # the job's own work, over three lock durations
@@ -961,7 +965,7 @@ async def test_a_job_outliving_its_lock_duration_keeps_the_lock_by_renewing(
     completed: list[str] = []
     lost: list[str] = []
     async with run_worker(
-        q, proc, lock_duration=300, lock_renew_time=100, stalled_interval=0
+        q, proc, lock_duration=600, lock_renew_time=100, stalled_interval=0
     ) as worker:
         worker.on("completed", lambda j, r: completed.append(j.id))
         worker.on("lock-lost", lost.append)
