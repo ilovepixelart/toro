@@ -85,3 +85,11 @@ def test_the_readme_and_the_docs_agree_on_what_this_is():
     readme = (ROOT / "README.md").read_text()
     assert "docs" in readme
     assert INDEX.read_text().count("README") >= 1
+
+
+def test_a_1_0_release_does_not_call_itself_alpha():
+    """From 1.0 the API is a promise, and PyPI shows the development-status
+    classifier beside the version: 1.0.0 went out still marked Alpha."""
+    assert int(_version().split(".")[0]) >= 1
+    status = re.findall(r'"Development Status :: ([^"]+)"', (ROOT / "pyproject.toml").read_text())
+    assert status == ["5 - Production/Stable"], status
