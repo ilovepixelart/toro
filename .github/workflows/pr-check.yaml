@@ -14,11 +14,12 @@ on:
 permissions:
   contents: read
 
-# A new push to the same PR supersedes the previous run. A push to main never cancels
-# the previous merge's run: each merge commit needs a green run of its own, and a
-# release is tagged from one.
+# A new push to the same PR supersedes the previous run. A push to main gets a group
+# of its own: each merge commit needs a green run of its own (a release is tagged from
+# one), and a group shared by main's pushes keeps at most one run queued, so three
+# merges in two minutes left the middle commit with a cancelled run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
