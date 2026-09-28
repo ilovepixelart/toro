@@ -76,7 +76,7 @@ host (machine)
 └── process (pid)
     └── worker        (a Worker instance, unique id)   ← "live"
         └── slots     (concurrency async loops)        ← "slots"
-            └── jobs   (one per slot at a time)
+            └── jobs  (one per slot at a time)
 ```
 
 Because slots are `asyncio` tasks sharing one event loop (not threads or
