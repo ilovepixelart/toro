@@ -836,3 +836,97 @@ async def test_flow_progress_counts_direct_children_only(q, run_worker, run_unti
 
     # root has ONE direct child (mid), which completed -> (1, 0), not 2
     assert (await q.flow_progress([root.id]))[root.id] == (1, 0, 0)
+
+
+async def test_retry_flow_waits_for_a_continue_child_it_retries(q, run_worker, run_until):
+    """A parent whose `continue` child failed, and which then failed in its own
+    processor, has an empty barrier: every child settled. Retrying the flow retries
+    both, and the parent must wait for the child again rather than rerun beside it
+    on the results it had last time."""
+    fail = {"bad": True, "report": True}
+    seen: list[dict] = []
+    child_rerunning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "report":
+            seen.append(await job.children_results())
+        if job.name == "bad" and not fail["bad"]:
+            child_rerunning.set()
+            await release.wait()  # the parent gets every chance to run first
+        if fail[job.name]:
+            raise RuntimeError(f"{job.name} fails")
+        return "fixed"
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("bad", {}, on_fail="continue")])
+        assert await run_until(_count_is(q, "failed", 2))  # the child, then the parent
+
+        fail = {"bad": False, "report": False}
+        assert await q.retry_flow(parent.id) == 2
+        assert await run_until(child_rerunning.is_set)
+        release.set()
+        assert await run_until(_count_is(q, "completed", 2))
+
+    child_id = (await q.get_job(parent.id)).children_ids[0]
+    assert seen[-1] == {child_id: "fixed"}, seen
+
+
+async def test_retry_all_failed_waits_for_a_continue_child_it_retries(q, run_worker, run_until):
+    """The same flow recovered through retry_all_failed, which retries each failed
+    job on its own: the parent still waits for the child it failed beside."""
+    fail = {"bad": True, "report": True}
+    seen: list[dict] = []
+    child_rerunning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def proc(job):
+        if job.name == "report":
+            seen.append(await job.children_results())
+        if job.name == "bad" and not fail["bad"]:
+            child_rerunning.set()
+            await release.wait()  # the parent gets every chance to run first
+        if fail[job.name]:
+            raise RuntimeError(f"{job.name} fails")
+        return "fixed"
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("bad", {}, on_fail="continue")])
+        assert await run_until(_count_is(q, "failed", 2))
+
+        fail = {"bad": False, "report": False}
+        assert await q.retry_all_failed() == 2
+        assert await run_until(child_rerunning.is_set)
+        release.set()
+        assert await run_until(_count_is(q, "completed", 2))
+
+    child_id = (await q.get_job(parent.id)).children_ids[0]
+    assert seen[-1] == {child_id: "fixed"}, seen
+
+
+async def test_a_retried_parent_does_not_wait_on_a_cancelled_child(q, run_worker, run_until):
+    """A cancelled child was stopped on purpose and is never retried, so a parent
+    retried after it runs at once instead of parking on a child that cannot settle."""
+    release = asyncio.Event()
+    runs: list[str] = []
+
+    async def proc(job):
+        runs.append(job.name)
+        if job.name == "slow":
+            await release.wait()
+        if job.name == "report" and runs.count("report") == 1:
+            raise RuntimeError("report fails")
+        return "ok"
+
+    async with run_worker(q, proc, concurrency=2):
+        parent = await q.add_flow("report", {}, children=[c("slow", {}, on_fail="continue")])
+        child_id = (await q.get_job(parent.id)).children_ids[0]
+        assert await run_until(lambda: "slow" in runs)
+        assert await q.cancel_job(child_id)
+        assert await run_until(_count_is(q, "failed", 1))  # the parent, run without it
+
+        assert await q.retry_flow(parent.id) == 1
+        assert await run_until(_count_is(q, "completed", 1))  # reran without waiting
+        release.set()
+
+    assert (await q.get_job(child_id)).state == "cancelled"

@@ -15,6 +15,7 @@ from typing import Any, ParamSpec, TypedDict, TypeVar, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
+from redis.exceptions import WatchError
 
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
@@ -717,9 +718,32 @@ class Queue:
         # redis-py's hset overloads don't resolve a plain dict[str, str] mapping.
         await self.redis.hset(self.keys.scheduler(scheduler_id), mapping=template)  # ty: ignore[no-matching-overload]
         when = next_run(_now_ms(), every=every, cron=cron)
+        previous = await self.redis.zscore(self.keys.repeat, scheduler_id)
         await self.redis.zadd(self.keys.repeat, {scheduler_id: when})
+        if previous is not None and int(previous) != when:
+            await self._drop_pending_occurrence(f"repeat:{scheduler_id}:{int(previous)}")
         await self._enqueue_occurrence(scheduler_id, when, template)
         return scheduler_id
+
+    async def _drop_pending_occurrence(self, job_id: str) -> None:
+        """Remove an occurrence the schedule no longer produces, if it has not started.
+
+        Checked and removed in one WATCHed transaction: a worker claiming it in
+        between writes its hash, which aborts the removal, and a run already under
+        way is left to finish rather than killed mid-flight.
+        """
+        sha = await self.redis.script_load(scripts.REMOVE_JOB)  # ensure loaded for EVALSHA
+        keys = self._remove_job_keys()
+        async with self.redis.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(self.keys.job(job_id))
+                if await pipe.hget(self.keys.job(job_id), "state") not in ("delayed", "held"):
+                    return
+                pipe.multi()
+                pipe.evalsha(sha, len(keys), *keys, job_id, _now_ms())
+                await pipe.execute()
+            except WatchError:
+                return  # it started meanwhile
 
     async def _enqueue_occurrence(
         self, scheduler_id: str, when: int, template: dict[str, str]
