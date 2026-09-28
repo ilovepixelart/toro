@@ -118,7 +118,8 @@ The scripts share a small library of routines:
 |---|---|
 | `priorityScore` | Packs `(PRIORITY_OFFSET - priority) * 2^32 + seq` for the prioritized ZSET. |
 | `enqueue` | Adds a job to `prioritized` at its score and arms the marker. |
-| `lockAndLoad` | Sets the lock token and loads the hash for a just-claimed id. |
+| `lockAndLoad` | Sets the lock token and loads the hash for a just-claimed id, stamping `processedOn`. |
+| `claimedBy` | Whether a finish comes from the run that holds the job: the hash's `processedOn` equals the claim the worker passes. The token alone cannot tell a stale run from the same worker's re-run of the id. |
 | `acquireNext` | Pops the top prioritized job into `active` and locks it, honoring the rate limit and the global concurrency cap. |
 | `requireCap` | Reads the cap argument, raising when it is missing. Called before a script's first write. |
 | `wakeIfWaiting` | Arms the marker when jobs are waiting: a slot was freed without a claim. |
@@ -158,7 +159,8 @@ Scripts signal outcomes with sentinels the worker decodes:
 - `RL_SENTINEL` (`"__rl__"`) - a claim hit the rate limiter; the second value is
   ms until a token frees, so the worker waits instead of busy-spinning.
 - `LOCK_LOST` (`-2`) - a finish ran but the worker no longer held the lock (the
-  job was reclaimed); the result is dropped.
+  job was reclaimed), or holds it for a later run of the same job (a stale run on
+  the worker that re-claimed it); the result is dropped.
 - `NOT_ACTIVE` (`-3`) - a finish ran but the job was no longer in `active`.
 - `OUTCOME_FAILED` (`1`) vs `0` - `MOVE_TO_FAILED` telling the worker whether the
   job terminally failed or will retry.
