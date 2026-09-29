@@ -1191,6 +1191,7 @@ class Queue:
                                 "concurrency": int(h.get("concurrency", 0)),
                                 "processed": int(h.get("processed", 0)),
                                 "failed": int(h.get("failed", 0)),
+                                "cancelled": int(h.get("cancelled", 0)),
                                 "started": int(h.get("started", 0)),
                                 "last_seen": int(h.get("heartbeat", 0)),
                                 "current": json.loads(h.get("current", "[]")),

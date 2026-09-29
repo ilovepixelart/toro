@@ -116,6 +116,7 @@ async def test_lost_worker_is_recorded_when_pruned(q):
             "concurrency": 3,
             "processed": 99,
             "failed": 5,
+            "cancelled": 2,
             "current": '["210", "211"]',  # it was mid-flight on these when it vanished
         },
     )
@@ -128,6 +129,8 @@ async def test_lost_worker_is_recorded_when_pruned(q):
     assert rec["host"] == "node-7"
     assert rec["pid"] == 4242
     assert rec["processed"] == 99
+    # the same shape as a graceful stop's record: its counts include cancellations
+    assert (rec["failed"], rec["cancelled"]) == (5, 2)
     # the death record froze WHAT IT WAS RUNNING - the whole point of the post-mortem
     assert rec["current"] == ["210", "211"]
     assert rec["last_seen"] < rec["at"]  # last heartbeat vs when the sweep detected it
