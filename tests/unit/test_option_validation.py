@@ -7,9 +7,23 @@ enqueued, half a flow running while its caller was told the whole thing failed. 
 validation belongs where the value arrives.
 """
 
+import enum
+
 import pytest
 
 from toro import JobOptions
+
+
+class Delay(enum.IntEnum):
+    SLOW = 5000
+
+
+def test_an_int_subclass_is_stored_as_a_plain_int():
+    """An IntEnum passes as a whole number, and redis-py sends an int subclass as its
+    repr (`<Delay.SLOW: 5000>`), which the add script's tonumber() reads as nothing
+    after it has written the job hash: an id spent on a hash in no state set. An
+    option is a plain int whatever it arrived as."""
+    assert type(JobOptions(delay=Delay.SLOW).delay) is int
 
 
 @pytest.mark.parametrize(

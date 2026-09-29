@@ -122,7 +122,9 @@ to a queue whose limits were never set; `set_limits()` with no arguments gives t
 queue limits of its own, none, and the workers' arguments no longer apply. Both limits
 are validated like every option: whole numbers of at least 1 (a whole float such as
 `60_000 / 2` is fine), and a string, a fraction or a bool raises `ValueError` where
-`rate_limit` used to coerce them.
+`rate_limit` used to coerce them. An option given as an int subclass (an `IntEnum`)
+is stored as a plain int: it used to reach Redis as the enum's repr, and `add()`
+failed after the job hash was written, on an id already spent.
 
 ## 1.0.2
 

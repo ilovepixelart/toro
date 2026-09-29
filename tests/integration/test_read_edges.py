@@ -6,6 +6,7 @@ job's wait from the moment it was added, not from the moment it could run.
 """
 
 import asyncio
+import enum
 
 from toro import Queue
 from toro.queue import _now_ms
@@ -71,3 +72,16 @@ async def test_latency_counts_from_when_a_delayed_job_could_first_run(q, run_wor
         since_add = _now_ms() - job.timestamp
     assert latency <= since_add - 400, (latency, since_add)  # the 500 ms delay is not lateness
     await asyncio.sleep(0)
+
+
+class _Delay(enum.IntEnum):
+    SLOW = 5000
+
+
+async def test_an_int_subclass_option_reaches_the_script_as_a_number(q):
+    """`delay=Delay.SLOW` passed validation as an int and went over the wire as the
+    enum's repr, so the add script wrote the job hash and then failed on the delay:
+    the caller got an error, the id was spent, and the hash sat in no state set."""
+    job = await q.add("later", {}, delay=_Delay.SLOW)
+    assert (await q.counts())["delayed"] == 1
+    assert (await q.get_job(job.id)).opts.delay == 5000
