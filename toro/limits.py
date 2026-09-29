@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from .job import _whole
+
 
 class RateLimit(TypedDict):
     """The queue-wide token bucket: ``{"max": N, "duration": ms}`` - at most N
@@ -33,22 +35,22 @@ def limit_fields(
 ) -> tuple[int, int, int]:
     """Validate the two limits and return them as the scripts read them: the cap, the
     rate's max and its duration, 0 for a limit that is not set.
+
+    Whole numbers of at least 1, like every other option (`_whole`): a string was
+    coerced, a fractional value truncated and a bool read as 1, and `set_limits`
+    then stored the coerced value for every worker on the queue.
     """
-    if rate_limit is not None and (
-        int(rate_limit.get("max", 0)) <= 0 or int(rate_limit.get("duration", 0)) <= 0
-    ):
-        raise ValueError("rate_limit needs {'max': positive, 'duration': positive ms}")
-    # bool is an int subclass, so it is rejected by name: True would silently mean 1.
-    if global_concurrency is not None and (
-        isinstance(global_concurrency, bool)
-        or not isinstance(global_concurrency, int)
-        or global_concurrency <= 0
-    ):
-        raise ValueError("global_concurrency needs a positive integer")
-    # int(): an int subclass (an IntEnum) would reach Redis as its repr, which Lua
-    # reads as no number at all.
+    # int(): an int subclass (an IntEnum) passes `_whole` and would reach Redis as its
+    # repr, which Lua reads as no number at all.
+    cap = (
+        0
+        if global_concurrency is None
+        else int(_whole(global_concurrency, "global_concurrency", minimum=1))
+    )
+    if rate_limit is None:
+        return cap, 0, 0
     return (
-        int(global_concurrency or 0),
-        int(rate_limit["max"]) if rate_limit else 0,
-        int(rate_limit["duration"]) if rate_limit else 0,
+        cap,
+        int(_whole(rate_limit.get("max"), "rate_limit max", minimum=1)),
+        int(_whole(rate_limit.get("duration"), "rate_limit duration (ms)", minimum=1)),
     )
