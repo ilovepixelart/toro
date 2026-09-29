@@ -202,6 +202,33 @@ async def test_a_held_job_handed_its_key_marks_when_it_is_due(q):
     assert await _wake_at(q) == waiting.timestamp + 60_000
 
 
+async def test_a_delayed_member_whose_hash_is_gone_is_dropped_not_resurrected(q):
+    """A `delayed` member with no hash behind it (an out-of-band delete) came back as
+    a stub job: the promotion's HSET created the hash, and the claim ran an empty job
+    that a finish then recorded. The member is dropped instead."""
+    await q.redis.zadd(q.keys.delayed, {"ghost": _now_ms() - 1000})
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+
+    assert await w._acquire() is None
+
+    assert await q.redis.exists(q.keys.job("ghost")) == 0
+    assert await q.redis.zcard(q.keys.delayed) == 0
+    assert await q.redis.zcard(q.keys.prioritized) == 0
+
+
+async def test_a_delayed_member_scored_below_zero_is_still_promoted(q):
+    """The promotion ranged from 0, so a member scored below it was never promoted,
+    while the head-of-set check kept answering it as the next due time: every idle
+    claim then blocked for the shortest wait and claimed again, for good."""
+    j = await q.add("x", {}, delay=60_000)
+    await q.redis.zadd(q.keys.delayed, {j.id: -1})
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+
+    loaded = await w._acquire()
+
+    assert loaded is not None and loaded[0] == j.id
+
+
 async def test_a_cancel_commit_promotes_what_is_due(q, run_worker, run_until):
     """Under a saturated cap the finish that frees the slot is the one moment a due
     delayed job can move. A cancel commit fetches nothing and promoted nothing, so

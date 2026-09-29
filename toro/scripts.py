@@ -124,12 +124,19 @@ end
 -- state: a concurrency key handed to the job later would park it for it again.
 local function promoteDue(base, prioritizedKey, pcKey, now)
   local delayedKey = base .. "delayed"
-  local due = redis.call("ZRANGEBYSCORE", delayedKey, 0, now, "LIMIT", 0, PROMOTE_BATCH)
+  -- From -inf, not 0: whatever is scored below now is due, and the head of the set
+  -- is what an empty claim answers with, so a member the range skipped would be
+  -- answered as due for good.
+  local due = redis.call("ZRANGEBYSCORE", delayedKey, "-inf", now, "LIMIT", 0, PROMOTE_BATCH)
   for _, jobId in ipairs(due) do
     redis.call("ZREM", delayedKey, jobId)
-    local priority = tonumber(redis.call("HGET", base .. jobId, "priority")) or 0
-    redis.call("HSET", base .. jobId, "state", "wait", "delay", 0)
-    redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
+    -- An id whose hash is gone is not a job (see releaseKey): the HSET below would
+    -- create it, and the claim would run an empty job that a finish then records.
+    if redis.call("EXISTS", base .. jobId) == 1 then
+      local priority = tonumber(redis.call("HGET", base .. jobId, "priority")) or 0
+      redis.call("HSET", base .. jobId, "state", "wait", "delay", 0)
+      redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
+    end
   end
 end
 -- A cancellation names the CLAIM it is meant for, not just the job: an id is free
