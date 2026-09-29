@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import threading
+import time
 
 import pytest
 
@@ -136,10 +138,10 @@ async def test_a_stopped_worker_can_be_run_again(q, run_until):
 
 async def test_cancelling_run_directly_ends_the_worker(q):
     """A framework that cancels its tasks on shutdown, or Ctrl-C under asyncio.run(),
-    cancels run() without stop(). The job in flight stays active for the stalled sweep,
-    as one cut off past stop()'s grace period does. On Python 3.10, which cannot tell a
-    task's own cancellation from one it asked for, the worker instead failed the job
-    with a reason of its own and went on claiming, so the cancellation never landed."""
+    cancels run() without stop(). The job in flight goes back to the queue, as one cut
+    off past stop()'s grace period does. On Python 3.10, which cannot tell a task's own
+    cancellation from one it asked for, the worker instead failed the job with a reason
+    of its own and went on claiming, so the cancellation never landed."""
     started = asyncio.Event()
 
     async def proc(job):
@@ -154,7 +156,7 @@ async def test_cancelling_run_directly_ends_the_worker(q):
         task.cancel()
         done, _ = await asyncio.wait({task}, timeout=3)  # not wait_for: see above
         assert task in done, "run() carried on after being cancelled"
-        assert (await q.get_job(job.id)).state == "active"  # left to the sweep, not failed
+        assert (await q.get_job(job.id)).state == "wait"  # handed back, not failed
     finally:
         # stop() first: it lowers the flag and cancels the loops whatever run() did, so
         # a run() that absorbed its cancellation can still end, and the wait is bounded.
@@ -162,3 +164,94 @@ async def test_cancelling_run_directly_ends_the_worker(q):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
+
+
+async def test_a_job_cut_off_past_the_grace_period_goes_straight_back_to_the_queue(q, run_until):
+    """A job whose processor stop() had to cancel sat locked in `active` until the
+    lock expired and a sweep recovered it, 60 to 90 s later, and that recovery spent
+    one of its stalls: at max_stalled_count=1 a job cut off by two deploys in a row was
+    failed for good. It now goes back to `wait` at once, nothing counted."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(30)
+
+    job = await q.add("long", {})
+    w = Worker(q.name, proc, prefix=PREFIX, stalled_interval=0, grace_period=0.2)
+    task = asyncio.create_task(w.run())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        await w.stop()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    fields = await q.redis.hgetall(q.keys.job(job.id))
+    assert fields["state"] == "wait"
+    assert "stalledCounter" not in fields and fields.get("attemptsMade", "0") == "0"
+    assert await q.redis.lrange(q.keys.active, 0, -1) == []
+    assert await q.redis.exists(q.keys.lock(job.id)) == 0
+    assert await q.redis.zscore(q.keys.prioritized, job.id) is not None  # claimable at once
+
+    done: list[str] = []
+    again = Worker(q.name, lambda j: done.append(j.id), prefix=PREFIX, stalled_interval=0)
+    task = asyncio.create_task(again.run())
+    try:
+        assert await run_until(lambda: done == [job.id], timeout=5)
+    finally:
+        await again.stop()
+        task.cancel()
+
+
+async def test_a_sync_job_cut_off_past_the_grace_period_keeps_its_lock(q, run_until):
+    """A thread cannot be taken back: the job stays claimed and locked while it runs
+    on, and the sweep recovers it once the lock lapses, as before."""
+    started = threading.Event()
+
+    def proc(job):
+        started.set()
+        time.sleep(1.5)
+
+    job = await q.add("blocking", {})
+    w = Worker(q.name, proc, prefix=PREFIX, stalled_interval=0, grace_period=0.2)
+    task = asyncio.create_task(w.run())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        await w.stop()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert await q.redis.hget(q.keys.job(job.id), "state") == "active"
+    assert await q.redis.lrange(q.keys.active, 0, -1) == [job.id]
+    assert await q.redis.exists(q.keys.lock(job.id)) == 1
+
+
+async def test_a_run_that_lost_its_lock_hands_nothing_back_at_shutdown(q):
+    """The release is token-guarded like a finish: a job taken over by another run
+    (its lock now carries another token) stays with that run, or two workers would
+    hold it at once."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(30)
+
+    job = await q.add("taken-over", {})
+    w = Worker(q.name, proc, prefix=PREFIX, stalled_interval=0, grace_period=0.2)
+    task = asyncio.create_task(w.run())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        await q.redis.set(q.keys.lock(job.id), "another-workers-token")  # taken over
+        await w.stop()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert await q.redis.hget(q.keys.job(job.id), "state") == "active"
+    assert await q.redis.lrange(q.keys.active, 0, -1) == [job.id]
+    assert await q.redis.get(q.keys.lock(job.id)) == "another-workers-token"

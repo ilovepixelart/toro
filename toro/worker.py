@@ -570,6 +570,7 @@ class Worker:
         self._move_to_completed = register(scripts.MOVE_TO_COMPLETED)
         self._move_to_failed = register(scripts.MOVE_TO_FAILED)
         self._move_to_cancelled = register(scripts.MOVE_TO_CANCELLED)
+        self._release_job = register(scripts.RELEASE_JOB)
         self._move_stalled = register(scripts.MOVE_STALLED)
         self._promote_delayed = register(scripts.PROMOTE_DELAYED)
         self._add_scheduled = register(scripts.ADD_SCHEDULED)
@@ -760,6 +761,12 @@ class Worker:
         asked = getattr(outer, "cancelling", None)
         stopping = asked() > 0 if asked is not None else not self._running
         if stopping:
+            if self._async_processor:
+                # The processor's task has unwound (awaiting it is what raised), so the
+                # job goes straight back to the queue. A sync processor's thread runs
+                # on and keeps the job; the sweep takes it later.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._release(job), 2.0)
             raise asyncio.CancelledError
         if expired:
             over = TimeoutError(
@@ -841,6 +848,28 @@ class Worker:
         self._cancelled += 1
         self._emit("cancelled", job)
         return None
+
+    async def _release(self, job: Job) -> None:
+        """Hand a job cut off by a shutdown back to the queue at once, its lock dropped.
+
+        Left in `active`, it waited out its lock and a sweep pass before running again,
+        and that recovery counted toward `max_stalled_count`: at the default of 1, a
+        job cut off by two deploys in a row was failed for good.
+        """
+        res = await self._release_job(
+            keys=[
+                self.keys.active,
+                self.keys.prioritized,
+                self.keys.job(job.id),
+                self.keys.lock(job.id),
+                self.keys.marker,
+                self.keys.base,
+                self.keys.pc,
+            ],
+            args=[job.id, self.token, _claim(job)],
+        )
+        if int(res) < 0:
+            await self._finish_lost(job.id)  # another run owns it: nothing to hand back
 
     async def _committed(
         self,
