@@ -280,3 +280,29 @@ async def test_a_cancel_whose_reply_was_lost_is_not_reported_lost(
         proxy.close()
     assert lost == []
     assert (await q.get_job(job.id)).state == "cancelled"
+
+
+async def test_a_failure_while_handling_a_job_is_not_logged_as_a_claim(
+    q, run_worker, run_until, caplog
+):
+    """Whatever escaped the handling of a claimed job (a finish given up past its
+    lease, a scheduler's mint) was logged as "a claim failed and is retried every
+    interval": the wrong step, and a retry the job does not get. It waits for the
+    stalled sweep, and the log says so."""
+    async with run_worker(q, lambda job: None, concurrency=1, stalled_interval=0) as w:
+        real = w._handle
+
+        async def broken(loaded):
+            w._handle = real  # once
+            raise RuntimeError("the finish could not be sent")
+
+        w._handle = broken
+        with caplog.at_level(logging.WARNING, logger="toro.worker"):
+            await q.add("j", {})
+            assert await run_until(lambda: "could not be sent" in caplog.text, timeout=5)
+
+    about = [
+        r.getMessage() for r in caplog.records if "waits for the stalled sweep" in r.getMessage()
+    ]
+    assert about, caplog.text
+    assert not any("a claim" in r.getMessage() for r in caplog.records), caplog.text
