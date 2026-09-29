@@ -163,7 +163,7 @@ def run_until():
 # ---- TCP proxies to Redis that lose a reply or a link, for the re-send paths ----
 
 
-async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379):
+async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379, command: bytes = b""):
     """A TCP proxy to Redis that drops the reply to the first EVALSHA of `sha`:
     the command runs on the server, and the client never hears back."""
     swallowed = {"done": False}
@@ -171,7 +171,14 @@ async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379):
     async def pipe(reader, writer, state, from_client):
         try:
             while data := await reader.read(65536):
-                if from_client and not swallowed["done"] and sha.encode() in data:
+                # `command` narrows the match: a pipeline asks SCRIPT EXISTS <sha> before
+                # it sends its EVALSHAs, and that reply is not the one to lose.
+                if (
+                    from_client
+                    and not swallowed["done"]
+                    and sha.encode() in data
+                    and command in data
+                ):
                     swallowed["done"] = True
                     state["swallow"] = True
                 elif not from_client and state.get("swallow"):
@@ -232,8 +239,9 @@ async def _drop_link_after_first(sha: str, upstream_port: int = 6379):
 @pytest.fixture
 def swallow_first_reply():
     """`proxy = await swallow_first_reply(sha)`: a proxy on a free port that lets the
-    first EVALSHA of `sha` through and drops its reply; `proxy.sockets[0]` has the port,
-    `proxy.close()` ends it."""
+    first command naming `sha` through and drops its reply; `command=b"EVALSHA"` skips
+    a pipeline's SCRIPT EXISTS probe. `proxy.sockets[0]` has the port, `proxy.close()`
+    ends it."""
     return _swallow_first_reply_to
 
 

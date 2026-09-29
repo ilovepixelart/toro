@@ -6,12 +6,15 @@ through, which is the half of the dual-write problem people actually hit.
 """
 
 import asyncio
+import hashlib
 from dataclasses import replace
 
 import pytest
+import redis.asyncio as aioredis
 from redis.asyncio.connection import Connection
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from toro import FlowChild, PartialFlushError
+from toro import FlowChild, PartialFlushError, Queue, scripts
 
 PREFIX = "torotest"
 
@@ -208,3 +211,31 @@ async def test_a_failed_flush_keeps_what_it_could_not_send(q):
 
     assert len(pending) == 2, "the buffer threw away what it could not send"
     assert (await q.counts())["wait"] == 0
+
+
+async def test_a_batch_flushed_again_after_a_lost_reply_adds_nothing_twice(q, swallow_first_reply):
+    """The pipeline's replies were lost: flush() raised and kept the batch, as it says
+    it does, and the caller flushed again. Each flush staged the calls afresh, with
+    fresh replay tokens, so the jobs the first flush had made were made again. The
+    token is minted when a call joins the batch, and a second flush replays it."""
+    sha = hashlib.sha1(scripts.ADD_JOB.encode()).hexdigest()  # noqa: S324 - Redis names scripts by SHA1
+    await q.redis.script_load(scripts.ADD_JOB)  # cached: the swallowed reply must be the add's own
+    proxy = await swallow_first_reply(sha, command=b"EVALSHA")  # the adds, not SCRIPT EXISTS
+    port = proxy.sockets[0].getsockname()[1]
+    conn = aioredis.from_url(f"redis://localhost:{port}", socket_timeout=0.5, decode_responses=True)
+    producer = Queue(q.name, prefix=PREFIX, connection=conn)
+    try:
+        batch = producer.pending()
+        batch.add("a", {})
+        batch.add("b", {})
+        with pytest.raises(RedisTimeoutError):
+            await batch.flush()
+        assert len(batch) == 2  # the batch stands: nothing could say what landed
+
+        await batch.flush()
+
+        assert (await q.counts())["wait"] == 2
+    finally:
+        await producer.close()
+        await conn.aclose()
+        proxy.close()

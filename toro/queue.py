@@ -323,6 +323,7 @@ class Queue:
         job_id: str | None,
         deduplication: Deduplication | None,
         opts: dict[str, Any],
+        token: str | None = None,
     ) -> _Staged:
         """Everything `add()` does except the round trip. Shared with `pending()`,
         which stages a batch and sends it in one.
@@ -387,7 +388,7 @@ class Queue:
                 dedup_id=dedup_id,
                 dedup_ttl=dedup_ttl,
                 concurrency_key=options.concurrency_key or "",
-                token=uuid.uuid4().hex,  # names this call: a re-sent one adds nothing
+                token=token or uuid.uuid4().hex,  # names this call: a re-send adds nothing
             ),
             build=build,
         )
@@ -414,7 +415,13 @@ class Queue:
         return staged.build(await staged.script(keys=staged.keys, args=staged.args))
 
     def _stage_flow(
-        self, name: str, data: Any, *, children: list[FlowChild], opts: dict[str, Any]
+        self,
+        name: str,
+        data: Any,
+        *,
+        children: list[FlowChild],
+        opts: dict[str, Any],
+        token: str | None = None,
     ) -> _Staged:
         """Everything `add_flow()` does except the round trip."""
         _job_name(name)
@@ -449,7 +456,7 @@ class Queue:
                 now,
                 json.dumps(tree),
                 scripts.METRICS_RETENTION_MS,
-                uuid.uuid4().hex,  # names this call: a re-sent one adds nothing
+                token or uuid.uuid4().hex,  # names this call: a re-send adds nothing
                 scripts.ADD_REPLAY_WINDOW_MS,
             ],
             build=build,
@@ -1690,9 +1697,12 @@ class PendingJobs:
         # caller fills in an id or scrubs a secret, and `Queue.add` encodes at the
         # call, so it snapshots. Holding the caller's object would send what it became.
         snapshot = copy.deepcopy(data)
+        # The replay token is minted here, not at flush: a flush that lost its replies
+        # keeps the batch, and the next flush must re-send the same calls, not new ones.
+        token = uuid.uuid4().hex
         self._calls.append(
             lambda: self._queue._stage_add(  # noqa: SLF001 - the queue's own staging
-                name, snapshot, job_id=job_id, deduplication=deduplication, opts=opts
+                name, snapshot, job_id=job_id, deduplication=deduplication, opts=opts, token=token
             )
         )
 
@@ -1701,9 +1711,10 @@ class PendingJobs:
     ) -> None:
         """Collect one flow. Same arguments as `Queue.add_flow`; nothing is sent yet."""
         snapshot, tree = copy.deepcopy(data), copy.deepcopy(children)  # as in `add`
+        token = uuid.uuid4().hex  # as in `add`
         self._calls.append(
             lambda: self._queue._stage_flow(  # noqa: SLF001 - the queue's own staging
-                name, snapshot, children=tree, opts=opts
+                name, snapshot, children=tree, opts=opts, token=token
             )
         )
 
@@ -1723,9 +1734,11 @@ class PendingJobs:
         enqueued. That raises `PartialFlushError`, naming what was sent, and leaves
         exactly what did not send in the buffer, so a retry cannot double anything.
 
-        A flush that never reaches Redis at all (a dead connection) keeps the whole
-        batch, because nothing can say how much of it landed: a retry may duplicate,
-        which is the direction an at-least-once queue errs in.
+        A flush that never hears back (a dead connection, a lost reply) keeps the whole
+        batch, because nothing can say how much of it landed. A second flush re-sends
+        the same calls, each with the replay token it was given when it joined the
+        batch, so a job the first flush made is answered, not made again, for as long
+        as the script remembers the call (ADD_REPLAY_WINDOW_MS).
         """
         calls, self._calls = self._calls, []
         if not calls:
@@ -1743,10 +1756,10 @@ class PendingJobs:
                 replies = await pipe.execute(raise_on_error=False)
         except BaseException:
             # The connection died somewhere in there and nothing can say how much of
-            # the batch landed. Keeping it means a retry may duplicate; dropping it
-            # means the jobs are gone with no record of what they were, after the
-            # transaction they belong to has committed. This queue is at-least-once
-            # by design, so duplicating beats losing.
+            # the batch landed. Kept, the next flush replays the same calls, and the
+            # scripts answer a call they already ran with the job it made; dropped, the
+            # jobs are gone with no record of what they were, after the transaction
+            # they belong to has committed.
             self._calls = calls + self._calls
             raise
         sent: list[Job] = []
