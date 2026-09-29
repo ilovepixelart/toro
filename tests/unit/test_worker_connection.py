@@ -15,6 +15,18 @@ async def _noop(job):
     return None
 
 
+def test_a_client_that_hands_back_bytes_is_refused():
+    """redis-py's default client returns bytes, and toro reads every reply as str: a
+    Worker on one ran each job with an empty name, no data and no cancel flag, and
+    never committed a finish, since its keys were built from a repr. A Queue on one
+    is as blind. Both refuse the client where it is handed over."""
+    raw = aioredis.from_url("redis://localhost:6379")
+    with pytest.raises(ValueError, match="decode_responses"):
+        Worker("q", _noop, connection=raw)
+    with pytest.raises(ValueError, match="decode_responses"):
+        Queue("q", connection=raw)
+
+
 def test_read_timeout_exceeds_the_blocking_pop_at_defaults():
     """redis-py 8 defaults socket_timeout to 5s, the same as block_timeout. Equal is
     not enough: the client gives up on the read as the server answers it. The value

@@ -98,7 +98,31 @@ def _whole(value: object, what: str, *, minimum: int = 0) -> int:
     if not isinstance(value, int) or value < minimum:
         msg = f"{what} must be a whole number >= {minimum}, not {value!r}"
         raise ValueError(msg)
-    return value
+    # A plain int: redis-py sends an int subclass (an IntEnum) as its repr, which the
+    # scripts' tonumber() reads as nothing after they have written.
+    return int(value)
+
+
+MAX_JOB_NAME_CHARS = 128
+
+
+def _job_name(name: object) -> str:
+    """Check a job name: a label a person reads and a metrics series is kept under,
+    not a place to put a payload or an id. Every entry point that stores a name (an
+    add, a flow node, a scheduler's template) checks it here.
+    """
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > MAX_JOB_NAME_CHARS
+        or any(ord(c) < 0x20 for c in name)
+    ):
+        msg = (
+            f"job name must be a non-empty string of at most {MAX_JOB_NAME_CHARS} "
+            f"characters with no control characters"
+        )
+        raise ValueError(msg)
+    return name
 
 
 def _backoff(value: Backoff) -> Backoff:

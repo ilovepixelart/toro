@@ -215,19 +215,20 @@ end
 -- its lock, and the run another of its slots re-claimed after the stalled sweep. The
 -- claim's processedOn (stamped below) tells the two apart, as the cancel message
 -- already does. "" skips the check.
--- A finish answers the same thing twice. A worker re-sends a finish whose reply was
--- lost in a Redis blip; the guards refuse the replay (the lock is gone), and the
--- worker could not tell "committed, reply lost" from "lock lost": it reported the
--- finish lost, and the job the first send fetched sat locked in `active` with nobody
--- running it until the sweep. So each finish records what it answered under the run
--- it belongs to (`fin:<token>:<job>:<claim>`), for as long as the lease it was sent
--- under, and a re-send is answered from that, with the fetched job while it is still
--- this worker's to run.
+-- A finish answers the same thing twice. A finish whose reply was lost in a Redis
+-- blip is re-sent, by the worker or by the client itself on a new connection; the
+-- guards refuse the replay (the lock is gone), and the worker could not tell
+-- "committed, reply lost" from "lock lost": it reported the finish lost, and the job
+-- the first send fetched sat locked in `active` with nobody running it until the
+-- sweep. So each finish records what it answered under the run it belongs to
+-- (`fin:<token>:<job>:<claim>`), for as long as the lease it was sent under, and a
+-- re-send is answered from that, with the fetched job while it is still this
+-- worker's to run. Every finish looks first: a re-send is not marked as one when the
+-- client sent it.
 local function finishMemo(base, token, jobId, claim)
   return base .. "fin:" .. token .. ":" .. jobId .. ":" .. (claim or "")
 end
-local function recallFinish(base, token, jobId, claim, replay)
-  if replay ~= "1" then return nil end
+local function recallFinish(base, token, jobId, claim)
   local memo = redis.call("GET", finishMemo(base, token, jobId, claim))
   if not memo then return nil end
   local seen = cjson.decode(memo)
@@ -250,6 +251,11 @@ local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   redis.call("SREM", stalledKey, jobId)
   -- attemptsMade counts runs that FINISHED (the finish scripts bump it): a run cut
   -- short by a stall or a shutdown spends none of the job's attempts.
+  -- processedOn names the run (the finish memo, the cancel message): a job claimed
+  -- again within the millisecond of its last claim, as a retry with no backoff is by
+  -- the finish that failed it, is stamped one later, or the two runs would be one.
+  local last = tonumber(redis.call("HGET", jobKey, "processedOn"))
+  if last and tonumber(now) <= last then now = tostring(last + 1) end
   redis.call("HSET", jobKey, "processedOn", now, "state", "active")
   return {redis.call("HGETALL", jobKey), jobId}
 end
@@ -906,13 +912,12 @@ return 0
 # ARGV[7] rlMax  ARGV[8] rlDuration(ms)  ARGV[9] metricsRetention(ms)
 # ARGV[10] globalConcurrency (0 = no cap)  ARGV[11] inline the result in the event?
 # ARGV[12] the claim's processedOn ("" = unchecked)
-# ARGV[13] replay (1 = a re-send: answered as the first send was, see recallFinish)
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}, or
 # {1, "__due__", dueMs} (nothing to fetch, a delayed job is due at dueMs).
 MOVE_TO_COMPLETED = (
     _LIB
     + """
-local seen = recallFinish(KEYS[8], ARGV[4], ARGV[1], ARGV[12], ARGV[13])
+local seen = recallFinish(KEYS[8], ARGV[4], ARGV[1], ARGV[12])
 if seen then return seen end
 local cap, rlMax, rlDuration = 0, tonumber(ARGV[7]), tonumber(ARGV[8])
 if ARGV[5] == "1" then
@@ -983,13 +988,12 @@ return {1}
 # ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
 # ARGV[13] globalConcurrency (0 = no cap)  ARGV[14] the claim's processedOn ("" = unchecked)
 # ARGV[15] the failure's traceback ("" = none), written only past the guards
-# ARGV[16] replay (1 = a re-send: answered as the first send was, see recallFinish)
 # Returns -2/-3, else {outcome}, {outcome, nextHash, nextId} or {outcome, "__due__",
 # dueMs} (see MOVE_TO_COMPLETED); outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
     + """
-local seen = recallFinish(KEYS[9], ARGV[7], ARGV[1], ARGV[14], ARGV[16])
+local seen = recallFinish(KEYS[9], ARGV[7], ARGV[1], ARGV[14])
 if seen then return seen end
 local cap, rlMax, rlDuration = 0, tonumber(ARGV[10]), tonumber(ARGV[11])
 if ARGV[8] == "1" then
@@ -1247,9 +1251,10 @@ local function removeTree(jobId)
   end
 end
 -- What a key IS, not what it is called: a job id arrives from a URL and a job hash
--- lives beside the queue's own keys, so `totals`, `meta` or `worker:<token>` would
--- otherwise be removable by asking to remove a job. Every job carries its options.
-local existed = redis.call("HEXISTS", base .. ARGV[1], "opts")
+-- lives beside the queue's own keys, so `totals`, `meta`, `worker:<token>` or a
+-- scheduler's template (`repeat:<id>`, which carries options like a job) would
+-- otherwise be removable by asking to remove a job. Every job is stamped at its add.
+local existed = redis.call("HEXISTS", base .. ARGV[1], "timestamp")
 if existed == 0 then return 0 end
 local parentId = redis.call("HGET", base .. ARGV[1], "parentId")
 removeTree(ARGV[1])
@@ -1299,13 +1304,12 @@ return 1
 # KEYS[5] prioritized  KEYS[6] marker  KEYS[7] base  KEYS[8] events channel
 # ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] token  ARGV[4] metricsRetention(ms)
 # ARGV[5] the claim's processedOn ("" = unchecked)  ARGV[6] lockDuration(ms)
-# ARGV[7] replay (1 = a re-send: answered as the first send was, see recallFinish)
 # Returns -2 lock lost, -3 not active, 1 committed.
 MOVE_TO_CANCELLED = (
     _LIB
     + """
 local base = KEYS[7]
-local seen = recallFinish(base, ARGV[3], ARGV[1], ARGV[5], ARGV[7])
+local seen = recallFinish(base, ARGV[3], ARGV[1], ARGV[5])
 if seen then return seen[1] end
 if redis.call("GET", KEYS[4]) ~= ARGV[3] or not claimedBy(KEYS[3], ARGV[5] or "") then return -2 end
 redis.call("DEL", KEYS[4])

@@ -13,7 +13,8 @@ job = await queue.add("welcome", {"user_id": 42})
 `Queue(name, *, url=..., prefix="toro", connection=None, default_job_options=None)`.
 Pass `url=` to reach another server, or `connection=` to share a
 `redis.asyncio.Redis` you already have (toro never closes a connection it did not
-open). `prefix=` namespaces every key, so two applications can share one Redis, and
+open). The client must be created with `decode_responses=True`; one that hands back
+bytes is refused. `prefix=` namespaces every key, so two applications can share one Redis, and
 it must match the workers' prefix or they are looking at different queues.
 
 `add(name, data=None, *, job_id=None, deduplication=None, **options)` writes the

@@ -48,6 +48,7 @@ from .connection import (
     connect,
     pop_timeout,
     read_timeout,
+    require_decoded,
 )
 from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
@@ -215,6 +216,7 @@ class Worker:
         self.redis = connection or connect(
             url, max_connections=max(50, concurrency + 10), blocking_timeout=block_timeout
         )
+        require_decoded(self.redis)
         # A connection we opened is ours to give back when we stop; one handed to us
         # belongs to the caller, who may still be using it elsewhere.
         self._owns_connection = connection is None
@@ -248,6 +250,10 @@ class Worker:
         self.heartbeat_interval = heartbeat_interval
 
         self._running = False
+        # Raised right before the slots are cancelled (stop() past its grace period, a
+        # cancelled run()): before 3.11 it is how a slot tells that cancellation from
+        # a job it asked to stop itself.
+        self._cut_off = False
         self._tasks: list[asyncio.Task[None]] = []
         self._process_tasks: list[asyncio.Task[None]] = []
 
@@ -330,6 +336,7 @@ class Worker:
         # must not run a claim loop against a model it cannot read.
         await stamp_data_model(self._stamp, self.keys, self.name)
         self._running = True
+        self._cut_off = False
         self._state = "running"  # a worker run again after stop() is no longer draining
         self.started_at = _now_ms()
         await self._write_heartbeat()  # register at once so the worker shows up immediately
@@ -363,9 +370,10 @@ class Worker:
         except asyncio.CancelledError:
             # run() cancelled outright (a framework cancelling its tasks, Ctrl-C under
             # asyncio.run): end the loops as stop() does without the grace period, and
-            # lower the flag first, so a slot can tell this from a job it was asked to
-            # cancel where the task's own cancellation count is not there to tell it.
+            # raise the cut-off flag first, so a slot can tell this from a job it was
+            # asked to cancel where the task's own cancellation count is not there.
             self._running = False
+            self._cut_off = True
             for t in self._tasks:
                 t.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -393,6 +401,8 @@ class Worker:
         if self._process_tasks:
             await asyncio.wait(self._process_tasks, timeout=grace)
         # Force-cancel anything left (jobs past the grace period + background loops).
+        # The flag goes up first: from here every cancellation a slot sees is this one.
+        self._cut_off = True
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -742,7 +752,7 @@ class Worker:
         if expired[0]:
             # The processor caught the timer's cancellation and returned (or its cleanup
             # raised): the run still ended on the job's timeout, not with a result.
-            return await self._processing_failed(job, _timed_out(job))
+            return await self._processing_failed(job, _timed_out(job), stacktrace="")
         if self._cancelling.get(job.id) is task:
             return await self._finish_cancelled(job)
         try:
@@ -791,12 +801,15 @@ class Worker:
         when this WORKER is being stopped, and absorbing that one commits a job
         and carries on through a shutdown. Cancelling the awaiting task cancels
         the awaited one too, so the inner task cannot tell them apart; the
-        outer task's own pending-cancellation count can (3.11+, with the
-        shutdown flag as the fallback: run() clears it before cancelling us).
+        outer task's own pending-cancellation count can (3.11+). Before that
+        the cut-off flag stands in, raised by stop() and by a cancelled run()
+        right before they cancel the slots. The running flag cannot: stop()
+        clears it before the grace wait, and a timeout or a cancel request
+        landing in that window is this worker's own doing, not the shutdown.
         """
         outer = asyncio.current_task()
         asked = getattr(outer, "cancelling", None)
-        stopping = asked() > 0 if asked is not None else not self._running
+        stopping = asked() > 0 if asked is not None else self._cut_off
         if stopping:
             if self._async_processor:
                 # The processor's task has unwound (awaiting it is what raised), so the
@@ -806,7 +819,7 @@ class Worker:
                     await asyncio.wait_for(self._release(job), 2.0)
             raise asyncio.CancelledError
         if expired:
-            return await self._processing_failed(job, _timed_out(job))
+            return await self._processing_failed(job, _timed_out(job), stacktrace="")
         if self._cancelling.get(job.id) is not task:
             # Nobody cancelled this run and the worker is not stopping: the
             # processor raised it itself (it awaited something that was
@@ -914,21 +927,21 @@ class Worker:
     ) -> Any:
         """Run a finish script, re-sending it through a Redis blip while the lease holds.
 
-        A re-send is marked as one (the last ARGV), and a finish that ran but whose
-        reply was lost answers it as it answered the first time, with the job it
-        fetched (see recallFinish in the scripts); one that never ran runs now. So a
-        blip of a few seconds becomes a late commit rather than a re-run of the job
-        after the sweep, and nothing is fetched twice: a re-send never asks for the
-        next job itself. The lease was renewed at most lock_renew_time ago, so it
-        holds for lock_duration less that; past it the finish is given up as before.
+        A finish that ran but whose reply was lost answers a re-send as it answered
+        the first time, with the job it fetched (see recallFinish in the scripts),
+        whether this loop re-sent it or the client did on a new connection; one that
+        never ran runs now. So a blip of a few seconds becomes a late commit rather
+        than a re-run of the job after the sweep, and nothing is fetched twice: a
+        re-send from here never asks for the next job itself. The lease was renewed
+        at most lock_renew_time ago, so it holds for lock_duration less that; past it
+        the finish is given up as before.
         """
         deadline = time.monotonic() + max(0.0, (self.lock_duration - self.lock_renew_time) / 1000)
         pause = 0.2
         fetch = self._fetch_flag()
-        replay = "0"
         while True:
             try:
-                res = await script(keys=keys, args=[*args(fetch), replay])
+                res = await script(keys=keys, args=args(fetch))
             except (RedisConnectionError, RedisTimeoutError) as exc:
                 if time.monotonic() + pause > deadline:
                     raise
@@ -936,7 +949,6 @@ class Worker:
                 await asyncio.sleep(pause)
                 pause = min(pause * 2, 2.0)
                 fetch = "0"
-                replay = "1"
                 continue
             self._loop_recovered("a finish")
             return res
@@ -990,11 +1002,15 @@ class Worker:
         return self._next_from(res)
 
     async def _processing_failed(
-        self, job: Job, exc: Exception
+        self, job: Job, exc: Exception, stacktrace: str | None = None
     ) -> tuple[str, dict[str, str]] | None:
-        """Record the traceback being handled and fail the job with `exc`."""
+        """Fail the job with `exc` and the traceback being handled, unless told what
+        to record: a timeout has no traceback of the job's own, and the one being
+        handled then is the worker's cancellation, or none ("NoneType: None").
+        """
         self._failed += 1
-        return await self._finish_failed(job, exc, traceback.format_exc())
+        trace = traceback.format_exc() if stacktrace is None else stacktrace
+        return await self._finish_failed(job, exc, trace)
 
     async def _finish_failed(
         self, job: Job, exc: Exception, stacktrace: str = ""

@@ -350,3 +350,35 @@ async def test_removing_a_schedule_as_its_next_occurrence_is_minted_leaves_nothi
     assert await q.schedulers() == []
     assert await q.redis.zcard(q.keys.repeat) == 0
     assert (await q.counts())["delayed"] == 0
+
+
+@pytest.mark.parametrize(
+    "priority", [1.7, True, -1, "5"], ids=["fraction", "bool", "negative", "text"]
+)
+async def test_a_scheduler_priority_is_validated_like_a_job_priority(q, priority):
+    """`add()` refuses these; `add_scheduler()` clamped them into the template, so a
+    bool ran every occurrence at priority 1 and a fraction was truncated."""
+    with pytest.raises(ValueError, match="priority"):
+        await q.add_scheduler("nightly", every=3_600_000, priority=priority)
+
+
+async def test_a_scheduler_takes_the_queue_default_priority(q):
+    """The docs say the queue's defaults merge under the scheduler's options as they
+    do for `add()`; the priority parameter's own default of 0 won over them."""
+    producer = Queue(q.name, prefix=PREFIX, default_job_options={"priority": 5})
+    try:
+        await producer.add_scheduler("nightly", every=3_600_000)
+        assert await producer.add_scheduler("urgent", every=3_600_000, priority=1)
+    finally:
+        await producer.close()
+    pending = {j.name: j.opts.priority for j in await q.get_jobs("delayed")}
+    assert pending == {"nightly": 5, "urgent": 1}
+
+
+async def test_a_scheduler_name_is_validated_like_a_job_name(q):
+    """The stored name goes into every occurrence and into `trigger_scheduler()`'s
+    add(): a name add() refuses ran on schedule and raised on "run now"."""
+    with pytest.raises(ValueError, match="job name"):
+        await q.add_scheduler("nightly", every=3_600_000, name="x" * 129)
+    with pytest.raises(ValueError, match="job name"):
+        await q.add_scheduler("nightly", every=3_600_000, name="tab\there")

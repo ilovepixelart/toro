@@ -12,7 +12,7 @@ await queue.add_scheduler("poll-inbox", every=30_000)
 ```
 
 `add_scheduler(scheduler_id, *, every=ms | cron="...", name=None, data=None,
-priority=0, **job_options)` stores the schedule's template (name, cadence, data,
+priority=None, **job_options)` stores the schedule's template (name, cadence, data,
 options) and enqueues the first occurrence. Exactly one of `every` / `cron`.
 Re-calling with the same id **updates** the schedule in place.
 

@@ -26,11 +26,21 @@ from .connection import (
     connect,
     pop_timeout,
     read_timeout,
+    require_decoded,
 )
 from .errors import IncompatibleDataModelError, JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
-from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
+from .job import (
+    FINISHED_STATES,
+    Deduplication,
+    Job,
+    JobOptions,
+    JobState,
+    _job_name,
+    _whole,
+    decode_results,
+)
 from .keys import Keys
 from .limits import Limits, RateLimit, limit_fields
 from .openmetrics import OUTCOMES, TOTAL_FIELDS, render
@@ -41,7 +51,6 @@ from .scheduler import next_run, valid_cron
 MAX_JOB_ID_CHARS = 256
 # A job name is a LABEL: it is rendered on every row, and the per-minute metrics keep
 # a field per distinct value for eight hours. Bounded for the same reasons.
-MAX_JOB_NAME_CHARS = 128
 
 
 _P = ParamSpec("_P")
@@ -64,24 +73,6 @@ def _writes(method: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Corou
 
     guarded.__toro_writes__ = True  # ty: ignore[unresolved-attribute]
     return guarded
-
-
-def _job_name(name: object) -> str:
-    """Check a job name: a label a person reads and a metrics series is kept under,
-    not a place to put a payload or an id.
-    """
-    if (
-        not isinstance(name, str)
-        or not name
-        or len(name) > MAX_JOB_NAME_CHARS
-        or any(ord(c) < 0x20 for c in name)
-    ):
-        msg = (
-            f"job name must be a non-empty string of at most {MAX_JOB_NAME_CHARS} "
-            f"characters with no control characters"
-        )
-        raise ValueError(msg)
-    return name
 
 
 def _now_ms() -> int:
@@ -233,6 +224,7 @@ class Queue:
         # NB: created with decode_responses=True, so every command returns str -
         # redis-py's async client isn't generic over that, hence the casts below.
         self.redis = connection or connect(url)
+        require_decoded(self.redis)
         # A connection we opened is ours to give back on close(); one handed to us
         # belongs to the caller, who may still be using it elsewhere.
         self._owns_connection = connection is None
@@ -315,6 +307,18 @@ class Queue:
         staged = self._stage_add(name, data, job_id=job_id, deduplication=deduplication, opts=opts)
         return staged.build(await staged.script(keys=staged.keys, args=staged.args))
 
+    def _job_options(self, opts: dict[str, Any]) -> JobOptions:
+        """Validate a call's options over the queue's defaults, the priority clamped
+        into the packable range. An unknown option is a ValueError like every other
+        option error (JobOptions itself raises TypeError for one).
+        """
+        try:
+            options = JobOptions(**{**self.default_job_options, **opts})
+        except TypeError as exc:
+            raise ValueError(str(exc)) from None
+        options.priority = _clamp_priority(options.priority)
+        return options
+
     def _stage_add(
         self,
         name: str,
@@ -329,16 +333,15 @@ class Queue:
         which stages a batch and sends it in one.
         """
         _job_name(name)
-        options = JobOptions(**{**self.default_job_options, **opts})
-        options.priority = _clamp_priority(options.priority)
+        options = self._job_options(opts)
         if job_id is not None:
             job_id = self._custom_job_id(job_id)
         dedup_id, dedup_ttl = "", 0
         if deduplication is not None:
             dedup_id = str(deduplication.get("id") or "")
-            dedup_ttl = int(deduplication.get("ttl") or 0)
-            if not dedup_id or dedup_ttl <= 0:
+            if not dedup_id:
                 raise ValueError("deduplication needs {'id': str, 'ttl': positive ms}")
+            dedup_ttl = _whole(deduplication.get("ttl"), "deduplication ttl (ms)", minimum=1)
             # same rule as scheduler ids: the id becomes a Redis key segment,
             # so ':' or control characters would let distinct ids collide
             # (and silently drop jobs that share the accidental key)
@@ -773,7 +776,7 @@ class Queue:
         cron: str | None = None,
         name: str | None = None,
         data: Any = None,
-        priority: int = 0,
+        priority: int | None = None,
         **job_opts: Any,
     ) -> str:
         """Register a repeatable schedule. Exactly one of `every` (ms) or `cron`.
@@ -801,12 +804,12 @@ class Queue:
             raise ValueError(f"invalid cron expression: {cron!r}")
         # The queue's defaults go INTO the template: a worker mints every later
         # occurrence from it, and a worker never sees the producer's defaults.
-        merged: dict[str, Any] = {
-            **self.default_job_options,
-            **job_opts,
-            "priority": _clamp_priority(priority),
-        }
-        opts = JobOptions(**merged).to_dict()
+        if name is not None:
+            _job_name(name)  # every occurrence, and trigger_scheduler()'s add(), carry it
+        merged: dict[str, Any] = {**self.default_job_options, **job_opts}
+        if priority is not None:
+            merged["priority"] = priority
+        opts = self._job_options(merged).to_dict()
         template = {
             "name": name or scheduler_id,
             "every": str(every) if every else "",

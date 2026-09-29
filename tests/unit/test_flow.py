@@ -76,3 +76,17 @@ def test_flow_view_counts_a_fail_parent_failure_from_the_tree_alone():
     # only tolerated failures are copied into the parent
     view = _view({"a": "failed"}, results={}, failures={})
     assert (view.done, view.failed) == (0, 1)
+
+
+def test_a_node_name_is_validated_like_a_job_name():
+    """A child's name lands in metrics and listings like any job's: add() refuses a
+    control character or more than 128 characters, and a node used to take them."""
+    with pytest.raises(ValueError, match="job name"):
+        FlowChild("a\nb", {})
+    with pytest.raises(ValueError, match="job name"):
+        FlowChild("x" * 129, {})
+
+
+def test_an_option_value_error_names_the_node_too():
+    with pytest.raises(ValueError, match="resize"):
+        FlowChild("resize", {}, attempts=0)

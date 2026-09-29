@@ -50,6 +50,13 @@ Fixes:
   hash every five seconds and once more before giving up.
 - `result(timeout=None)` waits without limit, as it did before the re-read loop, which
   raised `TypeError` on it.
+- On Python 3.10, a job timeout or a cancel request landing while the worker drained
+  for shutdown read as the shutdown itself: the job went back to the queue with no
+  attempt spent, and a cancelled one stayed queued until its next claim. It ends
+  `failed` or `cancelled`, as on 3.11 and later.
+- A `connection=` client that hands back bytes (redis-py's default) is refused where
+  it is handed over. A worker on one ran every job with no name, no data and no
+  cancel flag, and never committed a finish.
 - A `result()` waiter on redis-py 5.x outlives channel silence longer than the
   connection's read timeout: the events subscription read with no timeout, which that
   redis-py turns into the socket timeout, so ten quiet seconds ended the subscription
@@ -57,12 +64,16 @@ Fixes:
 - A repeatable schedule survives an occurrence picked up early, one that fails before
   minting its successor, `cancel_job`, `remove_job` or `clean("delayed")` of a pending
   occurrence, and `remove_scheduler()` landing while the next occurrence is minted.
+- `remove_job("repeat:<scheduler id>")` returns False and leaves the scheduler's
+  template alone. It used to delete it: the scheduler stayed listed with no cadence
+  and ended after its pending occurrence.
 - Lock renewal survives a Redis error while the lease still holds; the job is not
   run twice.
 - A finish is re-sent through a Redis blip while the lease holds, and one whose first
-  send ran but lost its reply is answered as that send was, with the job it fetched.
-  It used to be dropped (the job re-ran after the sweep) and, once re-sent, refused as
-  a lost lock, leaving the fetched job locked in `active` until the sweep.
+  send ran but lost its reply is answered as that send was, with the job it fetched,
+  whether the worker re-sent it or the client did on a new connection. It used to be
+  dropped (the job re-ran after the sweep) and, once re-sent, refused as a lost lock,
+  leaving the fetched job locked in `active` until the sweep.
 - A run that lost its lock cannot commit over its own worker's re-run of the job.
 - Progress, log lines and stack traces are written only to a job that still exists,
   and the stack trace is stored atomically with the failure.
@@ -117,7 +128,15 @@ to a queue whose limits were never set; `set_limits()` with no arguments gives t
 queue limits of its own, none, and the workers' arguments no longer apply. Both limits
 are validated like every option: whole numbers of at least 1 (a whole float such as
 `60_000 / 2` is fine), and a string, a fraction or a bool raises `ValueError` where
-`rate_limit` used to coerce them.
+`rate_limit` used to coerce them. An option given as an int subclass (an `IntEnum`)
+is stored as a plain int: it used to reach Redis as the enum's repr, and `add()`
+failed after the job hash was written, on an id already spent. Every entry point
+validates the same way: `add_scheduler()` refuses a `priority` or a `name` that
+`add()` refuses (it clamped the one and stored the other) and takes the queue's
+default priority when none is given (its own default of 0 won over it); a flow node's
+name is checked like a job's; a deduplication `ttl` refuses a bool, a fraction or a
+string (`True` was a 1 ms window); and an unknown option raises `ValueError` from
+`add()` as it does from a flow node, where it raised `TypeError`.
 
 ## 1.0.2
 
