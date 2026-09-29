@@ -91,7 +91,7 @@ hit, a job about a row that was rolled back.
 | `delay` | 0 | ms before the job becomes runnable; it sits in `delayed` until due. |
 | `attempts` | 1 | Total tries before the job is terminally failed. |
 | `timeout` | unset | Milliseconds an async processor may run before the job fails (a `TimeoutError` naming the limit, retried like any other failure), whatever the processor does with the cancellation that ends it. The timeout and a cancel request are one signal: whichever comes first unwinds the run and decides how it ends. A sync processor's thread cannot be taken back, so it does not apply there. |
-| `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms, "max": ms, "jitter": 0..1}`. Exponential doubles per attempt; `max` caps the delay; `jitter` adds up to that share of the delay at random, so jobs that failed together do not retry together. Both optional. |
+| `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms, "max": ms, "jitter": 0..1}`. Exponential doubles per attempt; `max` caps the delay; `jitter` then adds up to that share of the capped delay at random (`max=3000, jitter=0.5` waits up to 4500 ms), so jobs that failed together do not retry together. Both optional. |
 | `remove_on_complete` | unset | Which successes to keep: unset keeps the newest 1000, `False` keeps all, `True` removes at once, `N` keeps the newest N, `{"count": N, "age": seconds}` bounds both. |
 | `remove_on_fail` | unset | Same, for terminal failures; unset keeps the newest 5000. |
 | `concurrency_key` | `None` | Jobs sharing a key run one at a time, in the order they were added. See [Serializing on a key](#serializing-on-a-key). |
@@ -214,7 +214,8 @@ Two distinct tools, usable independently:
 A custom id becomes the job's Redis key, beside the queue's own keys, so `add()`
 refuses one that would land on another key: a queue key's name (`completed`,
 `marker`, ...), a queue namespace or its bare name (`repeat:`, `worker:`,
-`metrics:`, `de:`, `ck:`, `held:`, and so `de` itself, whose lock would be `de:lock`), or another
+`metrics:`, `de:`, `ck:`, `held:`, `add:`, `fin:`, and so `de` itself, whose lock would be
+`de:lock`), or another
 job's aux key (`...:lock`, `:logs`, `:deps`, `:results`, `:cfail`, `:ccancel`,
 `:live`). Colons are
 otherwise fine: `order:123`.
@@ -237,8 +238,10 @@ value = await job.result(timeout=30)        # or queue.result(job.id)
 `result()` resolves with the processor's return value, raises `JobFailedError`
 on terminal failure, or `TimeoutError` after `timeout`. It registers for the
 job's events *before* checking state, so a job that finishes while you wait is
-never missed - and it works even when the job hash was auto-removed, as long as
-`result()` was awaited before the job finished. A retrying job keeps you
+never missed, and it re-reads the job's hash every five seconds while it waits,
+so an event lost to a pub/sub reconnect delays the answer rather than losing it.
+It works even when the job hash was auto-removed, as long as `result()` was
+awaited before the job finished. A retrying job keeps you
 waiting; only the terminal outcome resolves the call.
 
 ## Inspecting the queue
