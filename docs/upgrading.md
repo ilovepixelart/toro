@@ -50,6 +50,10 @@ Fixes:
   occurrence, and `remove_scheduler()` landing while the next occurrence is minted.
 - Lock renewal survives a Redis error while the lease still holds; the job is not
   run twice.
+- A finish is re-sent through a Redis blip while the lease holds, and one whose first
+  send ran but lost its reply is answered as that send was, with the job it fetched.
+  It used to be dropped (the job re-ran after the sweep) and, once re-sent, refused as
+  a lost lock, leaving the fetched job locked in `active` until the sweep.
 - A run that lost its lock cannot commit over its own worker's re-run of the job.
 - Progress, log lines and stack traces are written only to a job that still exists,
   and the stack trace is stored atomically with the failure.

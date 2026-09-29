@@ -206,6 +206,32 @@ end
 -- its lock, and the run another of its slots re-claimed after the stalled sweep. The
 -- claim's processedOn (stamped below) tells the two apart, as the cancel message
 -- already does. "" skips the check.
+-- A finish answers the same thing twice. A worker re-sends a finish whose reply was
+-- lost in a Redis blip; the guards refuse the replay (the lock is gone), and the
+-- worker could not tell "committed, reply lost" from "lock lost": it reported the
+-- finish lost, and the job the first send fetched sat locked in `active` with nobody
+-- running it until the sweep. So each finish records what it answered under the run
+-- it belongs to (`fin:<token>:<job>:<claim>`), for as long as the lease it was sent
+-- under, and a re-send is answered from that, with the fetched job while it is still
+-- this worker's to run.
+local function finishMemo(base, token, jobId, claim)
+  return base .. "fin:" .. token .. ":" .. jobId .. ":" .. (claim or "")
+end
+local function recallFinish(base, token, jobId, claim, replay)
+  if replay ~= "1" then return nil end
+  local memo = redis.call("GET", finishMemo(base, token, jobId, claim))
+  if not memo then return nil end
+  local seen = cjson.decode(memo)
+  if seen.nextId and redis.call("GET", base .. seen.nextId .. ":lock") == token then
+    return {seen.outcome, redis.call("HGETALL", base .. seen.nextId), seen.nextId}
+  end
+  return {seen.outcome}
+end
+local function rememberFinish(base, token, jobId, claim, outcome, nextId, ttlMs)
+  if not ttlMs or ttlMs <= 0 then return end
+  redis.call("SET", finishMemo(base, token, jobId, claim),
+    cjson.encode({outcome = outcome, nextId = nextId}), "PX", ttlMs)
+end
 local function claimedBy(jobKey, claim)
   return claim == "" or redis.call("HGET", jobKey, "processedOn") == claim
 end
@@ -852,11 +878,14 @@ return 0
 # ARGV[7] rlMax  ARGV[8] rlDuration(ms)  ARGV[9] metricsRetention(ms)
 # ARGV[10] globalConcurrency (0 = no cap)  ARGV[11] inline the result in the event?
 # ARGV[12] the claim's processedOn ("" = unchecked)
+# ARGV[13] replay (1 = a re-send: answered as the first send was, see recallFinish)
 # Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}, or
 # {1, "__due__", dueMs} (nothing to fetch, a delayed job is due at dueMs).
 MOVE_TO_COMPLETED = (
     _LIB
     + """
+local seen = recallFinish(KEYS[8], ARGV[4], ARGV[1], ARGV[12], ARGV[13])
+if seen then return seen end
 local cap = 0
 if ARGV[5] == "1" then cap = requireCap(ARGV[10]) end
 if redis.call("GET", KEYS[4]) ~= ARGV[4]
@@ -890,20 +919,21 @@ if ARGV[11] == "1" or redis.call("EXISTS", KEYS[3]) == 0 then
 else
   redis.call("PUBLISH", KEYS[10], cjson.encode({jobId = ARGV[1], event = "completed"}))
 end
+local nxt = false
 if ARGV[5] == "1" then
-  local nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
-                          ARGV[4], tonumber(ARGV[6]), ARGV[3],
-                          KEYS[12], tonumber(ARGV[7]), tonumber(ARGV[8]), cap)
-  if nxt then
-    if nxt[1] == "__rl__" then
-      redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
-    else
-      return {1, nxt[1], nxt[2]}
-    end
+  nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
+                    ARGV[4], tonumber(ARGV[6]), ARGV[3],
+                    KEYS[12], tonumber(ARGV[7]), tonumber(ARGV[8]), cap)
+  if nxt and nxt[1] == "__rl__" then
+    redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
+    nxt = false
   end
 else
   wakeIfWaiting(KEYS[5], KEYS[6])
 end
+local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
+rememberFinish(KEYS[8], ARGV[4], ARGV[1], ARGV[12], 1, fetched, tonumber(ARGV[6]))
+if nxt then return {1, nxt[1], nxt[2]} end
 return {1}
 """
 )
@@ -920,11 +950,14 @@ return {1}
 # ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
 # ARGV[13] globalConcurrency (0 = no cap)  ARGV[14] the claim's processedOn ("" = unchecked)
 # ARGV[15] the failure's traceback ("" = none), written only past the guards
+# ARGV[16] replay (1 = a re-send: answered as the first send was, see recallFinish)
 # Returns -2/-3, else {outcome}, {outcome, nextHash, nextId} or {outcome, "__due__",
 # dueMs} (see MOVE_TO_COMPLETED); outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
     + """
+local seen = recallFinish(KEYS[9], ARGV[7], ARGV[1], ARGV[14], ARGV[16])
+if seen then return seen end
 local cap = 0
 if ARGV[8] == "1" then cap = requireCap(ARGV[13]) end
 if redis.call("GET", KEYS[6]) ~= ARGV[7]
@@ -968,20 +1001,21 @@ else
   end
   outcome = 1
 end
+local nxt = false
 if ARGV[8] == "1" then
-  local nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
-                          ARGV[7], tonumber(ARGV[9]), ARGV[3],
-                          KEYS[13], tonumber(ARGV[10]), tonumber(ARGV[11]), cap)
-  if nxt then
-    if nxt[1] == "__rl__" then
-      redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check
-    else
-      return {outcome, nxt[1], nxt[2]}
-    end
+  nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
+                    ARGV[7], tonumber(ARGV[9]), ARGV[3],
+                    KEYS[13], tonumber(ARGV[10]), tonumber(ARGV[11]), cap)
+  if nxt and nxt[1] == "__rl__" then
+    redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check
+    nxt = false
   end
 else
   wakeIfWaiting(KEYS[2], KEYS[7])
 end
+local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
+rememberFinish(KEYS[9], ARGV[7], ARGV[1], ARGV[14], outcome, fetched, tonumber(ARGV[9]))
+if nxt then return {outcome, nxt[1], nxt[2]} end
 return {outcome}
 """
 )
@@ -1227,12 +1261,15 @@ return 1
 # KEYS[1] active  KEYS[2] cancelled  KEYS[3] job hash  KEYS[4] lock
 # KEYS[5] prioritized  KEYS[6] marker  KEYS[7] base  KEYS[8] events channel
 # ARGV[1] jobId  ARGV[2] now(ms)  ARGV[3] token  ARGV[4] metricsRetention(ms)
-# ARGV[5] the claim's processedOn ("" = unchecked)
+# ARGV[5] the claim's processedOn ("" = unchecked)  ARGV[6] lockDuration(ms)
+# ARGV[7] replay (1 = a re-send: answered as the first send was, see recallFinish)
 # Returns -2 lock lost, -3 not active, 1 committed.
 MOVE_TO_CANCELLED = (
     _LIB
     + """
 local base = KEYS[7]
+local seen = recallFinish(base, ARGV[3], ARGV[1], ARGV[5], ARGV[7])
+if seen then return seen[1] end
 if redis.call("GET", KEYS[4]) ~= ARGV[3] or not claimedBy(KEYS[3], ARGV[5] or "") then return -2 end
 redis.call("DEL", KEYS[4])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
@@ -1250,6 +1287,7 @@ if meta[1] then
     tonumber(ARGV[4]), "cancelled")
 end
 wakeIfWaiting(KEYS[5], KEYS[6])
+rememberFinish(base, ARGV[3], ARGV[1], ARGV[5], 1, nil, tonumber(ARGV[6]))
 return 1
 """
 )

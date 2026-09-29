@@ -49,6 +49,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `totals` | HASH | Outcome counters and `ms` since the queue was created, and never expiring: `rate()` reads across restarts, and a counter that resets reads as a cliff. Five fields, whatever the traffic; the per-name fields and histograms stay in the expiring buckets. |
 | `de:<dedupId>` | string (PX) | A live deduplication throttle window; holds the already-queued job's id. |
 | `add:<token>` | string (PX 60 s) | The job (or flow root) one `add()` / `add_flow()` call made, so the same call re-sent after a dropped connection adds nothing. |
+| `fin:<token>:<job>:<claim>` | string (PX `lock_duration`) | What a finish script answered for that run (its outcome and the job it fetched), so a finish re-sent after its reply was lost is answered the same rather than refused as a lost lock. |
 
 ## Per-scheduler, per-worker, per-job keys
 
