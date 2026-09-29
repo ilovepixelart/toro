@@ -936,6 +936,9 @@ if ARGV[5] == "1" then
     nxt = false
   end
 else
+  -- Fetching nothing, this finish is still the moment a slot frees under a cap, so
+  -- what is due moves now and the wake below finds it, rather than at the next poll.
+  promoteDue(KEYS[8], KEYS[5], KEYS[9], ARGV[3])
   wakeIfWaiting(KEYS[5], KEYS[6])
 end
 local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
@@ -1018,6 +1021,7 @@ if ARGV[8] == "1" then
     nxt = false
   end
 else
+  promoteDue(KEYS[9], KEYS[2], KEYS[10], ARGV[3])  -- see MOVE_TO_COMPLETED
   wakeIfWaiting(KEYS[2], KEYS[7])
 end
 local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
@@ -1293,6 +1297,7 @@ if meta[1] then
   settleChildGone(base, ARGV[1], meta[1], meta[2], meta[3] or "cancelled", now,
     tonumber(ARGV[4]), "cancelled")
 end
+promoteDue(base, KEYS[5], base .. "pc", ARGV[2])  -- see MOVE_TO_COMPLETED
 wakeIfWaiting(KEYS[5], KEYS[6])
 rememberFinish(base, ARGV[3], ARGV[1], ARGV[5], 1, nil, tonumber(ARGV[6]))
 return 1

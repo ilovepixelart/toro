@@ -10,7 +10,10 @@ hears the sooner time, and blocks until it.
 """
 
 import asyncio
+import contextlib
 import time
+
+import pytest
 
 from toro import FlowChild, Job, Queue, Worker
 from toro.worker import block_for
@@ -224,3 +227,66 @@ async def test_a_delayed_member_scored_below_zero_is_still_promoted(q):
     loaded = await w._acquire()
 
     assert loaded is not None and loaded[0] == j.id
+
+
+async def test_a_cancel_commit_promotes_what_is_due(q, run_worker, run_until):
+    """Under a saturated cap the finish that frees the slot is the one moment a due
+    delayed job can move. A cancel commit fetches nothing and promoted nothing, so
+    the job stayed in `delayed` and the parked slot woke only at its next poll."""
+    await q.set_limits(global_concurrency=1)
+    started = asyncio.Event()
+    ran: list[str] = []
+
+    async def proc(job):
+        ran.append(job.name)
+        if job.name == "hold":
+            started.set()
+            await asyncio.sleep(30)
+
+    hold = await q.add("hold", {})
+    async with run_worker(q, proc, concurrency=2, **_QUIET):
+        await asyncio.wait_for(started.wait(), 5)
+        await q.add("due", {}, delay=100)
+        await asyncio.sleep(0.4)  # due by now; the free slot was turned away at the cap
+        await q.cancel_job(hold.id)
+        assert await run_until(lambda: "due" in ran, timeout=1.5), f"ran {ran}"
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_draining_workers_finish_promotes_what_is_due(q, run_until, outcome):
+    """A stopping worker's finish fetches nothing. Under a cap it is what frees the
+    slot, and the due job it left in `delayed` waited for another worker's next poll."""
+    await q.set_limits(global_concurrency=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    ran: list[str] = []
+
+    async def proc(job):
+        ran.append(job.name)
+        if job.name == "hold":
+            started.set()
+            await release.wait()
+            if outcome == "failed":
+                raise RuntimeError("boom")
+
+    await q.add("hold", {}, attempts=1)
+    draining = Worker(q.name, proc, prefix=PREFIX, **_QUIET)
+    parked = Worker(q.name, proc, prefix=PREFIX, **_QUIET)
+    tasks = [asyncio.create_task(draining.run())]
+    try:
+        await asyncio.wait_for(started.wait(), 5)  # the first worker holds the one slot
+        tasks.append(asyncio.create_task(parked.run()))
+        stopping = asyncio.create_task(draining.stop(grace_period=5))
+        await asyncio.sleep(0.1)  # the flag is down (and stop()'s own wake has been spent)
+        await q.add("due", {}, delay=100)
+        await asyncio.sleep(0.4)  # due by now; the second worker was turned away at the cap
+        release.set()
+        assert await run_until(lambda: "due" in ran, timeout=1.5), f"ran {ran}"
+        await stopping
+    finally:
+        for w in (draining, parked):
+            await w.stop(grace_period=0)
+        for t in tasks:
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
