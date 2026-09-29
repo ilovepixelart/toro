@@ -914,21 +914,21 @@ class Worker:
     ) -> Any:
         """Run a finish script, re-sending it through a Redis blip while the lease holds.
 
-        A re-send is marked as one (the last ARGV), and a finish that ran but whose
-        reply was lost answers it as it answered the first time, with the job it
-        fetched (see recallFinish in the scripts); one that never ran runs now. So a
-        blip of a few seconds becomes a late commit rather than a re-run of the job
-        after the sweep, and nothing is fetched twice: a re-send never asks for the
-        next job itself. The lease was renewed at most lock_renew_time ago, so it
-        holds for lock_duration less that; past it the finish is given up as before.
+        A finish that ran but whose reply was lost answers a re-send as it answered
+        the first time, with the job it fetched (see recallFinish in the scripts),
+        whether this loop re-sent it or the client did on a new connection; one that
+        never ran runs now. So a blip of a few seconds becomes a late commit rather
+        than a re-run of the job after the sweep, and nothing is fetched twice: a
+        re-send from here never asks for the next job itself. The lease was renewed
+        at most lock_renew_time ago, so it holds for lock_duration less that; past it
+        the finish is given up as before.
         """
         deadline = time.monotonic() + max(0.0, (self.lock_duration - self.lock_renew_time) / 1000)
         pause = 0.2
         fetch = self._fetch_flag()
-        replay = "0"
         while True:
             try:
-                res = await script(keys=keys, args=[*args(fetch), replay])
+                res = await script(keys=keys, args=args(fetch))
             except (RedisConnectionError, RedisTimeoutError) as exc:
                 if time.monotonic() + pause > deadline:
                     raise
@@ -936,7 +936,6 @@ class Worker:
                 await asyncio.sleep(pause)
                 pause = min(pause * 2, 2.0)
                 fetch = "0"
-                replay = "1"
                 continue
             self._loop_recovered("a finish")
             return res
