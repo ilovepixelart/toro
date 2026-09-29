@@ -13,6 +13,7 @@ import asyncio
 import time
 
 from toro import FlowChild, Job, Queue, Worker
+from toro.worker import block_for
 
 PREFIX = "torotest"
 
@@ -110,6 +111,18 @@ async def test_a_delayed_job_once_run_leaves_its_worker_idle(q, run_worker, run_
         sent = _counting(w)
         await asyncio.sleep(1.0)
         assert sent == []
+
+
+async def test_the_shortest_block_returns_on_every_supported_redis(q):
+    """The block an idle slot sends for a due time that has already passed. Redis 6.2
+    turns a timeout of 0.001 s into 0, which blocks for good, and Redis 7 rounds it
+    up: the floor has to be a wait every supported server reads as short."""
+    now = _now_ms()
+    timeout = block_for(5.0, now - 1, now)
+
+    popped = await asyncio.wait_for(q.redis.bzpopmin(q.keys.marker, timeout), 2.0)
+
+    assert popped is None
 
 
 async def test_a_delayed_add_marks_when_the_next_job_is_due(q):
