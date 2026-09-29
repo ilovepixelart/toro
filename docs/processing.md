@@ -290,10 +290,12 @@ await worker.stop()        # or stop(grace_period=10)
 ```
 
 `stop()` stops claiming new jobs, lets in-flight jobs finish for up to the grace
-period, cancels whatever remains (those jobs' locks expire and the sweep
-recovers them; each recovery counts toward `max_stalled_count`, which is never reset,
-so at the default of 1 a job cut off a second time is failed instead), deregisters presence, and closes the
-connection. Pair `run()`/`stop()` with your framework's startup/shutdown hooks. A
-`run()` cancelled outright (a framework cancelling its tasks, Ctrl-C under
-`asyncio.run()`) ends the loops at once and leaves the jobs in flight to the stalled
-sweep; `stop()` is what gives them the grace period.
+period, cancels whatever remains and hands each cut-off job straight back to the
+queue (its lock dropped, no attempt and no stall counted, so the next worker runs it
+at once), deregisters presence, and closes the connection. A sync processor's job is
+the exception: its thread runs on, so the job keeps its lock and the stalled sweep
+recovers it after that expires, counting the recovery toward `max_stalled_count`.
+Pair `run()`/`stop()` with your framework's startup/shutdown hooks. A `run()`
+cancelled outright (a framework cancelling its tasks, Ctrl-C under `asyncio.run()`)
+ends the loops at once and hands its jobs back the same way; `stop()` is what gives
+them the grace period.

@@ -1127,6 +1127,30 @@ return existed
 """
 )
 
+# Hand a job its worker had to abandon (a shutdown past the grace period, a run()
+# cancelled outright) back to the queue at once: out of `active`, lock dropped, back in
+# `prioritized` at its own priority, nothing counted. Left in `active` it would wait
+# out its lock and a sweep pass, and the recovery would count toward max_stalled_count.
+# Token-guarded like a finish: a run that lost its lock hands back nothing. The job
+# keeps its concurrency key, exactly as a job the sweep recovers does.
+# KEYS[1] active  KEYS[2] prioritized  KEYS[3] job hash  KEYS[4] lock  KEYS[5] marker
+# KEYS[6] base  KEYS[7] pc
+# ARGV[1] jobId  ARGV[2] token  ARGV[3] the claim's processedOn ("" = unchecked)
+# Returns -2 lock lost, -3 not active, 1 released.
+RELEASE_JOB = (
+    _LIB
+    + """
+if redis.call("GET", KEYS[4]) ~= ARGV[2]
+  or not claimedBy(KEYS[3], ARGV[3] or "") then return -2 end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+redis.call("DEL", KEYS[4])
+local priority = tonumber(redis.call("HGET", KEYS[3], "priority")) or 0
+redis.call("HSET", KEYS[3], "state", "wait")
+enqueue(KEYS[2], KEYS[5], ARGV[1], priority, KEYS[7])
+return 1
+"""
+)
+
 # Commit a job its worker stopped. Token-guarded like every other finish: a worker
 # that lost its lock commits NOTHING, so a job taken over mid-cancellation is not
 # ended twice. No fetch-next: a cancellation is rare, and the loop takes the next job

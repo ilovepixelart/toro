@@ -47,6 +47,11 @@ Fixes:
   child was removed by retention runs it instead of parking it for good.
 - `stop()` landing before or during `run()`'s startup ends the run; a worker run
   again reports as running, not draining.
+- A job cut off by `stop()` past the grace period, or by a cancelled `run()`, goes
+  straight back to the queue with its lock dropped. It used to sit locked in `active`
+  until the lock expired and a sweep recovered it, 60 to 90 s later, and that recovery
+  spent one of its `max_stalled_count` stalls: at the default of 1, a job cut off by two
+  deploys in a row was failed for good. A sync processor's job still goes to the sweep.
 - A cancel request applies to the run it was made for: a job id re-added while its
   cancelled run unwinds is no longer cancelled with it.
 - The delayed-job sweep, the stalled sweep and the heartbeat log one warning per
