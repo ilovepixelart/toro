@@ -76,8 +76,9 @@ Redis for milliseconds per claim), and a claim that finds nothing answers with t
 next due time, which the idle slot blocks until. Whatever delays a job marks that
 time on the marker (`"1"`, scored at the earliest due time known), so an idle
 worker blocked past it wakes, claims again, and hears the sooner time. No worker
-polls for delayed jobs: an idle fleet's Redis load is one blocking pop per slot
-per `block_timeout`.
+polls for delayed jobs: an idle slot's Redis load is one claim and one blocking pop
+per `block_timeout`, plus each worker's schedule check and heartbeat every five
+seconds.
 
 ## Higher-level features
 

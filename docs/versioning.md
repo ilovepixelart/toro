@@ -77,9 +77,9 @@ change: the language moved, not the API.
 
 ## Redis
 
-**Redis 6.2 and later.** The floor is two commands: `ZMSCORE` and `ZDIFFSTORE`, which
-the root-first listings use and which arrived in 6.2. Everything else toro runs is
-older than that.
+**Redis 6.2 and later.** The floor is three commands that arrived in 6.2: `ZMSCORE`
+and `ZDIFFSTORE`, which the root-first listings use, and `ZADD` with `LT`, which marks
+the next due time on the marker. Everything else toro runs is older than that.
 A Redis-compatible server that implements the same commands and scripting works by
 construction, though only Redis itself is tested here.
 

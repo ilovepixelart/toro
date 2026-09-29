@@ -31,8 +31,8 @@ due delayed jobs into the queue once a second, so an idle fleet's Redis load gre
 its size. A claim now promotes what is due before it picks, and a worker with nothing
 to claim blocks until the next due time the claim answered with, woken sooner by any
 job delayed to an earlier time. A delayed job runs when due rather than up to a
-second later, an idle slot sends one blocking pop per `block_timeout`, and the
-schedule check that shared the sweep's loop runs every five seconds.
+second later, an idle slot sends one claim and one blocking pop per `block_timeout`,
+and the schedule check that shared the sweep's loop runs every five seconds.
 
 **Rolling upgrade.** Where `result()` is used with `remove_on_complete=True`, upgrade
 producers before workers: a 1.0.3 worker publishes such a result inside the event
@@ -45,6 +45,9 @@ Fixes:
 
 - `result()` delivers exactly what the processor returned: numbers over 14 digits and
   empty lists were rounded and turned into `{}` on the way through the event.
+- A `result()` waiter whose completion event was lost (a pub/sub reconnect drops what
+  was published in the gap) no longer waits out its timeout: it re-reads the job's
+  hash every five seconds and once more before giving up.
 - A `result()` waiter on redis-py 5.x outlives channel silence longer than the
   connection's read timeout: the events subscription read with no timeout, which that
   redis-py turns into the socket timeout, so ten quiet seconds ended the subscription
@@ -67,7 +70,7 @@ Fixes:
   again reports as running, not draining.
 - A job cut off by `stop()` past the grace period, or by a cancelled `run()`, goes
   straight back to the queue with its lock dropped. It used to sit locked in `active`
-  until the lock expired and a sweep recovered it, 60 to 90 s later, and that recovery
+  until the lock expired and a sweep recovered it, 30 to 60 s later, and that recovery
   spent one of its `max_stalled_count` stalls: at the default of 1, a job cut off by two
   deploys in a row was failed for good. A sync processor's job still goes to the sweep.
 - A cancel request applies to the run it was made for: a job id re-added while its
