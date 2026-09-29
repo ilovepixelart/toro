@@ -55,6 +55,10 @@ logger = logging.getLogger(__name__)
 # an ordinary overshoot would read as a blocked loop and an idle worker would warn.
 MIN_BLOCKED_WARNING = 0.01
 
+# How often a worker looks for a schedule whose queued occurrence was dropped. A
+# repair for a rare loss, so seconds apart: every worker runs it on its own.
+SCHEDULE_CHECK_S = 5.0
+
 
 def _blocked_threshold(blocked_warning: float | None, lock_renew_time: int) -> float:
     """How long the loop may be unable to run anything before that is worth saying.
@@ -124,6 +128,17 @@ def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
         return block_timeout
     ceiling = max(read_timeout_s - 1.0, read_timeout_s / 2)
     return min(block_timeout, ceiling)
+
+
+def block_for(pop_timeout_s: float, due_ms: int | None, now_ms: int) -> float:
+    """Bound an idle slot's block: the poll, cut short at the next due time the claim
+    told it, so a delayed job is promoted when due and not at the next poll.
+
+    Never 0, which a blocking pop reads as "no timeout".
+    """
+    if due_ms is None:
+        return pop_timeout_s
+    return min(pop_timeout_s, max((due_ms - now_ms) / 1000, 0.001))
 
 
 # How long a presence record outlives its worker's last heartbeat. Long enough that a
@@ -246,6 +261,9 @@ class Worker:
         # Background loops in a failure episode: named so each one warns once.
         self._failing: set[str] = set()
         self._current: set[str] = set()
+        # When the next delayed job is due, as the last claim that found nothing said:
+        # an idle slot blocks until then. None when nothing is delayed (or unknown).
+        self._due_ms: int | None = None
         # The processor task of each running job, so a cancellation can reach it, and
         # job id -> (its processor's task, the claim it is running). The claim fences
         # a cancellation against an id that has been reused since the request was made.
@@ -329,7 +347,7 @@ class Worker:
             asyncio.create_task(self._process_loop()) for _ in range(self.concurrency)
         ]
         bg = [
-            asyncio.create_task(self._promote_loop()),
+            asyncio.create_task(self._schedules_loop()),
             asyncio.create_task(self._cancel_listener(cancels)),
         ]
         if self.stalled_interval > 0:
@@ -527,17 +545,12 @@ class Worker:
         # expires and the stalled sweep recovers it - the normal at-least-once path.
         while self._running:
             try:
-                # The marker only wakes us; the real claim is the atomic
-                # MOVE_TO_ACTIVE below. A timeout (None) is fine - we still try
-                # to acquire, so a missed marker can never strand a job.
-                woke = await self.redis.bzpopmin(self.keys.marker, self._pop_timeout)
-                if not self._running:
-                    # Shutting down - don't claim a new job. A marker we popped was
-                    # a wake for a worker that still can, so hand it on: swallowed,
-                    # the work it signalled waits out someone's block_timeout.
-                    if woke:
-                        await self.redis.zadd(self.keys.marker, {"0": 0})
-                    break
+                # The claim comes first: it promotes the delayed jobs that are due and,
+                # finding nothing, says when the next one is due. Then the marker only
+                # wakes us; the real claim is the atomic MOVE_TO_ACTIVE. A timeout
+                # (None) is fine - we claim again, so a missed marker can never strand
+                # a job, and a delayed job is promoted at its due time by whichever
+                # comes first, the wake or the block ending.
                 loaded = await self._acquire()
                 # Keep processing as long as each finish hands us the next job. No
                 # `_running` check here: a job in hand is already claimed, and stop()
@@ -546,6 +559,15 @@ class Worker:
                 # chain by itself: a stopping worker finishes with fetch=0.
                 while loaded is not None:
                     loaded = await self._handle(loaded)
+                if not self._running:
+                    break
+                timeout = block_for(self._pop_timeout, self._due_ms, _now_ms())
+                woke = await self.redis.bzpopmin(self.keys.marker, timeout)
+                if woke and not self._running:
+                    # Shutting down - don't claim a new job. A marker we popped was
+                    # a wake for a worker that still can, so hand it on: swallowed,
+                    # the work it signalled waits out someone's block_timeout.
+                    await self.redis.zadd(self.keys.marker, {"0": 0})
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -561,7 +583,6 @@ class Worker:
         self._move_to_failed = register(scripts.MOVE_TO_FAILED)
         self._move_to_cancelled = register(scripts.MOVE_TO_CANCELLED)
         self._move_stalled = register(scripts.MOVE_STALLED)
-        self._promote_delayed = register(scripts.PROMOTE_DELAYED)
         self._add_scheduled = register(scripts.ADD_SCHEDULED)
         self._stamp = register(scripts.STAMP_MODEL)
         self._update_progress = register(scripts.UPDATE_PROGRESS)
@@ -606,7 +627,17 @@ class Worker:
                 await self.redis.zadd(self.keys.marker, {"0": 0})
 
     def _loaded(self, res: list[Any] | None) -> tuple[str, dict[str, str]] | None:
+        """Read the claim's answer: the job, or None.
+
+        A claim that found nothing may say when the next delayed job is due. Every
+        answer replaces the last one, so a stale due time never shortens the block
+        after the job has been taken.
+        """
+        self._due_ms = None
         if not res:
+            return None
+        if res[0] == scripts.DUE_SENTINEL:
+            self._due_ms = int(float(res[1]))
             return None
         fields = _pairs(res[0])
         if not fields:
@@ -970,9 +1001,8 @@ class Worker:
         return "1" if self._running else "0"
 
     def _next_from(self, res: Any) -> tuple[str, dict[str, str]] | None:
-        if isinstance(res, (list, tuple)) and len(res) >= 3:
-            return (str(res[2]), _pairs(res[1]))
-        return None
+        """Read what a finish fetched next: the claim's answer after the outcome."""
+        return self._loaded(list(res[1:])) if isinstance(res, (list, tuple)) else None
 
     # ---- locks & recovery -------------------------------------------------
 
@@ -1068,32 +1098,22 @@ class Worker:
                 # on another worker. Asking twice is a no-op (see _request_cancel).
                 self._request_cancel(job_id)
 
-    async def _promote_loop(self) -> None:
+    async def _schedules_loop(self) -> None:
+        """Repair schedules every SCHEDULE_CHECK_S, from startup on.
+
+        Delayed jobs need no loop: the claim promotes the ones that are due, and an
+        idle slot blocks until the next due time the claim told it.
+        """
         while self._running:
             try:
-                # Drain in bounded chunks: a full batch means more may be due, so
-                # go again at once - each call blocks Redis ~ms, not the whole sweep.
-                while self._running:
-                    promoted = await self._promote_delayed(
-                        keys=[
-                            self.keys.delayed,
-                            self.keys.prioritized,
-                            self.keys.marker,
-                            self.keys.base,
-                            self.keys.pc,
-                        ],
-                        args=[_now_ms(), scripts.PROMOTE_BATCH],
-                    )
-                    if int(promoted) < scripts.PROMOTE_BATCH:
-                        break
                 await self._resume_orphaned_schedules()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._loop_failed("the delayed-job sweep", exc)
+                self._loop_failed("the schedule check", exc)
             else:
-                self._loop_recovered("the delayed-job sweep")
-            await asyncio.sleep(1.0)
+                self._loop_recovered("the schedule check")
+            await asyncio.sleep(SCHEDULE_CHECK_S)
 
     async def _resume_orphaned_schedules(self) -> None:
         """Enqueue the next occurrence of a schedule whose queued one was dropped.

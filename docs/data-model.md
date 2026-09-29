@@ -23,10 +23,10 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 |---|---|---|
 | `id` | string (counter) | `INCR`-ed to mint auto job ids. |
 | `prioritized` | ZSET | Waiting jobs in global priority order; score packs (priority, sequence). This *is* the `wait` state. |
-| `marker` | ZSET | A single idempotent base member (`"0"`); idle workers `BZPOPMIN` it to wake. It only signals; the real claim is atomic. |
+| `marker` | ZSET | Two idempotent members: `"0"` (score 0) says work is waiting, `"1"` is scored at the earliest time a delayed job is due; idle workers `BZPOPMIN` it to wake. It only signals; the real claim is atomic. |
 | `pc` | string (counter) | Priority sequence counter, so same-priority jobs stay FIFO. |
 | `active` | LIST | Ids currently claimed by a worker and running. |
-| `delayed` | ZSET | Ids scored by their process-at timestamp (ms); promoted to `prioritized` when due. |
+| `delayed` | ZSET | Ids scored by their process-at timestamp (ms); promoted to `prioritized` by the first claim once due. |
 | `completed` | ZSET | Successfully-finished ids, scored by retention position: finish time, except a running flow's children (above every timestamp) and a settled flow's children (just above their root). |
 | `failed` | ZSET | Terminally-failed ids, scored the same way. |
 | `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |

@@ -207,25 +207,36 @@ async def test_a_retried_occurrence_does_not_start_a_second_chain(
 ):
     """The first attempt enqueued the next occurrence; a retry after the clock moved
     past it must not enqueue another at a later slot, which would run the schedule
-    twice from then on."""
+    twice from then on. The next occurrence is due by then, so the retry's own claim
+    promotes it and it runs right after: the chain is read while the retry runs."""
     await q.add_scheduler("tick", every=60_000, attempts=2)
     (first,) = await q.redis.zrange(q.keys.delayed, 0, -1)
     slot = int(first.rsplit(":", 1)[1])
     assert await q.promote_job(first) is True
     clock = {"now": slot + 10}
     monkeypatch.setattr("toro.worker._now_ms", lambda: clock["now"])
-    attempts: list[int] = []
+    runs = 0
+    chain: list[tuple[float | None, list[str]]] = []
 
     async def proc(job):
-        attempts.append(job.attempts_made)
-        if len(attempts) == 1:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
             clock["now"] = slot + 70_000  # past the next slot before the retry
             raise RuntimeError("first attempt fails")
+        if job.id == first:  # the retry: what did its pickup leave of the chain?
+            chain.append(
+                (
+                    await q.redis.zscore(q.keys.repeat, "tick"),
+                    await q.redis.zrange(q.keys.delayed, 0, -1),
+                )
+            )
 
     async with run_worker(q, proc):
-        assert await run_until(lambda: len(attempts) == 2)
+        assert await run_until(lambda: chain)
 
-    assert await q.redis.zrange(q.keys.delayed, 0, -1) == [f"repeat:tick:{slot + 60_000}"]
+    # the chain stands where the first attempt left it, and the retry minted nothing
+    assert chain == [(slot + 60_000, [])]
 
 
 async def test_a_whole_float_interval_runs_like_the_int(q, run_worker, run_until):

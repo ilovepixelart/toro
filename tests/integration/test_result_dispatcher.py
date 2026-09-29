@@ -125,8 +125,8 @@ async def test_retry_all_failed_on_an_empty_queue(q):
 
 
 async def test_promote_drains_more_than_one_full_batch(q, run_worker, run_until):
-    # A due-backlog larger than PROMOTE_BATCH forces the worker's drain loop to
-    # go around again instead of waiting a tick per batch.
+    # A due backlog larger than PROMOTE_BATCH takes more than one claim to promote:
+    # each claim promotes a batch, and the claims that follow take the rest.
     n = scripts.PROMOTE_BATCH + 5
     due = int(time.time() * 1000) - 1000
     pipe = q.redis.pipeline(transaction=False)

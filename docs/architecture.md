@@ -32,9 +32,9 @@ can't starve a high-priority one.
 A single ZSET can't be blocking-popped, so wakeup uses a small **base marker**:
 producers `ZADD marker 0 "0"` (idempotent) on enqueue, and idle workers park on
 `BZPOPMIN marker`. The marker only wakes a worker; the real claim is the atomic
-`MOVE_TO_ACTIVE` (`ZPOPMIN prioritized` → push to `active` → set the lock → load
-the job). Because the claim is atomic and idempotent, a missed marker can never
-strand a job.
+`MOVE_TO_ACTIVE` (promote the delayed jobs that are due → `ZPOPMIN prioritized` →
+push to `active` → set the lock → load the job). Because the claim is atomic and
+idempotent, a missed marker can never strand a job.
 
 ## Fetch-next inside finish
 
@@ -70,8 +70,14 @@ at finish, not by preventing duplicate handler runs.
 ## Delayed jobs
 
 Delayed jobs and retries with backoff sit in a `delayed` ZSET scored by their
-process-at timestamp (ms). A one-second promotion loop in the worker moves any
-due jobs into the prioritized set.
+process-at timestamp (ms). Every claim first moves the due ones into the
+prioritized set (`PROMOTE_BATCH` at most, so a backlog coming due at once holds
+Redis for milliseconds per claim), and a claim that finds nothing answers with the
+next due time, which the idle slot blocks until. Whatever delays a job marks that
+time on the marker (`"1"`, scored at the earliest due time known), so an idle
+worker blocked past it wakes, claims again, and hears the sooner time. No worker
+polls for delayed jobs: an idle fleet's Redis load is one blocking pop per slot
+per `block_timeout`.
 
 ## Higher-level features
 
@@ -137,14 +143,13 @@ And the scripts themselves:
 |---|---|---|
 | `ADD_JOB` | producer | Mint/accept an id, write the hash, enqueue or delay, dedup, publish `added`. |
 | `ADD_FLOW` | producer | Create a whole flow tree atomically: leaves enqueued/delayed, parents parked with their `:deps` barrier. |
-| `MOVE_TO_ACTIVE` | worker wakeup | Claim the next job: `ZPOPMIN prioritized` → `active` → lock + load. |
+| `MOVE_TO_ACTIVE` | worker wakeup | Claim the next job: promote up to `PROMOTE_BATCH` (1000) due delayed jobs → `ZPOPMIN prioritized` → `active` → lock + load; or answer when the next delayed job is due. |
 | `MOVE_TO_COMPLETED` | worker finish | Commit the result (settling a flow child into its parent) and fetch-next in one round trip. |
 | `MOVE_TO_FAILED` | worker finish | Retry (to `wait`/`delayed`) or terminally fail (applying a flow child's `on_fail`), and fetch-next. |
 | `EXTEND_LOCK` | renewer | Token-guarded lock renewal; clears the job from `stalled`. Answers `LOCK_CANCEL_REQUESTED` (2) when the job carries a cancellation, which is the backstop for a request whose message never arrived. |
 | `CANCEL_JOB` | producer/dashboard | Stop a job wherever it is: one that has not started ends here (its subtree with it), a running one is flagged and its worker told over the cancel channel. |
 | `MOVE_TO_CANCELLED` | worker finish | Commit a job the worker stopped, token-guarded like the other finishes. |
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
-| `PROMOTE_DELAYED` | promote loop | Move up to `PROMOTE_BATCH` (1000) due delayed jobs to `prioritized`. |
 | `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |
 | `UPDATE_PROGRESS` | processor (`job.update_progress`) | Write progress and publish the `progress` event, only while the job hash exists: a removed job's cleanup cannot recreate it as a stub. |
 | `APPEND_LOG` | processor (`job.log`) | Append a log line, only while the job hash exists, for the same reason. |

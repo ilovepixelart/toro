@@ -13,8 +13,8 @@ toro has a clean producer/consumer split, and both talk to the same Redis.
 - A **`Worker`** is the *consumer*. You give it a queue name and an `async`
   processor function; calling `worker.run()` starts claiming jobs, running the
   processor over each, and recovering jobs from workers that died. A worker also
-  runs small background loops (delayed-job promotion, stalled-job sweep,
-  heartbeat) while it's alive.
+  runs small background loops (schedule check, stalled-job sweep, heartbeat)
+  while it's alive.
 - A **`Job`** is one unit of work. It carries an `id`, a `name` (a label you
   choose, e.g. `"welcome"`), a JSON-serializable `data` payload, its options, and
   bookkeeping the system fills in: `state`, `attempts_made`, timestamps
@@ -36,7 +36,7 @@ type, `JobState`:
 | State | Meaning |
 |---|---|
 | `wait` | Ready to run, waiting for a free worker. (Stored in the priority-ordered set, so "wait" and "prioritized" are the same place.) |
-| `delayed` | Scheduled for the future; not yet runnable. Promoted to `wait` when due. |
+| `delayed` | Scheduled for the future; not yet runnable. Promoted to `wait` by the first claim once due. |
 | `held` | Waiting on a `concurrency_key` another job holds. It waits on that job, not on a worker, so it occupies no slot and no place in the queue. |
 | `active` | Claimed by a worker and currently running. |
 | `waiting-children` | A flow parent, parked until every child settles; released to `wait` by its last child. |

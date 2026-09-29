@@ -4,7 +4,7 @@ Breaking changes by release, newest first, each with what to do about it.
 
 ## 1.0.3
 
-Four things change for a caller, and one for a rolling upgrade. The rest are fixes.
+Five things change for a caller, and two for a rolling upgrade. The rest are fixes.
 
 **`attempts_made` counts the runs that finished.** A run cut short by a stall or a
 shutdown used to spend one of the job's `attempts`, so with `attempts=2` a job whose
@@ -26,10 +26,20 @@ and on Python 3.10 it failed that job and went on claiming instead.
 `every=1000.0` was stored as text the worker could not read, which ended the schedule
 at its first pickup; a whole float such as `60_000 / 2` still works.
 
+**Delayed jobs are promoted by the claim, not by a sweep.** Every worker used to move
+due delayed jobs into the queue once a second, so an idle fleet's Redis load grew with
+its size. A claim now promotes what is due before it picks, and a worker with nothing
+to claim blocks until the next due time the claim answered with, woken sooner by any
+job delayed to an earlier time. A delayed job runs when due rather than up to a
+second later, an idle slot sends one blocking pop per `block_timeout`, and the
+schedule check that shared the sweep's loop runs every five seconds.
+
 **Rolling upgrade.** Where `result()` is used with `remove_on_complete=True`, upgrade
 producers before workers: a 1.0.3 worker publishes such a result inside the event
 only (`resultJson`), and a 1.0.2 producer reads it from the job's hash, which is
-already gone, and resolves `None`.
+already gone, and resolves `None`. A job delayed by a 1.0.2 producer does not wake a
+1.0.3 worker, which sees it at its next claim or idle poll (`block_timeout`, 5 s by
+default); 1.0.2 workers keep their own sweep.
 
 Fixes:
 
@@ -49,7 +59,7 @@ Fixes:
   again reports as running, not draining.
 - A cancel request applies to the run it was made for: a job id re-added while its
   cancelled run unwinds is no longer cancelled with it.
-- The delayed-job sweep, the stalled sweep and the heartbeat log one warning per
+- The schedule check, the stalled sweep and the heartbeat log one warning per
   failure episode and one line on recovery, where they were silent.
 - `get_job()` returns `None` for an id that names one of the queue's own keys or a
   hash that is not a job's; `get_jobs()` reads a negative index from the end and an

@@ -1,21 +1,28 @@
-"""@load - PROMOTE_DELAYED must promote due jobs in bounded chunks (LIMIT), so
-a big backlog coming due at once (e.g. a backoff storm after an outage) never
-blocks Redis for the whole sweep.
+"""@load - a claim must promote due delayed jobs in bounded chunks (LIMIT), so a
+big backlog coming due at once (e.g. a backoff storm after an outage) never blocks
+Redis for the whole backlog inside one claim.
 
-Seeds M delayed jobs all due now, drains them with repeated promote calls, and
-samples PING latency from a second connection throughout: no single call - and
+Seeds M delayed jobs all due now, drains `delayed` with repeated claims, and
+samples PING latency from a second connection throughout: no single claim - and
 no observed stall - may approach the duration of the whole drain. Baseline
 recorded on local Redis 7.4 before chunking: one call swept all M jobs and an
 independent client's PING stalled for the full sweep (M=50k: 131ms, ~2.6µs/job).
 """
 
 import asyncio
+import math
 import time
 
 import redis.asyncio as aioredis
 
-from toro import scripts
+from toro import Worker, scripts
 from toro.queue import Queue
+
+PREFIX = "torotest"
+
+
+async def _noop(job):
+    return None
 
 
 async def _wipe(q: Queue) -> None:
@@ -68,9 +75,9 @@ async def _ping_sampler(url: str, stop: asyncio.Event) -> list[float]:
     return stalls
 
 
-async def test_promote_delayed_drains_in_bounded_chunks(q, load_scale):
-    print("\n--- PROMOTE_DELAYED chunked drain (must not block Redis) ---")
-    promote = q.redis.register_script(scripts.PROMOTE_DELAYED)
+async def test_a_claim_promotes_due_jobs_in_bounded_chunks(q, load_scale):
+    print("\n--- claim-path promotion, chunked drain (must not block Redis) ---")
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
     for m in (int(10_000 * load_scale), int(50_000 * load_scale)):
         await _wipe(q)
         await _seed_delayed_due(q, m)
@@ -79,29 +86,23 @@ async def test_promote_delayed_drains_in_bounded_chunks(q, load_scale):
         sampler = asyncio.create_task(_ping_sampler("redis://localhost:6379", stop))
         await asyncio.sleep(0.05)  # let the sampler establish a baseline
         per_call: list[float] = []
-        total = 0
-        while True:
+        while await q.redis.zcard(q.keys.delayed):
             t0 = time.perf_counter()
-            n = await promote(
-                keys=[q.keys.delayed, q.keys.prioritized, q.keys.marker, q.keys.base, q.keys.pc],
-                args=[int(time.time() * 1000), scripts.PROMOTE_BATCH],
-            )
+            assert await w._acquire() is not None  # promotes a batch, takes one
             per_call.append((time.perf_counter() - t0) * 1000)
-            total += n
-            if n < scripts.PROMOTE_BATCH:
-                break
         await asyncio.sleep(0.05)
         stop.set()
         stalls = await sampler
 
-        assert total == m
-        assert (await q.counts())["wait"] == m  # every due job landed in prioritized
+        assert len(per_call) == math.ceil(m / scripts.PROMOTE_BATCH)
+        counts = await q.counts()
+        assert counts["wait"] + counts["active"] == m  # every due job was promoted
         total_ms = sum(per_call)
         print(
-            f" M={m:>6}: drained in {len(per_call)} calls, {total_ms:>7.1f}ms total   "
-            f"max call {max(per_call):>6.1f}ms   PING max {max(stalls):>6.1f}ms"
+            f" M={m:>6}: drained in {len(per_call)} claims, {total_ms:>7.1f}ms total   "
+            f"max claim {max(per_call):>6.1f}ms   PING max {max(stalls):>6.1f}ms"
         )
-        # Chunking: neither a single promote call nor an independent client's
-        # stall may approach the duration of the whole drain.
-        assert max(per_call) < total_ms * 0.5, f"one call swept ~everything: {per_call[:3]}"
+        # Chunking: neither a single claim nor an independent client's stall may
+        # approach the duration of the whole drain.
+        assert max(per_call) < total_ms * 0.5, f"one claim swept ~everything: {per_call[:3]}"
         assert max(stalls) < total_ms * 0.5, f"Redis blocked ~the whole drain: {max(stalls):.1f}ms"
