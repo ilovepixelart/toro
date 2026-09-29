@@ -57,8 +57,10 @@ async def test_stop_before_run_starts_ends_it(q):
     try:
         await w.stop()
         # asyncio.wait, not wait_for: wait_for cancels run() on timeout, and run()
-        # returns quietly from a cancellation, which would hide the bug it looks for
-        done, _ = await asyncio.wait({task}, timeout=3)
+        # returns quietly from a cancellation, which would hide the bug it looks for.
+        # The bound only keeps a run() that carries on from hanging the test; it is
+        # not a speed claim, and a loaded CI runner has spent 3 s on the shutdown.
+        done, _ = await asyncio.wait({task}, timeout=10)
         assert task in done, "run() carried on after stop()"
         await q.add("after-stop", {})
         await asyncio.sleep(0.3)  # nothing may claim it: asserting an absence
@@ -96,7 +98,7 @@ async def test_stop_while_run_is_starting_ends_it(q, monkeypatch, own_pool):
         await asyncio.sleep(0)  # run() is now held in its first round trip
         await w.stop()
         release.set()
-        done, _ = await asyncio.wait({task}, timeout=3)  # not wait_for: see above
+        done, _ = await asyncio.wait({task}, timeout=10)  # not wait_for: see above
         assert task in done, "run() carried on after stop()"
 
         await q.add("after-stop", {})
@@ -154,7 +156,7 @@ async def test_cancelling_run_directly_ends_the_worker(q):
         job = await q.add("cut-off", {})
         await asyncio.wait_for(started.wait(), 5)
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=3)  # not wait_for: see above
+        done, _ = await asyncio.wait({task}, timeout=10)  # not wait_for: see above
         assert task in done, "run() carried on after being cancelled"
         assert (await q.get_job(job.id)).state == "wait"  # handed back, not failed
     finally:
