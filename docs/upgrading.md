@@ -57,6 +57,9 @@ Fixes:
 - A repeatable schedule survives an occurrence picked up early, one that fails before
   minting its successor, `cancel_job`, `remove_job` or `clean("delayed")` of a pending
   occurrence, and `remove_scheduler()` landing while the next occurrence is minted.
+- `remove_job("repeat:<scheduler id>")` returns False and leaves the scheduler's
+  template alone. It used to delete it: the scheduler stayed listed with no cadence
+  and ended after its pending occurrence.
 - Lock renewal survives a Redis error while the lease still holds; the job is not
   run twice.
 - A finish is re-sent through a Redis blip while the lease holds, and one whose first

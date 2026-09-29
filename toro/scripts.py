@@ -1244,9 +1244,10 @@ local function removeTree(jobId)
   end
 end
 -- What a key IS, not what it is called: a job id arrives from a URL and a job hash
--- lives beside the queue's own keys, so `totals`, `meta` or `worker:<token>` would
--- otherwise be removable by asking to remove a job. Every job carries its options.
-local existed = redis.call("HEXISTS", base .. ARGV[1], "opts")
+-- lives beside the queue's own keys, so `totals`, `meta`, `worker:<token>` or a
+-- scheduler's template (`repeat:<id>`, which carries options like a job) would
+-- otherwise be removable by asking to remove a job. Every job is stamped at its add.
+local existed = redis.call("HEXISTS", base .. ARGV[1], "timestamp")
 if existed == 0 then return 0 end
 local parentId = redis.call("HGET", base .. ARGV[1], "parentId")
 removeTree(ARGV[1])
