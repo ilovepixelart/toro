@@ -99,6 +99,21 @@ def read_timeout(client: aioredis.Redis) -> float | None:
     return None if timeout is None else float(timeout)
 
 
+def require_decoded(client: aioredis.Redis) -> None:
+    """Refuse a client that hands back bytes.
+
+    Every reply is read as str (see _replies). On redis-py's default client a worker
+    ran each job with no name, no data and no cancel flag, and never committed a
+    finish: its keys were built from a repr. The flag sits in the pool's kwargs
+    whenever it was set, and unset means bytes.
+    """
+    if not client.connection_pool.connection_kwargs.get("decode_responses", False):
+        raise ValueError(
+            "connection= must be a client created with decode_responses=True: "
+            "toro reads every reply as text"
+        )
+
+
 def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
     """How long a blocking read may block: `block_timeout`, held under the
     connection's read timeout. A read that outlasts it raises instead of timing out
