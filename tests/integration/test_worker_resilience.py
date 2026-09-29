@@ -4,9 +4,11 @@ Redis error between the blocking pop and the finish.
 """
 
 import asyncio
+import logging
 import time
 
 import redis.asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 
 async def test_raising_event_callback_does_not_kill_the_slot(q, run_worker, run_until):
@@ -99,3 +101,67 @@ async def test_idle_repoll_survives_a_read_timeout_shorter_than_the_pop(q, run_w
     conn = aioredis.from_url("redis://localhost:6379", socket_timeout=0.4, decode_responses=True)
     async with run_worker(q, proc, connection=conn, block_timeout=1.0, stalled_interval=0):
         assert await run_until(lambda: done, timeout=3.0), "the idle re-poll never claimed it"
+
+
+async def test_a_finish_is_re_sent_through_a_blip(q, run_worker, caplog):
+    """A finish that failed on a connection error was dropped, and the job re-ran
+    after the sweep. A finish is idempotent (the token and claim guards refuse a
+    replay of one that ran), so it is re-sent while the lease holds: a blip becomes a
+    late commit. The retries never fetch the next job."""
+    seen_fetch: list[str] = []
+    blips = 2
+
+    async with run_worker(q, lambda job: "done", stalled_interval=0) as w:
+        real = w._move_to_completed
+
+        async def flaky(*, keys, args):
+            nonlocal blips
+            seen_fetch.append(args[4])  # ARGV[5]: fetch the next job
+            if blips:
+                blips -= 1
+                raise RedisConnectionError("blip")
+            return await real(keys=keys, args=args)
+
+        w._move_to_completed = flaky
+        with caplog.at_level(logging.INFO, logger="toro.worker"):
+            job = await q.add("once", {})
+            assert await q.result(job.id, timeout=10) == "done"
+
+    assert seen_fetch == ["1", "0", "0"]
+    assert (await q.get_job(job.id)).attempts_made == 1  # committed once, never re-run
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "a finish" in warnings[0]
+    assert [r.message for r in caplog.records if r.levelno == logging.INFO] == [
+        "a finish recovered"
+    ]
+
+
+async def test_a_redis_outage_logs_once_and_backs_off(q, run_worker, run_until, caplog):
+    """With Redis down every slot logged a full traceback ten times a second. One
+    warning opens the outage, the pause doubles up to the block timeout, and one
+    line closes it."""
+    calls = 0
+    down = True
+
+    async with run_worker(
+        q, lambda job: None, concurrency=3, stalled_interval=0, block_timeout=1.0
+    ) as w:
+        real = w.redis.bzpopmin
+
+        async def flaky(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if down:
+                raise RedisConnectionError("down")
+            return await real(*args, **kwargs)
+
+        with caplog.at_level(logging.INFO, logger="toro.worker"):
+            w.redis.bzpopmin = flaky
+            await asyncio.sleep(2.0)
+            during = calls
+            down = False
+            assert await run_until(lambda: "a claim recovered" in caplog.text, timeout=5)
+
+    assert during <= 3 * 8, during  # three slots backing off, not thirty attempts a second
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "a claim" in warnings[0]
