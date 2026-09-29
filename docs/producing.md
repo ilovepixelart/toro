@@ -90,6 +90,7 @@ hit, a job about a row that was rolled back.
 | `priority` | 0 | Higher = more urgent, one global order (a whole number from 0; values above 2^20 are clamped to it). Default 0 is the least-urgent band, FIFO among itself. |
 | `delay` | 0 | ms before the job becomes runnable; it sits in `delayed` until due. |
 | `attempts` | 1 | Total tries before the job is terminally failed. |
+| `timeout` | unset | Milliseconds an async processor may run before the job fails (a `TimeoutError` naming the limit, retried like any other failure). A sync processor's thread cannot be taken back, so it does not apply there. |
 | `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms}`. Exponential doubles per attempt. |
 | `remove_on_complete` | unset | Which successes to keep: unset keeps the newest 1000, `False` keeps all, `True` removes at once, `N` keeps the newest N, `{"count": N, "age": seconds}` bounds both. |
 | `remove_on_fail` | unset | Same, for terminal failures; unset keeps the newest 5000. |
