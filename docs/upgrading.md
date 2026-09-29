@@ -128,7 +128,13 @@ are validated like every option: whole numbers of at least 1 (a whole float such
 `60_000 / 2` is fine), and a string, a fraction or a bool raises `ValueError` where
 `rate_limit` used to coerce them. An option given as an int subclass (an `IntEnum`)
 is stored as a plain int: it used to reach Redis as the enum's repr, and `add()`
-failed after the job hash was written, on an id already spent.
+failed after the job hash was written, on an id already spent. Every entry point
+validates the same way: `add_scheduler()` refuses a `priority` or a `name` that
+`add()` refuses (it clamped the one and stored the other) and takes the queue's
+default priority when none is given (its own default of 0 won over it); a flow node's
+name is checked like a job's; a deduplication `ttl` refuses a bool, a fraction or a
+string (`True` was a 1 ms window); and an unknown option raises `ValueError` from
+`add()` as it does from a flow node, where it raised `TypeError`.
 
 ## 1.0.2
 

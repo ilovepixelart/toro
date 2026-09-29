@@ -1116,3 +1116,18 @@ async def test_a_retried_job_gets_a_fresh_stall_budget(q):
     await w.check_stalled(throttle_ms=0)  # mark
 
     assert await w.check_stalled(throttle_ms=0) == ([], [job.id])  # recovered, not failed
+
+
+@pytest.mark.parametrize("ttl", [True, 1.5, "60000"], ids=["bool", "fraction", "text"])
+async def test_a_dedup_ttl_is_validated_like_every_option(q, ttl):
+    """`ttl=True` became a 1 ms window and `1.5` a 1 ms one: the throttle silently
+    off. Every other option refuses these."""
+    with pytest.raises(ValueError, match="ttl"):
+        await q.add("sync", {}, deduplication={"id": "user-42", "ttl": ttl})
+
+
+async def test_an_unknown_option_is_a_value_error_on_add_too(q):
+    """A typo'd option raised `TypeError` from add() and `ValueError` from a flow
+    node; the docs promise `ValueError` for every option error."""
+    with pytest.raises(ValueError, match="prority"):
+        await q.add("sync", {}, prority=1)
