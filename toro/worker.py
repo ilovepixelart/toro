@@ -64,6 +64,13 @@ MIN_BLOCKED_WARNING = 0.01
 # repair for a rare loss, so seconds apart: every worker runs it on its own.
 SCHEDULE_CHECK_S = 5.0
 
+# The shortest block an idle slot sends when the due time it was told has passed.
+# Never 0, which a blocking pop reads as "no timeout"; and not 0.001 either: Redis
+# 6.2 parses the timeout into whole milliseconds by truncating a long double
+# product, which turns 0.001 into 0 and blocks for good (Redis 7 rounds up). Ten
+# milliseconds survives both and is under either server's timeout granularity.
+MIN_BLOCK_S = 0.01
+
 
 def _blocked_threshold(blocked_warning: float | None, lock_renew_time: int) -> float:
     """How long the loop may be unable to run anything before that is worth saying.
@@ -130,11 +137,11 @@ def block_for(pop_timeout_s: float, due_ms: int | None, now_ms: int) -> float:
     """Bound an idle slot's block: the poll, cut short at the next due time the claim
     told it, so a delayed job is promoted when due and not at the next poll.
 
-    Never 0, which a blocking pop reads as "no timeout".
+    Never below MIN_BLOCK_S: 0 would block for good, and so would 0.001 on Redis 6.2.
     """
     if due_ms is None:
         return pop_timeout_s
-    return min(pop_timeout_s, max((due_ms - now_ms) / 1000, 0.001))
+    return min(pop_timeout_s, max((due_ms - now_ms) / 1000, MIN_BLOCK_S))
 
 
 # How long a presence record outlives its worker's last heartbeat. Long enough that a

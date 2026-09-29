@@ -3,7 +3,7 @@ job is due."""
 
 import pytest
 
-from toro.worker import block_for
+from toro.worker import MIN_BLOCK_S, block_for
 
 
 @pytest.mark.parametrize(
@@ -12,10 +12,16 @@ from toro.worker import block_for
         pytest.param(None, 5.0, id="nothing-delayed-blocks-the-whole-poll"),
         pytest.param(12_000, 2.0, id="due-inside-the-poll-ends-the-block-then"),
         pytest.param(30_000, 5.0, id="due-past-the-poll-blocks-the-whole-poll"),
-        pytest.param(10_000, 0.001, id="due-now-returns-at-once-never-zero"),
-        pytest.param(9_000, 0.001, id="due-passed-returns-at-once-never-zero"),
+        pytest.param(10_000, MIN_BLOCK_S, id="due-now-returns-at-once-never-zero"),
+        pytest.param(9_000, MIN_BLOCK_S, id="due-passed-returns-at-once-never-zero"),
     ],
 )
 def test_block_for_ends_at_the_next_due_time_or_the_poll(due_ms, expected):
     # 0 would block for good: a blocking pop reads it as "no timeout".
     assert block_for(5.0, due_ms, now_ms=10_000) == expected
+
+
+def test_the_floor_is_a_wait_redis_6_reads_as_short():
+    """Redis 6.2 parses a blocking timeout into whole milliseconds by truncation, and
+    0.001 comes out as 0 (block for good); anything from 0.002 up survives it."""
+    assert MIN_BLOCK_S >= 0.01
