@@ -1008,7 +1008,6 @@ class Worker:
         to record: a timeout has no traceback of the job's own, and the one being
         handled then is the worker's cancellation, or none ("NoneType: None").
         """
-        self._failed += 1
         trace = traceback.format_exc() if stacktrace is None else stacktrace
         return await self._finish_failed(job, exc, trace)
 
@@ -1055,6 +1054,9 @@ class Worker:
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             await self._finish_lost(job.id)
             return None
+        # Counted once committed, like a completion or a cancellation: a run that lost
+        # its lock failed nothing the queue has a record of.
+        self._failed += 1
         job.failed_reason = str(exc)
         self._emit("failed" if res[0] == scripts.OUTCOME_FAILED else "retrying", job, exc)
         return self._next_from(res)

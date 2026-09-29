@@ -732,6 +732,38 @@ async def test_a_worker_counts_only_the_cancellations_it_committed(q, run_worker
         assert w._cancelled == 0, "a worker counted a cancellation it never committed"
 
 
+async def test_a_worker_counts_only_the_failures_it_committed(q, run_worker, run_until):
+    """A run that lost its lock and then raised commits nothing: the queue records no
+    failure, so the worker's own count must not either. It counted the attempt before
+    the commit, and the presence record showed a failure the queue has no record of."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    lost: list[str] = []
+
+    async def proc(job):
+        started.set()
+        await release.wait()
+        raise RuntimeError("late")
+
+    async with run_worker(q, proc, concurrency=2) as w:
+        w.on("lock-lost", lost.append)
+        job = await q.add("doomed", {})
+        await asyncio.wait_for(started.wait(), 10)
+        await q.redis.delete(q.keys.lock(job.id))  # taken over while it ran
+        release.set()
+        assert await run_until(lambda: lost == [job.id], timeout=5)
+
+        assert (await q.counts())["failed"] == 0  # the queue recorded nothing
+        assert w._failed == 0, "a worker counted a failure it never committed"
+
+        async def one_failed() -> bool:
+            return await _count(q, "failed") == 1
+
+        await q.add("doomed-too", {})  # this one keeps its lock and fails for real
+        assert await run_until(one_failed, timeout=5)
+        assert w._failed == 1
+
+
 async def test_a_removal_whose_message_is_lost_still_stops_the_processor(q, run_worker):
     """Removal stops a running job by telling its worker, and a message can be missed.
     A cancellation has the lock renewal as its backstop, but a removal deletes the

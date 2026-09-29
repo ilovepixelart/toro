@@ -69,6 +69,9 @@ Fixes:
   and ended after its pending occurrence.
 - Lock renewal survives a Redis error while the lease still holds; the job is not
   run twice.
+- A worker's presence record counts a failure once its commit has landed, as it
+  counts completions and cancellations: a run that lost its lock and then raised
+  commits nothing, and used to count.
 - A finish is re-sent through a Redis blip while the lease holds, and one whose first
   send ran but lost its reply is answered as that send was, with the job it fetched,
   whether the worker re-sent it or the client did on a new connection. It used to be
