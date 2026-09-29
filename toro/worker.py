@@ -1123,4 +1123,6 @@ class Worker:
         return failed, recovered
 
     def _backoff_delay(self, job: Job) -> int:
-        return compute_backoff(job.opts.backoff, job.attempts_made)
+        # attempts_made counts the runs that finished before this one; the run that is
+        # failing now is the next ordinal, and the backoff is that attempt's.
+        return compute_backoff(job.opts.backoff, job.attempts_made + 1)

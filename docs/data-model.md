@@ -55,7 +55,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 |---|---|---|
 | `repeat:<schedulerId>` | HASH | A scheduler's template: `name`, `every`/`cron`, `data`, `opts`. |
 | `worker:<workerId>` | HASH | A worker's presence record: host, pid, concurrency, global concurrency cap, current jobs, processed/failed counts, state. Expires a day after the last heartbeat. |
-| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade`, timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail`/`rootId` (children), `children` (parents), and `ckey` on a job with a concurrency key. |
+| `<jobId>` | HASH | The job itself: `name`, `data`, `opts`, `state`, `attemptsMade` (runs that finished; a stall or a shutdown spends none), timestamps, `returnvalue`/`failedReason`, `progress`, `stacktrace`, plus flow linkage on flow jobs: `parentId`/`onFail`/`rootId` (children), `children` (parents), and `ckey` on a job with a concurrency key. |
 | `<jobId>:lock` | string (token, PX) | The per-job lock: the owning worker's token with an expiry. Only the holder may finish or renew it. |
 | `<jobId>:logs` | LIST | Log lines appended by `job.log(...)` from inside a processor. |
 | `<jobId>:deps` | SET | A flow parent's still-pending child ids - the fan-in barrier; the parent releases when it empties. |

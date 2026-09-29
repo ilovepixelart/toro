@@ -67,7 +67,7 @@ async def test_cap_holds_across_workers(q):
         gauge.enter()
         try:
             await asyncio.sleep(0.03)
-            if job.data["flaky"] and job.attempts_made == 1:
+            if job.data["flaky"] and job.attempts_made == 0:  # its first run
                 raise RuntimeError("first attempt fails")
         finally:
             gauge.leave()

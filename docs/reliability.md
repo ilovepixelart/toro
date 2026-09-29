@@ -86,7 +86,8 @@ are bounded by `max_stalled_count`.
 Two different counters bound two different failure modes:
 
 - `attempts_made` vs `attempts` - *your code failed*: the processor raised.
-  Decided at finish time; retries re-enqueue (with [backoff](producing.md) if
+  Counted and decided at finish time, so a run cut short by a stall or a shutdown
+  spends no attempt; retries re-enqueue (with [backoff](producing.md) if
   configured) until attempts run out, then the job fails with your exception.
 - `stalledCounter` vs `max_stalled_count` - *the worker failed*: nobody renewed
   the lock. Decided by the sweep; bounds how many times an apparently

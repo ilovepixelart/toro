@@ -1059,12 +1059,13 @@ async def test_a_run_that_lost_its_lock_cannot_commit_over_its_own_workers_rerun
     lost: list[str] = []
 
     async def proc(job):
-        started.append(job.attempts_made)
-        if job.attempts_made == 1:
+        run = len(started) + 1  # attempts_made counts finished runs: 0 for both of these
+        started.append(run)
+        if run == 1:
             await release_first.wait()
         else:
             await release_second.wait()
-        return f"run {job.attempts_made}"
+        return f"run {run}"
 
     job = await q.add("x", {})
     async with run_worker(q, proc, concurrency=2, stalled_interval=0) as worker:
