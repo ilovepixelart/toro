@@ -98,7 +98,9 @@ def _whole(value: object, what: str, *, minimum: int = 0) -> int:
     if not isinstance(value, int) or value < minimum:
         msg = f"{what} must be a whole number >= {minimum}, not {value!r}"
         raise ValueError(msg)
-    return value
+    # A plain int: redis-py sends an int subclass (an IntEnum) as its repr, which the
+    # scripts' tonumber() reads as nothing after they have written.
+    return int(value)
 
 
 def _backoff(value: Backoff) -> Backoff:
