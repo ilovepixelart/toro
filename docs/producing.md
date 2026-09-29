@@ -91,7 +91,7 @@ hit, a job about a row that was rolled back.
 | `delay` | 0 | ms before the job becomes runnable; it sits in `delayed` until due. |
 | `attempts` | 1 | Total tries before the job is terminally failed. |
 | `timeout` | unset | Milliseconds an async processor may run before the job fails (a `TimeoutError` naming the limit, retried like any other failure). A sync processor's thread cannot be taken back, so it does not apply there. |
-| `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms}`. Exponential doubles per attempt. |
+| `backoff` | `None` | Delay before each retry: an int (fixed ms) or `{"type": "fixed"\|"exponential", "delay": ms, "max": ms, "jitter": 0..1}`. Exponential doubles per attempt; `max` caps the delay; `jitter` adds up to that share of the delay at random, so jobs that failed together do not retry together. Both optional. |
 | `remove_on_complete` | unset | Which successes to keep: unset keeps the newest 1000, `False` keeps all, `True` removes at once, `N` keeps the newest N, `{"count": N, "age": seconds}` bounds both. |
 | `remove_on_fail` | unset | Same, for terminal failures; unset keeps the newest 5000. |
 | `concurrency_key` | `None` | Jobs sharing a key run one at a time, in the order they were added. See [Serializing on a key](#serializing-on-a-key). |
