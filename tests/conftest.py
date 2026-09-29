@@ -165,7 +165,13 @@ def run_until():
 
 async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379, command: bytes = b""):
     """A TCP proxy to Redis that drops the reply to the first EVALSHA of `sha`:
-    the command runs on the server, and the client never hears back."""
+    the command runs on the server, and the client never hears back.
+
+    Everything the server sends on that connection from then on is dropped, not one
+    read: a reply arrives in as many chunks as TCP delivers, and a client handed the
+    tail of one reads it as an answer of its own. The client times out on the silence
+    and drops the connection, so nothing later is lost with it.
+    """
     swallowed = {"done": False}
 
     async def pipe(reader, writer, state, from_client):
@@ -182,8 +188,7 @@ async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379, command: 
                     swallowed["done"] = True
                     state["swallow"] = True
                 elif not from_client and state.get("swallow"):
-                    state["swallow"] = False  # this is the reply nobody will hear
-                    continue
+                    continue  # the reply nobody will hear, whole
                 writer.write(data)
                 await writer.drain()
         except (ConnectionError, OSError):
