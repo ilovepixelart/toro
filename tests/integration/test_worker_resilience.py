@@ -4,11 +4,15 @@ Redis error between the blocking pop and the finish.
 """
 
 import asyncio
+import hashlib
 import logging
 import time
 
+import pytest
 import redis.asyncio as aioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
+
+from toro import scripts
 
 
 async def test_raising_event_callback_does_not_kill_the_slot(q, run_worker, run_until):
@@ -165,3 +169,76 @@ async def test_a_redis_outage_logs_once_and_backs_off(q, run_worker, run_until, 
     assert during <= 3 * 8, during  # three slots backing off, not thirty attempts a second
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1 and "a claim" in warnings[0]
+
+
+async def _count(q, state: str, want: int) -> bool:
+    return (await q.counts())[state] >= want
+
+
+@pytest.mark.parametrize("succeed", [True, False], ids=["completed", "failed"])
+async def test_a_finish_whose_reply_was_lost_hands_over_the_job_it_fetched(
+    q, run_worker, run_until, swallow_first_reply, succeed
+):
+    """The first send committed the job and fetched the next one, then its reply was
+    lost. The re-send was refused (the lock is gone), the worker reported the finish
+    lost, and the fetched job sat locked in `active` with nobody running it until the
+    sweep. A finish records what it answered, and the re-send is answered the same."""
+    script = scripts.MOVE_TO_COMPLETED if succeed else scripts.MOVE_TO_FAILED
+    sha = hashlib.sha1(script.encode()).hexdigest()  # noqa: S324 - Redis names scripts by SHA1
+    await q.redis.script_load(script)  # cached: the swallowed reply must be the finish's own
+    proxy = await swallow_first_reply(sha)
+    port = proxy.sockets[0].getsockname()[1]
+    conn = aioredis.from_url(f"redis://localhost:{port}", socket_timeout=0.5, decode_responses=True)
+    ran: list[str] = []
+    lost: list[str] = []
+
+    async def proc(job):
+        ran.append(job.id)
+        if not succeed:
+            raise RuntimeError("boom")
+
+    await q.add("a", {}, attempts=1)
+    await q.add("b", {}, attempts=1)
+    try:
+        async with run_worker(q, proc, connection=conn, block_timeout=0.2, stalled_interval=0) as w:
+            w.on("lock-lost", lost.append)
+            assert await run_until(lambda: len(ran) == 2, timeout=5), f"ran {ran}"
+            state = "completed" if succeed else "failed"
+            assert await run_until(lambda: _count(q, state, 2), timeout=5)
+    finally:
+        await conn.aclose()
+        proxy.close()
+    assert lost == []
+
+
+async def test_a_cancel_whose_reply_was_lost_is_not_reported_lost(
+    q, run_worker, run_until, swallow_first_reply
+):
+    """A cancel commit fetches nothing, so nothing was stranded, but its lost reply
+    was reported as a lost lock on a job that had just been cancelled."""
+    sha = hashlib.sha1(scripts.MOVE_TO_CANCELLED.encode()).hexdigest()  # noqa: S324
+    await q.redis.script_load(scripts.MOVE_TO_CANCELLED)
+    proxy = await swallow_first_reply(sha)
+    port = proxy.sockets[0].getsockname()[1]
+    conn = aioredis.from_url(f"redis://localhost:{port}", socket_timeout=0.5, decode_responses=True)
+    started = asyncio.Event()
+    lost: list[str] = []
+    ended: list[str] = []
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(30)
+
+    job = await q.add("long", {})
+    try:
+        async with run_worker(q, proc, connection=conn, block_timeout=0.2, stalled_interval=0) as w:
+            w.on("lock-lost", lost.append)
+            w.on("cancelled", lambda job: ended.append(job.id))
+            await asyncio.wait_for(started.wait(), 5)
+            await q.cancel_job(job.id)
+            assert await run_until(lambda: ended, timeout=5)
+    finally:
+        await conn.aclose()
+        proxy.close()
+    assert lost == []
+    assert (await q.get_job(job.id)).state == "cancelled"
