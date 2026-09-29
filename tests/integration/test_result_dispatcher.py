@@ -292,3 +292,17 @@ async def test_a_failure_whose_event_was_lost_is_still_raised(q, run_until, monk
 
     with pytest.raises(JobFailedError, match="boom"):
         await asyncio.wait_for(waiting, 3)
+
+
+async def test_result_with_no_timeout_waits_for_the_job(q, run_worker, monkeypatch):
+    """`timeout=None` meant no limit while the wait was one `asyncio.wait_for`; the
+    re-read loop did arithmetic on it and raised TypeError at once."""
+    monkeypatch.setattr(queue_module, "RESULT_RECHECK_S", 0.2)
+
+    async def slow(job):
+        await asyncio.sleep(0.5)
+        return "eventually"
+
+    async with run_worker(q, slow):
+        job = await q.add("slow", {})
+        assert await q.result(job.id, timeout=None) == "eventually"

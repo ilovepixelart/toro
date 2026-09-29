@@ -48,6 +48,8 @@ Fixes:
 - A `result()` waiter whose completion event was lost (a pub/sub reconnect drops what
   was published in the gap) no longer waits out its timeout: it re-reads the job's
   hash every five seconds and once more before giving up.
+- `result(timeout=None)` waits without limit, as it did before the re-read loop, which
+  raised `TypeError` on it.
 - A `result()` waiter on redis-py 5.x outlives channel silence longer than the
   connection's read timeout: the events subscription read with no timeout, which that
   redis-py turns into the socket timeout, so ten quiet seconds ended the subscription

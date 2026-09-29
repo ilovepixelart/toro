@@ -236,7 +236,8 @@ value = await job.result(timeout=30)        # or queue.result(job.id)
 ```
 
 `result()` resolves with the processor's return value, raises `JobFailedError`
-on terminal failure, or `TimeoutError` after `timeout`. It registers for the
+on terminal failure, or `TimeoutError` after `timeout` (`None` waits without limit).
+It registers for the
 job's events *before* checking state, so a job that finishes while you wait is
 never missed, and it re-reads the job's hash every five seconds while it waits,
 so an event lost to a pub/sub reconnect delays the answer rather than losing it.
