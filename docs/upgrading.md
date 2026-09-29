@@ -50,6 +50,10 @@ Fixes:
   hash every five seconds and once more before giving up.
 - `result(timeout=None)` waits without limit, as it did before the re-read loop, which
   raised `TypeError` on it.
+- On Python 3.10, a job timeout or a cancel request landing while the worker drained
+  for shutdown read as the shutdown itself: the job went back to the queue with no
+  attempt spent, and a cancelled one stayed queued until its next claim. It ends
+  `failed` or `cancelled`, as on 3.11 and later.
 - A `result()` waiter on redis-py 5.x outlives channel silence longer than the
   connection's read timeout: the events subscription read with no timeout, which that
   redis-py turns into the socket timeout, so ten quiet seconds ended the subscription

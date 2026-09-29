@@ -904,7 +904,8 @@ async def test_a_worker_shutting_down_does_not_swallow_its_own_cancellation(q):
 
     settling = asyncio.create_task(worker._outcome(job, inner))
     await asyncio.sleep(0.1)
-    settling.cancel()  # the worker is going down
+    worker._cut_off = True  # the worker is going down, as stop() says before it cancels
+    settling.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await settling

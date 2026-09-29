@@ -232,6 +232,68 @@ async def test_a_sync_job_cut_off_past_the_grace_period_keeps_its_lock(q, run_un
     assert await q.redis.exists(q.keys.lock(job.id)) == 1
 
 
+async def _drain(w: Worker, run: asyncio.Task[None], grace: float) -> None:
+    await w.stop(grace_period=grace)
+    run.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run
+
+
+async def test_a_timeout_during_the_grace_period_fails_the_job(q):
+    """A job whose timeout fires while the worker drains is a timed-out job, not a
+    casualty of the shutdown: it ends `failed` with the timeout's reason. The worker's
+    own cancellation arrives as the same CancelledError, and before 3.11 the shutdown
+    flag stands in for the task's own cancellation count; stop() clears that flag
+    before the grace wait, so a run the worker itself asked to stop read as the
+    shutdown and went back to the queue with no attempt spent."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    job = await q.add("slow", {}, timeout=300, attempts=1)
+    w = Worker(q.name, proc, prefix=PREFIX, block_timeout=0.2, stalled_interval=0)
+    run = asyncio.create_task(w.run())
+    await asyncio.wait_for(started.wait(), 10)
+    await _drain(w, run, grace=5)  # the timeout fires inside this window
+
+    ended = await q.get_job(job.id)
+    assert ended.state == "failed", ended.state
+    assert "timeout" in (ended.failed_reason or "")
+
+
+async def test_a_cancel_during_the_grace_period_cancels_the_job(q):
+    """The same for a cancel request landing while the worker drains: the job ends
+    `cancelled` now, not back in the queue to be cancelled by whoever claims it. The
+    request reaches the run through its lock renewal: the cancel listener stops
+    with the claim loop, and the renewal is the backstop that outlives it."""
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        await asyncio.sleep(60)
+
+    job = await q.add("slow", {})
+    w = Worker(
+        q.name,
+        proc,
+        prefix=PREFIX,
+        block_timeout=0.2,
+        stalled_interval=0,
+        lock_duration=2_000,
+        lock_renew_time=500,
+    )
+    run = asyncio.create_task(w.run())
+    await asyncio.wait_for(started.wait(), 10)
+    stopping = asyncio.create_task(_drain(w, run, grace=5))
+    await asyncio.sleep(0.3)  # the grace wait is on
+    assert await q.cancel_job(job.id) is True
+    await stopping
+
+    assert (await q.get_job(job.id)).state == "cancelled"
+
+
 async def test_a_run_that_lost_its_lock_hands_nothing_back_at_shutdown(q):
     """The release is token-guarded like a finish: a job taken over by another run
     (its lock now carries another token) stays with that run, or two workers would
