@@ -500,13 +500,14 @@ class Queue:
         parent_of: dict[str, str],
     ) -> list[str]:
         """Build the node for each id in one BFS level, link it under its parent,
-        and return the next level's child ids. Hashes that vanished mid-walk are
-        skipped. Mutates `nodes`/`parent_of` (the walk's shared accumulators).
+        and return the next level's child ids. Hashes that vanished mid-walk, and
+        hashes that are not a job's, are skipped. Mutates `nodes`/`parent_of` (the
+        walk's shared accumulators).
         """
         next_level: list[str] = []
         for jid, h in zip(level, replies, strict=True):
-            if not h:
-                continue  # removed mid-walk (or a stale children entry)
+            if not h or "timestamp" not in h:
+                continue  # removed mid-walk (or a stale children entry), or `meta`
             nodes[jid] = {"job": Job.from_hash(jid, h), "children": []}
             if (pid := parent_of.get(jid)) is not None:
                 nodes[pid]["children"].append(nodes[jid])
@@ -518,8 +519,9 @@ class Queue:
     async def _hydrate_flow(self, job_id: str, depth: int) -> dict[str, Any] | None:
         """BFS-hydrate a flow tree into ``{"job": Job, "children": [<same>]}``,
         root-down, one pipelined round trip per level - O(depth), not O(nodes).
-        Shared by get_flow() and flow_view(). None when the root is gone; child
-        hashes that vanished mid-walk are skipped. `depth` bounds the walk.
+        Shared by get_flow() and flow_view(). None when the root is gone or is not a
+        job (one of the queue's own keys, as get_job() answers); child hashes that
+        vanished mid-walk are skipped. `depth` bounds the walk.
         """
         nodes: dict[str, dict[str, Any]] = {}
         parent_of: dict[str, str] = {}
@@ -528,9 +530,13 @@ class Queue:
             pipe = self.redis.pipeline(transaction=False)  # read fan-out per level
             for jid in level:
                 pipe.hgetall(self.keys.job(jid))
-            level = self._hydrate_level(
-                level, _hash_replies(await pipe.execute()), nodes, parent_of
-            )
+            try:
+                replies = _hash_replies(await pipe.execute())
+            except ResponseError as exc:
+                if "WRONGTYPE" not in str(exc):
+                    raise
+                return None  # the root names a state set (`completed`, ...), not a job
+            level = self._hydrate_level(level, replies, nodes, parent_of)
             if not level:
                 break
         return nodes.get(job_id)

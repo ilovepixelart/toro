@@ -379,6 +379,18 @@ async def test_flow_view_none_for_a_missing_job(q):
     assert await q.flow_view("nope") is None
 
 
+async def test_a_flow_read_of_something_that_is_not_a_job_is_none(q):
+    """A flow id arrives from a URL like a job id, and `meta` and the state sets live
+    beside the job hashes: get_flow("meta") hydrated the data-model stamp into a
+    tree of one fake job, and get_flow("prioritized") raised WRONGTYPE. get_job()
+    already answers None for both."""
+    await q.add("real", {})  # so meta is stamped and the `prioritized` set exists
+    assert await q.get_flow("meta") is None
+    assert await q.get_flow("prioritized") is None
+    assert await q.flow_view("meta") is None
+    assert await q.flow_view("prioritized") is None
+
+
 async def test_late_sibling_does_not_resurrect_failed_parent(q, run_worker, run_until):
     async def proc(job):
         if job.name == "bad":
