@@ -11,10 +11,11 @@ from .errors import (
 )
 from .flow import FlowChild, FlowView, OnFail
 from .job import Backoff, BackoffOpts, Deduplication, Job, JobOptions, JobState, RemoveOption
+from .limits import Limits, RateLimit
 from .openmetrics import render_all
 from .queue import FlowMetricsPoint, MetricsPoint, NameMetrics, PendingJobs, Queue
 from .scripts import DATA_MODEL_VERSION
-from .worker import RateLimit, Worker
+from .worker import Worker
 
 __all__ = [
     "DATA_MODEL_VERSION",
@@ -30,6 +31,7 @@ __all__ = [
     "JobFailedError",
     "JobOptions",
     "JobState",
+    "Limits",
     "MetricsPoint",
     "NameMetrics",
     "OnFail",

@@ -157,6 +157,7 @@ READS = {
     "is_paused",
     "latency",
     "lifetime_totals",
+    "limits",
     "metrics",
     "metrics_by_name",
     "metrics_text",

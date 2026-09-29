@@ -259,7 +259,7 @@ waiting; only the terminal outcome resolves the call.
 | `await queue.lifetime_totals()` / `metrics_text()` | Counters that never reset, and the OpenMetrics rendering of them ([Operating](operating.md)). |
 
 The shapes those metric calls return are exported and typed: `MetricsPoint`,
-`NameMetrics` and `FlowMetricsPoint`.
+`NameMetrics` and `FlowMetricsPoint`; `limits()` returns a `Limits`.
 
 Durations are kept in 26 geometric buckets (20 ms, each half again as wide as the
 last), so a percentile is an estimate within about a fifth of the true value. The
@@ -277,6 +277,7 @@ top bucket has no ceiling: a job over about 5.6 minutes (336,683 ms) reads as ab
 | `await queue.remove_job(job_id)` | Delete a job from every state, with its lock, logs and flow keys. A RUNNING job's async processor is stopped too, so its worker slot frees at once rather than when the work happens to end (a sync processor's thread runs to its end); the job is removed, not `cancelled`. Removing a flow parent removes its whole subtree - children included, even running ones. |
 | `await queue.clean(state, limit=1000)` | Remove every job in a state (pipelined). |
 | `await queue.pause()` / `resume()` / `is_paused()` | Stop workers claiming new jobs (in-flight jobs finish); resume wakes idle workers. |
+| `await queue.set_limits(global_concurrency=N, rate_limit={"max": N, "duration": ms})` / `limits()` | The queue's own limits, enforced by every claim across every worker at once ([Processing](processing.md#global-concurrency)); `limits()` reads them back as a `Limits` dict, `None` for a limit not set, and `None` as a whole for a queue with no limits of its own. |
 | `await queue.clear_departed()` | Forget the stopped-worker history. Presence records prune themselves; this is the "I have read those" button. |
 
 These are the operations a dashboard such as

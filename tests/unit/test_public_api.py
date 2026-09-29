@@ -29,6 +29,7 @@ PUBLIC = {
     "JobFailedError",
     "JobOptions",
     "JobState",
+    "Limits",
     "MetricsPoint",
     "NameMetrics",
     "OnFail",

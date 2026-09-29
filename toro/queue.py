@@ -26,6 +26,7 @@ from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options
 from .flow import clamp_priority as _clamp_priority
 from .job import FINISHED_STATES, Deduplication, Job, JobOptions, JobState, decode_results
 from .keys import Keys
+from .limits import Limits, RateLimit, limit_fields
 from .openmetrics import OUTCOMES, TOTAL_FIELDS, render
 from .scheduler import next_run, valid_cron
 
@@ -1575,6 +1576,41 @@ class Queue:
 
     async def is_paused(self) -> bool:
         return bool(await self.redis.exists(self.keys.meta_paused))
+
+    @_writes
+    async def set_limits(
+        self, *, global_concurrency: int | None = None, rate_limit: RateLimit | None = None
+    ) -> None:
+        """Set the queue's own limits: the cap on jobs active at once across every
+        worker, and the rate of job starts; None (or left out) is no limit.
+
+        Every claim reads them from the queue, so they apply to every worker at once
+        and outlive restarts. A worker's `global_concurrency` and `rate_limit`
+        arguments apply only to a queue whose limits were never set: once set, even to
+        none, the queue's are what every claim enforces.
+        """
+        cap, rl_max, rl_duration = limit_fields(global_concurrency, rate_limit)
+        await self.redis.hset(
+            self.keys.meta,
+            mapping={"globalConcurrency": cap, "rlMax": rl_max, "rlDuration": rl_duration},
+        )
+        # A raised cap frees slots: a worker parked at the old one would otherwise
+        # wait out its block_timeout with room to run.
+        await self.redis.zadd(self.keys.marker, {"0": 0})
+
+    async def limits(self) -> Limits | None:
+        """Read the queue's own limits back: None for a limit that is not set, and
+        None as a whole for a queue with no limits of its own (its workers' apply).
+        """
+        cap, rl_max, rl_duration = await self.redis.hmget(
+            self.keys.meta, "globalConcurrency", "rlMax", "rlDuration"
+        )
+        if cap is None:
+            return None
+        rate: RateLimit | None = None
+        if int(rl_max or 0) > 0:
+            rate = {"max": int(rl_max or 0), "duration": int(rl_duration or 0)}
+        return {"global_concurrency": int(cap) or None, "rate_limit": rate}
 
     async def close(self) -> None:
         # Every step in a finally: a pub/sub close that raises would otherwise skip
