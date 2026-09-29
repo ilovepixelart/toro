@@ -41,7 +41,11 @@ async def test_the_timeout_failure_names_the_limit_and_is_terminal_at_one_attemp
         job = await q.add("slow", {}, timeout=200)
         with pytest.raises(JobFailedError, match="timeout of 200 ms"):
             await q.result(job.id, timeout=10)
-    assert (await q.get_job(job.id)).state == "failed"
+    ended = await q.get_job(job.id)
+    assert ended.state == "failed"
+    # Nothing raised in the processor, so there is no traceback to keep: the one of
+    # the cancellation that stopped it is the worker's, not the job's.
+    assert ended.stacktrace is None
 
 
 async def _ended(q, job_id: str) -> bool:
@@ -64,7 +68,9 @@ async def test_a_processor_that_swallows_the_timeout_still_fails(q, run_worker):
         job = await q.add("swallows", {}, timeout=200)
         with pytest.raises(JobFailedError, match="timeout of 200 ms"):
             await q.result(job.id, timeout=10)
-    assert (await q.get_job(job.id)).state == "failed"
+    ended = await q.get_job(job.id)
+    assert ended.state == "failed"
+    assert ended.stacktrace is None  # no exception was being handled: not "NoneType: None"
 
 
 async def test_a_cancel_followed_by_the_timeout_is_one_signal(q, run_worker, run_until):

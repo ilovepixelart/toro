@@ -744,7 +744,7 @@ class Worker:
         if expired[0]:
             # The processor caught the timer's cancellation and returned (or its cleanup
             # raised): the run still ended on the job's timeout, not with a result.
-            return await self._processing_failed(job, _timed_out(job))
+            return await self._processing_failed(job, _timed_out(job), stacktrace="")
         if self._cancelling.get(job.id) is task:
             return await self._finish_cancelled(job)
         try:
@@ -808,7 +808,7 @@ class Worker:
                     await asyncio.wait_for(self._release(job), 2.0)
             raise asyncio.CancelledError
         if expired:
-            return await self._processing_failed(job, _timed_out(job))
+            return await self._processing_failed(job, _timed_out(job), stacktrace="")
         if self._cancelling.get(job.id) is not task:
             # Nobody cancelled this run and the worker is not stopping: the
             # processor raised it itself (it awaited something that was
@@ -991,11 +991,15 @@ class Worker:
         return self._next_from(res)
 
     async def _processing_failed(
-        self, job: Job, exc: Exception
+        self, job: Job, exc: Exception, stacktrace: str | None = None
     ) -> tuple[str, dict[str, str]] | None:
-        """Record the traceback being handled and fail the job with `exc`."""
+        """Fail the job with `exc` and the traceback being handled, unless told what
+        to record: a timeout has no traceback of the job's own, and the one being
+        handled then is the worker's cancellation, or none ("NoneType: None").
+        """
         self._failed += 1
-        return await self._finish_failed(job, exc, traceback.format_exc())
+        trace = traceback.format_exc() if stacktrace is None else stacktrace
+        return await self._finish_failed(job, exc, trace)
 
     async def _finish_failed(
         self, job: Job, exc: Exception, stacktrace: str = ""
