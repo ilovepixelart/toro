@@ -45,6 +45,10 @@ Fixes:
 
 - `result()` delivers exactly what the processor returned: numbers over 14 digits and
   empty lists were rounded and turned into `{}` on the way through the event.
+- A `result()` waiter on redis-py 5.x outlives channel silence longer than the
+  connection's read timeout: the events subscription read with no timeout, which that
+  redis-py turns into the socket timeout, so ten quiet seconds ended the subscription
+  and failed every waiter with a Redis `TimeoutError`.
 - A repeatable schedule survives an occurrence picked up early, one that fails before
   minting its successor, `cancel_job`, `remove_job` or `clean("delayed")` of a pending
   occurrence, and `remove_scheduler()` landing while the next occurrence is minted.

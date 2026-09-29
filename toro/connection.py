@@ -97,3 +97,17 @@ def read_timeout(client: aioredis.Redis) -> float | None:
     """
     timeout = client.connection_pool.make_connection().socket_timeout
     return None if timeout is None else float(timeout)
+
+
+def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
+    """How long a blocking read may block: `block_timeout`, held under the
+    connection's read timeout. A read that outlasts it raises instead of timing out
+    quietly: a worker's loop then never reaches the claim, and a job whose wake was
+    missed is stranded; a queue's events dispatcher dies and fails its waiters. A
+    connection toro built has room by construction; a caller-provided one can carry
+    any read timeout.
+    """
+    if read_timeout_s is None:
+        return block_timeout
+    ceiling = max(read_timeout_s - 1.0, read_timeout_s / 2)
+    return min(block_timeout, ceiling)

@@ -42,7 +42,13 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from . import scripts
 from ._replies import _scored, _str_list
-from .connection import DEFAULT_BLOCK_TIMEOUT, confirm_subscribed, connect, read_timeout
+from .connection import (
+    DEFAULT_BLOCK_TIMEOUT,
+    confirm_subscribed,
+    connect,
+    pop_timeout,
+    read_timeout,
+)
 from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
 from .limits import RateLimit, limit_fields
@@ -111,19 +117,6 @@ def _pairs(flat: list[str] | None) -> dict[str, str]:
         return {}
     it = iter(flat)
     return dict(zip(it, it, strict=False))
-
-
-def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
-    """How long the blocking pop may block: `block_timeout`, held under the
-    connection's read timeout. A pop that outlasts the read raises instead of
-    timing out quietly, the loop never reaches the claim, and a job whose wake was
-    missed is stranded. A connection the worker built has room by construction; a
-    caller-provided one can carry any read timeout.
-    """
-    if read_timeout_s is None:
-        return block_timeout
-    ceiling = max(read_timeout_s - 1.0, read_timeout_s / 2)
-    return min(block_timeout, ceiling)
 
 
 def block_for(pop_timeout_s: float, due_ms: int | None, now_ms: int) -> float:
