@@ -32,6 +32,14 @@ async def _count(q: Queue, state: str, want: int) -> bool:
     return (await q.counts())[state] >= want
 
 
+async def _finish_buckets(q: Queue) -> list[dict[str, str]]:
+    """The buckets the finished jobs wrote: the minute of each finish, which is not
+    the minute the test reads in when a run straddles a minute boundary."""
+    jobs = [*await q.get_jobs("completed"), *await q.get_jobs("failed")]
+    minutes = sorted({_minute(j.finished_on) for j in jobs if j.finished_on})
+    return [await q.redis.hgetall(q.keys.metrics_bucket(m)) for m in minutes]
+
+
 async def test_completed_jobs_count_in_current_minute(q, run_worker, run_until):
     async with run_worker(q, _noop):
         for _ in range(3):
@@ -109,7 +117,8 @@ async def test_buckets_expire(q, run_worker, run_until):
         await q.add("m", {})
         assert await run_until(lambda: _count(q, "completed", 1))
 
-    bucket = q.keys.metrics_bucket(_minute(time.time() * 1000))
+    (job,) = await q.get_jobs("completed")
+    bucket = q.keys.metrics_bucket(_minute(job.finished_on))
     ttl = await q.redis.pttl(bucket)
     assert 0 < ttl <= METRICS_RETENTION_MS
 
@@ -270,10 +279,9 @@ async def test_histogram_written_for_completions_only(q, run_worker, run_until):
         assert await run_until(lambda: _count(q, "completed", 2))
         assert await run_until(lambda: _count(q, "failed", 1))
 
-    minute = _minute(time.time() * 1000)
-    h = await q.redis.hgetall(q.keys.metrics_bucket(minute))
-    good = sum(int(v) for f, v in h.items() if f.startswith("h:good:"))
-    bad = sum(int(v) for f, v in h.items() if f.startswith("h:bad:"))
+    buckets = await _finish_buckets(q)
+    good = sum(int(v) for h in buckets for f, v in h.items() if f.startswith("h:good:"))
+    bad = sum(int(v) for h in buckets for f, v in h.items() if f.startswith("h:bad:"))
     assert good == 2  # every completion lands in exactly one bucket
     assert bad == 0  # failures are not timed
 
