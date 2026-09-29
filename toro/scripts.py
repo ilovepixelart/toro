@@ -182,7 +182,8 @@ local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   local jobKey = base .. jobId
   redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
   redis.call("SREM", stalledKey, jobId)
-  redis.call("HINCRBY", jobKey, "attemptsMade", 1)
+  -- attemptsMade counts runs that FINISHED (the finish scripts bump it): a run cut
+  -- short by a stall or a shutdown spends none of the job's attempts.
   redis.call("HSET", jobKey, "processedOn", now, "state", "active")
   return {redis.call("HGETALL", jobKey), jobId}
 end
@@ -801,6 +802,7 @@ local now = tonumber(ARGV[3])
 local meta = redis.call("HMGET", KEYS[3],
   "processedOn", "name", "parentId", "children", "timestamp")
 local startedOn = tonumber(meta[1]) or now
+redis.call("HINCRBY", KEYS[3], "attemptsMade", 1)  -- this run finished
 recordFinished(KEYS[2], KEYS[3], KEYS[8], ARGV[1], now, "returnvalue", ARGV[2], "completed")
 recordMetrics(KEYS[8], "completed", now, now - startedOn, tonumber(ARGV[9]), meta[2])
 -- a root flow completing: count the whole flow and its end-to-end wall clock
@@ -845,7 +847,8 @@ return {1}
 # KEYS[1] active  KEYS[2] prioritized  KEYS[3] delayed  KEYS[4] failed
 # KEYS[5] job hash  KEYS[6] lock  KEYS[7] marker  KEYS[8] stalled  KEYS[9] base  KEYS[10] pc
 # KEYS[11] events channel  KEYS[12] meta-paused  KEYS[13] limiter
-# ARGV[1] jobId  ARGV[2] failedReason  ARGV[3] now(ms)  ARGV[4] attemptsMade
+# ARGV[1] jobId  ARGV[2] failedReason  ARGV[3] now(ms)  ARGV[4] unused (the hash counts
+# the attempts; kept so the arity is stable)
 # ARGV[5] maxAttempts  ARGV[6] backoff(ms)  ARGV[7] token  ARGV[8] fetch(1/0)
 # ARGV[9] lockDuration(ms)
 # ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
@@ -861,9 +864,9 @@ if redis.call("GET", KEYS[6]) ~= ARGV[7]
   or not claimedBy(KEYS[5], ARGV[14] or "") then return -2 end
 redis.call("DEL", KEYS[6])
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
-local attemptsMade = tonumber(ARGV[4])
+local attemptsMade = redis.call("HINCRBY", KEYS[5], "attemptsMade", 1)  -- this run finished
 local maxAttempts = tonumber(ARGV[5])
-redis.call("HSET", KEYS[5], "failedReason", ARGV[2], "attemptsMade", attemptsMade)
+redis.call("HSET", KEYS[5], "failedReason", ARGV[2])
 if ARGV[15] and ARGV[15] ~= "" then redis.call("HSET", KEYS[5], "stacktrace", ARGV[15]) end
 local outcome
 if attemptsMade < maxAttempts then
@@ -1143,6 +1146,7 @@ if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 local now = tonumber(ARGV[2])
 -- read BEFORE recordFinished (retention may DEL the hash)
 local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail", "cancelReason")
+redis.call("HINCRBY", KEYS[3], "attemptsMade", 1)  -- this run finished, by stopping
 recordFinished(KEYS[2], KEYS[3], base, ARGV[1], now, "cancel", "1", "cancelled")
 recordMetrics(base, "cancelled", now, 0, tonumber(ARGV[4]))
 local msg = {jobId = ARGV[1], event = "cancelled"}

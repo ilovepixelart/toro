@@ -4,7 +4,12 @@ Breaking changes by release, newest first, each with what to do about it.
 
 ## 1.0.3
 
-Three things change for a caller, and one for a rolling upgrade. The rest are fixes.
+Four things change for a caller, and one for a rolling upgrade. The rest are fixes.
+
+**`attempts_made` counts the runs that finished.** A run cut short by a stall or a
+shutdown used to spend one of the job's `attempts`, so with `attempts=2` a job whose
+first run stalled was failed for good after one real try. The counter now moves when a
+run commits, and inside a processor it reads `0` on the job's first run (it read `1`).
 
 **A `Queue` call whose reply times out raises `redis.exceptions.TimeoutError`** and
 is not sent again. A re-sent `add()` whose first attempt had reached Redis enqueued

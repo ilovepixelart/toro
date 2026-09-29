@@ -1,5 +1,6 @@
 """Integration: retry lifecycle - exhaustion, recovery, backoff routing, events."""
 
+import asyncio
 import time
 
 from toro import Worker
@@ -133,3 +134,54 @@ async def test_an_immediate_retry_keeps_its_priority(q):
     await w._finish_failed(Job.from_hash(job_id, fields), RuntimeError("boom"))
 
     assert [j.id for j in await q.get_jobs("wait", 0, -1)] == [urgent.id, later.id]
+
+
+async def test_a_stalled_run_spends_no_attempt(q, run_worker, run_until):
+    """`attempts` bounds the runs that finished by failing. A run cut short by a stall
+    (its worker died) counted as one of them, so with attempts=2 a job whose first run
+    stalled and whose second raised was failed for good after one real try."""
+    seen: list[int] = []
+
+    async def proc(job):
+        seen.append(job.attempts_made)
+        if len(seen) == 1:
+            await asyncio.sleep(2)  # outlives the lock without renewing it: a stall
+        elif len(seen) == 2:
+            raise RuntimeError("the second run fails")
+        return "the third run succeeds"
+
+    job = await q.add("stall-then-fail", {}, attempts=2, backoff=0)
+    async with run_worker(
+        q, proc, concurrency=2, renew_locks=False, lock_duration=300, stalled_interval=100
+    ):
+        assert await run_until(lambda: len(seen) >= 3, timeout=15)
+
+        async def completed_once() -> bool:
+            return await _count(q, "completed") == 1
+
+        assert await run_until(completed_once, timeout=15)
+
+    assert seen == [0, 0, 1]  # nothing finished before runs 1 and 2; one failure before run 3
+    assert (await q.get_job(job.id)).attempts_made == 2
+
+
+async def test_the_first_retry_waits_the_configured_delay(q, run_worker, run_until):
+    """Exponential backoff doubles per attempt from `delay`: the first retry waits
+    `delay`, not half of it. The ordinal is the run that just failed, one more than the
+    runs that finished before it."""
+    raised_at: list[int] = []
+
+    async def proc(job):
+        raised_at.append(int(time.time() * 1000))
+        raise RuntimeError("boom")
+
+    job = await q.add("slow-retry", {}, attempts=2, backoff={"type": "exponential", "delay": 600})
+    async with run_worker(q, proc):
+        assert await run_until(lambda: raised_at, timeout=5)
+
+        async def delayed_once() -> bool:
+            return await q.redis.zscore(q.keys.delayed, job.id) is not None
+
+        assert await run_until(delayed_once, timeout=5)
+        due = await q.redis.zscore(q.keys.delayed, job.id)
+    assert 550 <= due - raised_at[0] <= 800  # `delay` after the failure, plus the commit

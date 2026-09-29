@@ -32,8 +32,8 @@ The worker injects a runtime context into the job while it runs:
 async def handle(job):
     await job.log("starting")               # appends to <jobId>:logs
     await job.update_progress(42)           # publishes a `progress` event
-    if job.attempts_made > 1:
-        ...                                 # a retry, or a rerun after its worker died
+    if job.attempts_made > 0:
+        ...                                 # a retry: an earlier run finished by failing
 ```
 
 `update_progress` takes a number or any JSON value; dashboards render it live.
