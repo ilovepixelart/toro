@@ -279,11 +279,6 @@ end
 local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
                            base, pcKey, metaKey, token, lockMs, now,
                            rlKey, rlMax, rlDuration, cap)
-  -- The queue's own limits (Queue.set_limits) replace what the worker was started
-  -- with: a queue whose limits were set, even to none, is not the workers' to cap.
-  local own = redis.call("HMGET", base .. "meta", "globalConcurrency", "rlMax", "rlDuration")
-  if own[1] then cap = tonumber(own[1]) end
-  if own[2] then rlMax = tonumber(own[2]); rlDuration = tonumber(own[3]) end
   promoteDue(base, prioritizedKey, pcKey, now)
   if redis.call("EXISTS", metaKey) == 1 then return false end  -- queue paused
   if cap > 0 and redis.call("LLEN", activeKey) >= cap then return false end
@@ -323,6 +318,27 @@ local function requireCap(raw)
   local cap = tonumber(raw)
   if cap == nil then error("missing global concurrency cap argument") end
   return cap
+end
+-- The queue's own limits (Queue.set_limits) replace what the worker was started
+-- with: a queue whose limits were set, even to none, is not the workers' to cap.
+-- Read and checked BEFORE a finish's first write, like the cap argument: a field an
+-- operator has edited into something that is not a number would otherwise error
+-- after the commit, and an rlDuration of 0 would make the refill infinite and the
+-- rate limit fail open. A limit must never fail open.
+local function ownLimits(base, cap, rlMax, rlDuration)
+  local own = redis.call("HMGET", base .. "meta", "globalConcurrency", "rlMax", "rlDuration")
+  if own[1] then
+    cap = tonumber(own[1])
+    if cap == nil or cap < 0 then error("the queue's globalConcurrency is not a number") end
+  end
+  if own[2] then
+    rlMax, rlDuration = tonumber(own[2]), tonumber(own[3])
+    if rlMax == nil or rlMax < 0 then error("the queue's rlMax is not a number") end
+    if rlMax > 0 and (rlDuration == nil or rlDuration <= 0) then
+      error("the queue's rlDuration is not a positive number")
+    end
+  end
+  return cap, rlMax, rlDuration
 end
 -- A slot in `active` was freed WITHOUT a claim (a draining worker's finish, a
 -- stalled job failed for good). Under a global concurrency cap a worker may be
@@ -840,9 +856,11 @@ return rootId
 MOVE_TO_ACTIVE = (
     _LIB
     + """
+local cap, rlMax, rlDuration = ownLimits(KEYS[5], requireCap(ARGV[6]),
+                                         tonumber(ARGV[4]), tonumber(ARGV[5]))
 return acquireNext(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7],
                    ARGV[1], tonumber(ARGV[2]), ARGV[3],
-                   KEYS[8], tonumber(ARGV[4]), tonumber(ARGV[5]), requireCap(ARGV[6]))
+                   KEYS[8], rlMax, rlDuration, cap)
 """
 )
 
@@ -893,8 +911,10 @@ MOVE_TO_COMPLETED = (
     + """
 local seen = recallFinish(KEYS[8], ARGV[4], ARGV[1], ARGV[12], ARGV[13])
 if seen then return seen end
-local cap = 0
-if ARGV[5] == "1" then cap = requireCap(ARGV[10]) end
+local cap, rlMax, rlDuration = 0, tonumber(ARGV[7]), tonumber(ARGV[8])
+if ARGV[5] == "1" then
+  cap, rlMax, rlDuration = ownLimits(KEYS[8], requireCap(ARGV[10]), rlMax, rlDuration)
+end
 if redis.call("GET", KEYS[4]) ~= ARGV[4]
   or not claimedBy(KEYS[3], ARGV[12] or "") then return -2 end
 redis.call("DEL", KEYS[4])
@@ -930,7 +950,7 @@ local nxt = false
 if ARGV[5] == "1" then
   nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                     ARGV[4], tonumber(ARGV[6]), ARGV[3],
-                    KEYS[12], tonumber(ARGV[7]), tonumber(ARGV[8]), cap)
+                    KEYS[12], rlMax, rlDuration, cap)
   if nxt and nxt[1] == "__rl__" then
     redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
     nxt = false
@@ -968,8 +988,10 @@ MOVE_TO_FAILED = (
     + """
 local seen = recallFinish(KEYS[9], ARGV[7], ARGV[1], ARGV[14], ARGV[16])
 if seen then return seen end
-local cap = 0
-if ARGV[8] == "1" then cap = requireCap(ARGV[13]) end
+local cap, rlMax, rlDuration = 0, tonumber(ARGV[10]), tonumber(ARGV[11])
+if ARGV[8] == "1" then
+  cap, rlMax, rlDuration = ownLimits(KEYS[9], requireCap(ARGV[13]), rlMax, rlDuration)
+end
 if redis.call("GET", KEYS[6]) ~= ARGV[7]
   or not claimedBy(KEYS[5], ARGV[14] or "") then return -2 end
 redis.call("DEL", KEYS[6])
@@ -1015,7 +1037,7 @@ local nxt = false
 if ARGV[8] == "1" then
   nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
                     ARGV[7], tonumber(ARGV[9]), ARGV[3],
-                    KEYS[13], tonumber(ARGV[10]), tonumber(ARGV[11]), cap)
+                    KEYS[13], rlMax, rlDuration, cap)
   if nxt and nxt[1] == "__rl__" then
     redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check
     nxt = false
