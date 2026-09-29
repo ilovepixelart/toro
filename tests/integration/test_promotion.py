@@ -50,6 +50,28 @@ async def test_a_claim_promotes_a_due_delayed_job(q, monkeypatch):
     assert (await q.get_job(j.id)).state == "active"
 
 
+async def test_promoted_jobs_not_yet_claimed_read_wait(q, monkeypatch):
+    """A claim promotes every due job and takes one; the others wait in `prioritized`
+    and read `wait` with no delay left. Still reading `delayed`, they would be listed
+    where they are not, and a cancel would remove them from the wrong set and leave
+    a cancelled job in `prioritized` for the next claim to run."""
+    jobs = [await q.add("x", {}, delay=60_000) for _ in range(3)]
+    due = max(j.timestamp for j in jobs) + 60_000
+    monkeypatch.setattr("toro.worker._now_ms", lambda: due)
+    w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
+
+    loaded = await w._acquire()
+
+    assert loaded is not None
+    waiting = [j for j in jobs if j.id != loaded[0]]
+    for j in waiting:
+        assert (await q.get_job(j.id)).state == "wait"
+        assert await q.redis.hget(q.keys.job(j.id), "delay") == "0"
+    assert await q.cancel_job(waiting[0].id) is True
+    assert (await q.get_job(waiting[0].id)).state == "cancelled"
+    assert waiting[0].id not in await q.redis.zrange(q.keys.prioritized, 0, -1)
+
+
 async def test_an_idle_worker_runs_a_delayed_job_when_it_is_due(q, run_worker, run_until):
     """A sweep ran a delayed job up to a second after its time, and an idle worker
     blocked for its whole `block_timeout` would run it only when the block ended.
