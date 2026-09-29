@@ -165,6 +165,15 @@ async def test_trigger_scheduler_carries_the_concurrency_key(q):
     assert (await q.get_jobs("held", 0, -1))[0].opts.concurrency_key == "tenant-1"
 
 
+async def test_clean_reports_only_what_it_removed(q):
+    """The count was the ids listed, not the removals that landed: an id whose hash
+    is gone (an operator's DEL, a removal racing the clean) removes nothing and is
+    not a removal."""
+    ids = [(await q.add(f"w{i}", {})).id for i in range(4)]
+    await q.redis.delete(q.keys.job(ids[0]))
+    assert await q.clean("wait") == 3
+
+
 async def test_removing_something_that_is_not_a_job_touches_nothing(q):
     """A job id arrives from a URL, and a job hash lives beside the queue's own keys:
     `remove_job("totals")` used to delete the lifetime counters, `remove_job("meta")`
