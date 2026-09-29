@@ -3,6 +3,7 @@
 import asyncio
 import time
 
+import toro.worker as worker_module
 from toro import Worker
 from toro.job import Job
 
@@ -34,6 +35,30 @@ async def test_retries_until_max_then_fails(q, run_worker, run_until):
     assert retrying.count(j.id) == 2  # attempts - 1 retries ...
     assert failed.count(j.id) == 1  # ... then one terminal failure
     assert await _count(q, "failed") == 1
+
+
+async def test_retries_claimed_within_one_millisecond_still_spend_attempts(
+    q, run_worker, run_until, monkeypatch
+):
+    """A retry with no backoff is fetched straight back by the finish that failed it,
+    so on a fast machine both runs were claimed in the same millisecond and carried the
+    same processedOn, which is how a run is named: the second finish read the first
+    one's memo as its own re-send and was answered "retry, here it is again" with no
+    attempt spent, for ever. A re-claim inside that millisecond is stamped one later."""
+    frozen = int(time.time() * 1000)
+    monkeypatch.setattr(worker_module, "_now_ms", lambda: frozen)  # every claim in one ms
+    failed: list[str] = []
+
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    async with run_worker(q, proc) as w:
+        w.on("failed", lambda job, exc: failed.append(job.id))
+        j = await q.add("flaky", {}, attempts=3)
+        assert await run_until(lambda: _count(q, "failed"), timeout=5)
+
+    job = await q.get_job(j.id)
+    assert (job.state, job.attempts_made, failed) == ("failed", 3, [j.id])
 
 
 async def test_succeeds_on_a_later_attempt(q, run_worker, run_until):
