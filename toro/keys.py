@@ -176,7 +176,8 @@ class Keys:
     @property
     def meta(self) -> str:
         # HASH of what this queue IS rather than what it holds: the data-model version
-        # it was stamped with. Written once, read once per process, never on a read
+        # it was stamped with (written once, read once per process) and the queue's
+        # own limits (set by set_limits, read by every claim). Never created on a read
         # path - a dashboard opening a queue must not create it by looking.
         return f"{self.base}meta"
 

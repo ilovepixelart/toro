@@ -467,7 +467,9 @@ async def test_a_flow_parent_waits_for_its_own_key(q, run_worker, run_until):
         root = await q.add_flow("report", {}, children=[FlowChild("leaf", {})], concurrency_key="k")
         await _until(lambda: _in_state(q, root.id, "held"))
 
-        assert started == ["holder", "leaf"]  # the leaf has no key and ran
+        # the leaf has no key and ran; two idle slots claim within the same instant,
+        # so which processor starts first is not an order the queue promises
+        assert sorted(started) == ["holder", "leaf"]
         gate.set()
         assert await root.result(timeout=10) == "report"
 

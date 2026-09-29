@@ -90,6 +90,14 @@ doubles without limit) and `jitter` (0 to 1: up to that share of the delay, adde
 random). Without jitter, every job of a batch that failed together retried on the same
 millisecond. Neither is on by default.
 
+New: `await queue.set_limits(global_concurrency=..., rate_limit=...)` stores the two
+queue-wide limits on the queue, where every claim reads them, so they apply to every
+worker at once and a change needs no rollout; `await queue.limits()` reads them back
+(`None` for a queue with no limits of its own).
+A worker's `global_concurrency` and `rate_limit` arguments still work, and apply only
+to a queue whose limits were never set; `set_limits()` with no arguments gives the
+queue limits of its own, none, and the workers' arguments no longer apply.
+
 ## 1.0.2
 
 Nothing breaks. One fix.

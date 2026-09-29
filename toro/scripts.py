@@ -246,6 +246,11 @@ end
 local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
                            base, pcKey, metaKey, token, lockMs, now,
                            rlKey, rlMax, rlDuration, cap)
+  -- The queue's own limits (Queue.set_limits) replace what the worker was started
+  -- with: a queue whose limits were set, even to none, is not the workers' to cap.
+  local own = redis.call("HMGET", base .. "meta", "globalConcurrency", "rlMax", "rlDuration")
+  if own[1] then cap = tonumber(own[1]) end
+  if own[2] then rlMax = tonumber(own[2]); rlDuration = tonumber(own[3]) end
   promoteDue(base, prioritizedKey, pcKey, now)
   if redis.call("EXISTS", metaKey) == 1 then return false end  -- queue paused
   if cap > 0 and redis.call("LLEN", activeKey) >= cap then return false end

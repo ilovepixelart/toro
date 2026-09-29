@@ -107,7 +107,7 @@ report = await queue.add_flow("report", {"q": 3},
                               children=[c("fetch", {"shard": i}) for i in range(3)])
 
 # Queue-wide rate limit: at most 100 jobs / second across every worker
-worker = Worker("emails", process, rate_limit={"max": 100, "duration": 1000})
+await queue.set_limits(rate_limit={"max": 100, "duration": 1000})
 
 # Wait for a result from the producer side
 job = await queue.add("resize", {"src": "a.png"})

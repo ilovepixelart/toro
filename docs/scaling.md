@@ -109,9 +109,11 @@ cancellation channel, plus what your producers use. A dashboard adds its own.
 
 `global_concurrency` and `rate_limit` are enforced inside the Lua that claims a job,
 and `concurrency_key` inside the scripts that enqueue and finish one, so all three hold
-across every worker and every replica, not per process. `global_concurrency` and
-`rate_limit` are worker settings: set the same value in each replica. Each worker
-reports its `global_concurrency`, and the dashboard warns when workers disagree.
+across every worker and every replica, not per process. Set the first two on the queue
+(`await queue.set_limits(...)`): every claim reads them from there, so a change applies
+to every replica at once, with no rollout. A worker's own `global_concurrency` and
+`rate_limit` arguments apply only to a queue whose limits were never set; each worker
+reports its argument, and the dashboard warns when workers of such a queue disagree.
 
 ## What to watch
 

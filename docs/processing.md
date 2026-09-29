@@ -145,8 +145,8 @@ per job.
 | Option | Default | Meaning |
 |---|---|---|
 | `concurrency` | 1 | Parallel slots in this worker. |
-| `rate_limit` | `None` | `{"max": N, "duration": ms}` - queue-wide token bucket (below). |
-| `global_concurrency` | `None` | Cap on jobs active at once across all workers on the queue (below). |
+| `rate_limit` | `None` | `{"max": N, "duration": ms}` - queue-wide token bucket (below); applies only to a queue whose limits were never set with `queue.set_limits()`. |
+| `global_concurrency` | `None` | Cap on jobs active at once across all workers on the queue (below); applies only to a queue whose limits were never set with `queue.set_limits()`. |
 | `block_timeout` | 5.0 s | How long an idle slot blocks waiting for a wakeup before re-checking. |
 | `lock_duration` / `lock_renew_time` / `renew_locks` | 30000 / half / `True` | The at-least-once lease - see [Reliability](reliability.md). |
 | `stalled_interval` / `max_stalled_count` | 30000 / 1 | The recovery sweep - same page. |
@@ -161,25 +161,33 @@ and one info line when it next succeeds; the retries in between are silent.
 ## Rate limiting
 
 ```python
-worker = Worker("emails", handle, rate_limit={"max": 100, "duration": 60_000})
+await queue.set_limits(rate_limit={"max": 100, "duration": 60_000})
 ```
 
 Jobs start at an average of `max` per `duration`, across **all** workers on the queue.
 The bucket starts full, so up to `max` can start at once before the steady rate
-applies. It lives in Redis, shared, so adding workers doesn't multiply the
-limit (give every worker the same config). When a claim hits the limit the job
-goes back untouched: no attempt is consumed, and the worker sleeps until a token
-frees (emitting a `rate-limited` event with the wait).
+applies. It lives in Redis, shared, so adding workers doesn't multiply the limit.
+When a claim hits the limit the job goes back untouched: no attempt is consumed,
+and the worker sleeps until a token frees (emitting a `rate-limited` event with
+the wait).
 
 ## Global concurrency
 
 ```python
-worker = Worker("exports", handle, concurrency=10, global_concurrency=3)
+await queue.set_limits(global_concurrency=3)
+worker = Worker("exports", handle, concurrency=10)
 ```
 
 At most `global_concurrency` jobs are active at once across **all** workers on
-the queue, however many processes you run (give every worker the same value).
-`concurrency` sizes one worker; this caps the queue.
+the queue, however many processes you run. `concurrency` sizes one worker; this
+caps the queue.
+
+Both limits are the queue's own: `set_limits()` stores them where every claim reads
+them, so they apply to every worker at once and a change needs no rollout, and
+`limits()` reads them back. Each call sets both (a limit left out is none). A
+`Worker` still accepts `rate_limit` and `global_concurrency` arguments; they apply
+only to a queue whose limits were never set, and a queue whose limits were set to
+none ignores them.
 
 Use it when the constraint is *occupancy*, not arrival rate: a database pool of
 N connections, an API that allows N requests in flight. A rate limit bounds job
@@ -196,9 +204,10 @@ N connections, an API that allows N requests in flight. A rate limit bounds job
   stops, or crashes.
 - Removing an active job frees its place under the cap at once, so the next claim
   can take it. No parked worker is woken for it until the removed processor ends.
-- A changed value takes effect as workers restart. While a rollout mixes caps,
-  each worker enforces its own, and a freed slot can wait up to `block_timeout`
-  for a worker with room.
+- A cap set on the queue takes effect at the next claim, and raising it wakes a
+  worker parked at the old one. A cap passed to workers takes effect as they
+  restart: while a rollout mixes caps, each worker enforces its own, and a freed
+  slot can wait up to `block_timeout` for a worker with room.
 
 ## Lifecycle events
 

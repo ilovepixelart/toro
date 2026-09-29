@@ -32,7 +32,7 @@ import traceback
 import uuid
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
@@ -45,6 +45,7 @@ from ._replies import _scored, _str_list
 from .connection import DEFAULT_BLOCK_TIMEOUT, confirm_subscribed, connect, read_timeout
 from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
+from .limits import RateLimit, limit_fields
 from .queue import stamp_data_model
 from .scheduler import next_run
 
@@ -98,15 +99,6 @@ def _is_async(processor: Processor) -> bool:
         return True
     call = getattr(target, "__call__", None)  # noqa: B004
     return call is not None and bool(asyncio.iscoroutinefunction(call))
-
-
-class RateLimit(TypedDict):
-    """The queue-wide token bucket: ``{"max": N, "duration": ms}`` - at most N
-    job starts per duration, shared by every worker on the queue.
-    """
-
-    max: int
-    duration: int
 
 
 def _now_ms() -> int:
@@ -221,27 +213,13 @@ class Worker:
         # belongs to the caller, who may still be using it elsewhere.
         self._owns_connection = connection is None
         self.concurrency = concurrency
-        # Queue-wide rate limit, shared by all workers via one token bucket in Redis.
-        # `{"max": N, "duration": ms}` = at most N jobs per duration. All workers on a
-        # queue should pass the SAME config so the shared bucket behaves consistently.
-        if rate_limit is not None and (
-            int(rate_limit.get("max", 0)) <= 0 or int(rate_limit.get("duration", 0)) <= 0
-        ):
-            raise ValueError("rate_limit needs {'max': positive, 'duration': positive ms}")
-        self.rl_max = int(rate_limit["max"]) if rate_limit else 0
-        self.rl_duration = int(rate_limit["duration"]) if rate_limit else 0
-        # Queue-wide cap on jobs active at once, across every worker process. Like
-        # rate_limit, all workers on a queue should pass the SAME value. bool is an
-        # int subclass, so it is rejected by name: True would silently mean 1.
-        if global_concurrency is not None and (
-            isinstance(global_concurrency, bool)
-            or not isinstance(global_concurrency, int)
-            or global_concurrency <= 0
-        ):
-            raise ValueError("global_concurrency needs a positive integer")
-        # int(): an int subclass (an IntEnum) would reach Redis as its repr, which
-        # Lua reads as no number at all.
-        self.global_concurrency = int(global_concurrency or 0)
+        # The queue-wide cap and rate limit this worker was started with. They apply
+        # only to a queue whose own limits were never set (Queue.set_limits): the
+        # claim reads the queue's first. Passed on every claim, so the scripts need
+        # no separate read for a queue that has none of its own.
+        self.global_concurrency, self.rl_max, self.rl_duration = limit_fields(
+            global_concurrency, rate_limit
+        )
         self.block_timeout = block_timeout
         self._pop_timeout = pop_timeout(read_timeout(self.redis), block_timeout)
         if self._pop_timeout < block_timeout:
@@ -567,8 +545,6 @@ class Worker:
                 # a job, and a delayed job is promoted at its due time by whichever
                 # comes first, the wake or the block ending.
                 loaded = await self._acquire()
-                self._loop_recovered("a claim")
-                pause = 0.1
                 # Keep processing as long as each finish hands us the next job. No
                 # `_running` check here: a job in hand is already claimed, and stop()
                 # can land during the very round trip that claimed it. Dropped, it
@@ -580,6 +556,8 @@ class Worker:
                     break
                 timeout = block_for(self._pop_timeout, self._due_ms, _now_ms())
                 woke = await self.redis.bzpopmin(self.keys.marker, timeout)
+                self._loop_recovered("a claim")
+                pause = 0.1
                 if woke and not self._running:
                     # Shutting down - don't claim a new job. A marker we popped was
                     # a wake for a worker that still can, so hand it on: swallowed,
