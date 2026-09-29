@@ -1289,7 +1289,7 @@ return existed
 # Token-guarded like a finish: a run that lost its lock hands back nothing. The job
 # keeps its concurrency key, exactly as a job the sweep recovers does.
 # KEYS[1] active  KEYS[2] prioritized  KEYS[3] job hash  KEYS[4] lock  KEYS[5] marker
-# KEYS[6] base  KEYS[7] pc
+# KEYS[6] pc
 # ARGV[1] jobId  ARGV[2] token  ARGV[3] the claim's processedOn ("" = unchecked)
 # ARGV[4] now(ms)
 # Returns -2 lock lost, -3 not active, 1 released.
@@ -1302,7 +1302,7 @@ if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
 redis.call("DEL", KEYS[4])
 local priority = tonumber(redis.call("HGET", KEYS[3], "priority")) or 0
 redis.call("HSET", KEYS[3], "state", "wait")
-enqueue(KEYS[2], KEYS[5], ARGV[1], priority, KEYS[7], KEYS[3], tonumber(ARGV[4]))
+enqueue(KEYS[2], KEYS[5], ARGV[1], priority, KEYS[6], KEYS[3], tonumber(ARGV[4]))
 return 1
 """
 )

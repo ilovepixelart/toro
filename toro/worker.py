@@ -923,7 +923,6 @@ class Worker:
                 self.keys.job(job.id),
                 self.keys.lock(job.id),
                 self.keys.marker,
-                self.keys.base,
                 self.keys.pc,
             ],
             args=[job.id, self.token, _claim(job), _now_ms()],
