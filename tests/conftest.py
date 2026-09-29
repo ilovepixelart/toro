@@ -158,3 +158,87 @@ def run_until():
         return False
 
     return _run_until
+
+
+# ---- TCP proxies to Redis that lose a reply or a link, for the re-send paths ----
+
+
+async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379):
+    """A TCP proxy to Redis that drops the reply to the first EVALSHA of `sha`:
+    the command runs on the server, and the client never hears back."""
+    swallowed = {"done": False}
+
+    async def pipe(reader, writer, state, from_client):
+        try:
+            while data := await reader.read(65536):
+                if from_client and not swallowed["done"] and sha.encode() in data:
+                    swallowed["done"] = True
+                    state["swallow"] = True
+                elif not from_client and state.get("swallow"):
+                    state["swallow"] = False  # this is the reply nobody will hear
+                    continue
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def handle(client_reader, client_writer):
+        server_reader, server_writer = await asyncio.open_connection("localhost", upstream_port)
+        state: dict[str, bool] = {}
+        await asyncio.gather(
+            pipe(client_reader, server_writer, state, True),
+            pipe(server_reader, client_writer, state, False),
+        )
+
+    return await asyncio.start_server(handle, "localhost", 0)
+
+
+async def _drop_link_after_first(sha: str, upstream_port: int = 6379):
+    """A TCP proxy to Redis that, for the first EVALSHA of `sha`, lets the command
+    through and then cuts the client's connection before the reply reaches it: the
+    command ran, and the client sees a dropped connection instead of an answer."""
+    dropped = {"done": False}
+
+    async def pipe(reader, writer, state, from_client):
+        try:
+            while data := await reader.read(65536):
+                if from_client and not dropped["done"] and sha.encode() in data:
+                    dropped["done"] = True
+                    state["cut"] = True
+                elif not from_client and state.get("cut"):
+                    state["cut"] = False
+                    writer.close()  # the reply is on its way: the link goes instead
+                    return
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def handle(client_reader, client_writer):
+        server_reader, server_writer = await asyncio.open_connection("localhost", upstream_port)
+        state: dict[str, bool] = {}
+        await asyncio.gather(
+            pipe(client_reader, server_writer, state, True),
+            pipe(server_reader, client_writer, state, False),
+        )
+
+    return await asyncio.start_server(handle, "localhost", 0)
+
+
+@pytest.fixture
+def swallow_first_reply():
+    """`proxy = await swallow_first_reply(sha)`: a proxy on a free port that lets the
+    first EVALSHA of `sha` through and drops its reply; `proxy.sockets[0]` has the port,
+    `proxy.close()` ends it."""
+    return _swallow_first_reply_to
+
+
+@pytest.fixture
+def drop_link_after_first():
+    """`proxy = await drop_link_after_first(sha)`: like swallow_first_reply, but the
+    client's connection is cut with the reply on its way, so the client re-sends."""
+    return _drop_link_after_first

@@ -32,8 +32,8 @@ async def _noop(job):
 async def _leaked_keys(q: Queue) -> list[str]:
     """Per-job/aux keys left under the queue's namespace (infra keys excluded).
 
-    An add() replay record (`add:<token>`) is not a leak while it carries the expiry
-    the script gives it: it goes on its own within ADD_REPLAY_WINDOW_MS.
+    An add() replay record (`add:<token>`) or a finish's answer (`fin:...`) is not a
+    leak while it carries the expiry the script gives it: it goes on its own.
     """
     base = q.keys.base
     leaked = []
@@ -41,7 +41,7 @@ async def _leaked_keys(q: Queue) -> list[str]:
         suffix = key[len(base) :]
         if suffix in _INFRA or suffix.split(":")[0] in ("metrics", "worker", "repeat"):
             continue
-        if suffix.startswith("add:") and await q.redis.ttl(key) > 0:
+        if suffix.startswith(("add:", "fin:")) and await q.redis.ttl(key) > 0:
             continue
         leaked.append(suffix)
     return leaked
