@@ -167,6 +167,10 @@ def compute_backoff(
     return int(delay)
 
 
+def _timed_out(job: Job) -> TimeoutError:
+    return TimeoutError(f"the processor ran over the job's timeout of {job.opts.timeout} ms")
+
+
 def _claim(job: Job) -> str:
     """Return the processedOn a run was claimed at, which its finish must still find."""
     return "" if job.processed_on is None else str(job.processed_on)
@@ -733,6 +737,10 @@ class Worker:
         finally:
             if timer is not None:
                 timer.cancel()
+        if expired[0]:
+            # The processor caught the timer's cancellation and returned (or its cleanup
+            # raised): the run still ended on the job's timeout, not with a result.
+            return await self._processing_failed(job, _timed_out(job))
         if self._cancelling.get(job.id) is task:
             return await self._finish_cancelled(job)
         try:
@@ -751,7 +759,9 @@ class Worker:
     ) -> tuple[asyncio.TimerHandle | None, list[bool]]:
         """Start the job's timeout, if it has one: a timer that cancels the processor's
         task and raises a flag, which tells that cancellation from every other one, so
-        a TimeoutError the processor raises itself is still its own failure. A sync
+        a TimeoutError the processor raises itself is still its own failure. The timer
+        and a cancel request are one signal: whichever comes first unwinds the run and
+        decides how it ends, and the other is not delivered into its cleanup. A sync
         processor's thread cannot be taken back: no timer.
         """
         expired = [False]
@@ -760,7 +770,12 @@ class Worker:
             return None, expired
 
         def expire() -> None:
+            if self._cancelling.get(job.id) is task:
+                return  # a cancel request is already unwinding it: one signal, not two
             expired[0] = True
+            # Registered as the run's one cancellation, so a cancel request landing
+            # during the unwind is not a second one (see _request_cancel).
+            self._cancelling[job.id] = task
             task.cancel()
 
         return asyncio.get_running_loop().call_later(timeout / 1000, expire), expired
@@ -789,10 +804,7 @@ class Worker:
                     await asyncio.wait_for(self._release(job), 2.0)
             raise asyncio.CancelledError
         if expired:
-            over = TimeoutError(
-                f"the processor ran over the job's timeout of {job.opts.timeout} ms"
-            )
-            return await self._processing_failed(job, over)
+            return await self._processing_failed(job, _timed_out(job))
         if self._cancelling.get(job.id) is not task:
             # Nobody cancelled this run and the worker is not stopping: the
             # processor raised it itself (it awaited something that was
