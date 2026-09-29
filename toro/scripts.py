@@ -87,6 +87,10 @@ _CONSTANTS = (
     f"local LIVE = {LIVE_SCORE}\n"
     # as a string: Lua formats a number it concatenates with %.14g, four short of LIVE
     f'local LIVE_BOUND = "({LIVE_SCORE}"\n'
+    f"local PRIORITY_OFFSET = {PRIORITY_OFFSET}\n"
+    f"local SEQ_MOD = {SEQ_MOD}\n"
+    f"local LOCK_LOST = {LOCK_LOST}\n"
+    f"local NOT_ACTIVE = {NOT_ACTIVE}\n"
 )
 
 # Shared routines, prepended to every script that enqueues or acquires a job.
@@ -103,8 +107,8 @@ _LIB = (
     _CONSTANTS
     + """
 local function priorityScore(priority, pcKey)
-  local seq = redis.call("INCR", pcKey) % 4294967296
-  return (1048576 - priority) * 4294967296 + seq
+  local seq = redis.call("INCR", pcKey) % SEQ_MOD
+  return (PRIORITY_OFFSET - priority) * SEQ_MOD + seq
 end
 local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
@@ -886,18 +890,22 @@ LOCK_JOB_GONE = -1
 # thing that is missed.
 # KEYS[1] lock  KEYS[2] stalled  KEYS[3] job hash
 # ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] jobId
-EXTEND_LOCK = """
+EXTEND_LOCK = (
+    f"local CANCEL_REQUESTED = {LOCK_CANCEL_REQUESTED}\n"
+    f"local JOB_GONE = {LOCK_JOB_GONE}\n"
+    """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   redis.call("SET", KEYS[1], ARGV[1], "PX", tonumber(ARGV[2]))
   redis.call("SREM", KEYS[2], ARGV[3])
-  if redis.call("HGET", KEYS[3], "cancel") then return 2 end
+  if redis.call("HGET", KEYS[3], "cancel") then return CANCEL_REQUESTED end
   return 1
 end
 -- A removal takes the hash AND the lock, so a lost cancel message has no other way
 -- back: the renewal is the backstop for that too. A takeover leaves the hash alone.
-if redis.call("EXISTS", KEYS[3]) == 0 then return -1 end
+if redis.call("EXISTS", KEYS[3]) == 0 then return JOB_GONE end
 return 0
 """
+)
 
 # Commit a completed job, then (when fetch=1) acquire the next job in the SAME
 # round trip. Token-guarded: a worker that lost its lock commits NOTHING.
@@ -921,9 +929,9 @@ if ARGV[5] == "1" then
   cap, rlMax, rlDuration = ownLimits(KEYS[8], requireCap(ARGV[10]), rlMax, rlDuration)
 end
 if redis.call("GET", KEYS[4]) ~= ARGV[4]
-  or not claimedBy(KEYS[3], ARGV[12] or "") then return -2 end
+  or not claimedBy(KEYS[3], ARGV[12] or "") then return LOCK_LOST end
 redis.call("DEL", KEYS[4])
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
 local now = tonumber(ARGV[3])
 -- read BEFORE recordFinished (remove-on-complete may DEL the hash)
 local meta = redis.call("HMGET", KEYS[3],
@@ -997,9 +1005,9 @@ if ARGV[8] == "1" then
   cap, rlMax, rlDuration = ownLimits(KEYS[9], requireCap(ARGV[13]), rlMax, rlDuration)
 end
 if redis.call("GET", KEYS[6]) ~= ARGV[7]
-  or not claimedBy(KEYS[5], ARGV[14] or "") then return -2 end
+  or not claimedBy(KEYS[5], ARGV[14] or "") then return LOCK_LOST end
 redis.call("DEL", KEYS[6])
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
 local attemptsMade = redis.call("HINCRBY", KEYS[5], "attemptsMade", 1)  -- this run finished
 local maxAttempts = tonumber(ARGV[5])
 redis.call("HSET", KEYS[5], "failedReason", ARGV[2])
@@ -1282,8 +1290,8 @@ RELEASE_JOB = (
     _LIB
     + """
 if redis.call("GET", KEYS[4]) ~= ARGV[2]
-  or not claimedBy(KEYS[3], ARGV[3] or "") then return -2 end
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+  or not claimedBy(KEYS[3], ARGV[3] or "") then return LOCK_LOST end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
 redis.call("DEL", KEYS[4])
 local priority = tonumber(redis.call("HGET", KEYS[3], "priority")) or 0
 redis.call("HSET", KEYS[3], "state", "wait")
@@ -1307,9 +1315,11 @@ MOVE_TO_CANCELLED = (
 local base = KEYS[7]
 local seen = recallFinish(base, ARGV[3], ARGV[1], ARGV[5])
 if seen then return seen[1] end
-if redis.call("GET", KEYS[4]) ~= ARGV[3] or not claimedBy(KEYS[3], ARGV[5] or "") then return -2 end
+if redis.call("GET", KEYS[4]) ~= ARGV[3] or not claimedBy(KEYS[3], ARGV[5] or "") then
+  return LOCK_LOST
+end
 redis.call("DEL", KEYS[4])
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
 local now = tonumber(ARGV[2])
 -- read BEFORE recordFinished (retention may DEL the hash)
 local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail", "cancelReason")
