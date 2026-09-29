@@ -567,8 +567,6 @@ class Worker:
                 # a job, and a delayed job is promoted at its due time by whichever
                 # comes first, the wake or the block ending.
                 loaded = await self._acquire()
-                self._loop_recovered("a claim")
-                pause = 0.1
                 # Keep processing as long as each finish hands us the next job. No
                 # `_running` check here: a job in hand is already claimed, and stop()
                 # can land during the very round trip that claimed it. Dropped, it
@@ -580,6 +578,8 @@ class Worker:
                     break
                 timeout = block_for(self._pop_timeout, self._due_ms, _now_ms())
                 woke = await self.redis.bzpopmin(self.keys.marker, timeout)
+                self._loop_recovered("a claim")
+                pause = 0.1
                 if woke and not self._running:
                     # Shutting down - don't claim a new job. A marker we popped was
                     # a wake for a worker that still can, so hand it on: swallowed,
