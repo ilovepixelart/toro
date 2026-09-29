@@ -598,13 +598,13 @@ class Queue:
             for i, pid in enumerate(parent_ids)
         }
 
-    async def result(self, job_id: str, *, timeout: float = 30.0) -> Any:
+    async def result(self, job_id: str, *, timeout: float | None = 30.0) -> Any:
         """Wait for a job to finish; return its return value, or raise JobFailedError.
 
         Registers with the shared dispatcher BEFORE checking state, so it won't
         miss the outcome of a job that finishes while we wait. Works even if the
         job hash was auto-removed, as long as result() was awaited before the
-        job finished.
+        job finished. `timeout=None` waits without limit.
         """
         job_id = str(job_id)
         await self._ensure_dispatcher()
@@ -618,15 +618,12 @@ class Queue:
             # (redis-py re-subscribes without a word) drops whatever was published in
             # the gap, so the waiter re-reads the hash every RESULT_RECHECK_S and once
             # more before giving up, and a finished job is delivered, not timed out.
-            deadline = asyncio.get_running_loop().time() + timeout
+            loop = asyncio.get_running_loop()
+            deadline = None if timeout is None else loop.time() + timeout
             while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
+                wait = self._next_wait(deadline, job_id, timeout)
                 try:
-                    return await asyncio.wait_for(
-                        asyncio.shield(fut), min(remaining, RESULT_RECHECK_S)
-                    )
+                    return await asyncio.wait_for(asyncio.shield(fut), wait)
                 except (TimeoutError, asyncio.TimeoutError):
                     settled, value = self._settled(await self.get_job(job_id))
                     if settled:
@@ -638,6 +635,18 @@ class Queue:
                     waiters.remove(fut)
                 if not waiters:
                     del self._result_waiters[job_id]
+
+    @staticmethod
+    def _next_wait(deadline: float | None, job_id: str, timeout: float | None) -> float:
+        """How long result()'s next wait may last: the recheck interval, clipped to
+        what is left of the deadline; raises TimeoutError once nothing is left.
+        """
+        if deadline is None:
+            return RESULT_RECHECK_S
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
+        return min(remaining, RESULT_RECHECK_S)
 
     @staticmethod
     def _settled(job: Job | None) -> tuple[bool, Any]:
