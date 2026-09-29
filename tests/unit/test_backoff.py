@@ -47,6 +47,14 @@ def test_jitter_adds_up_to_its_share_of_the_delay_at_random():
     assert len(samples) > 1  # random, not a constant
 
 
+def test_a_long_run_of_failures_does_not_overflow():
+    """The 1025th failure raised OverflowError from the float multiply, and the job
+    stayed locked in `active` until the sweep failed it for stalling. The exponent is
+    clamped where the delay is already astronomical; a cap still applies after it."""
+    assert compute_backoff({"type": "exponential", "delay": 1000, "max": 60_000}, 5000) == 60_000
+    assert compute_backoff({"type": "exponential", "delay": 1000}, 5000) == 1000 * 2**62
+
+
 def test_jitter_applies_after_the_cap():
     backoff = {"type": "exponential", "delay": 1000, "max": 3000, "jitter": 0.5}
     assert compute_backoff(backoff, 4, rand=lambda: 1.0) == 4500  # 3000 capped, then +50%

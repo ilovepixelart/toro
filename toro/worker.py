@@ -157,7 +157,9 @@ def compute_backoff(
         return int(backoff)
     delay = float(backoff.get("delay", 0))
     if backoff.get("type") == "exponential":
-        delay *= 2 ** (attempts_made - 1)
+        # A float overflows past 2**1023; by 2**62 the delay is astronomical whatever
+        # the cap, which is applied after, so the exponent stops there.
+        delay *= 2 ** min(attempts_made - 1, 62)
     cap = backoff.get("max")
     if cap:
         delay = min(delay, float(cap))
