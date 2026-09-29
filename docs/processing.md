@@ -16,7 +16,8 @@ await worker.run()                   # awaits until stop()
 
 `Worker(name, processor, *, url=..., prefix="toro", connection=None, ...)` reaches
 Redis exactly as a `Queue` does: `url=` for another server, `connection=` to share a
-client you already have, `prefix=` to namespace the keys (it must match the queue's).
+client you already have (created with `decode_responses=True`, or it is refused),
+`prefix=` to namespace the keys (it must match the queue's).
 
 The processor is an `async` function of one argument, the `Job`. Returning
 commits the job as `completed` (the return value, JSON-serialized, becomes

@@ -26,6 +26,7 @@ from .connection import (
     connect,
     pop_timeout,
     read_timeout,
+    require_decoded,
 )
 from .errors import IncompatibleDataModelError, JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
@@ -233,6 +234,7 @@ class Queue:
         # NB: created with decode_responses=True, so every command returns str -
         # redis-py's async client isn't generic over that, hence the casts below.
         self.redis = connection or connect(url)
+        require_decoded(self.redis)
         # A connection we opened is ours to give back on close(); one handed to us
         # belongs to the caller, who may still be using it elsewhere.
         self._owns_connection = connection is None
