@@ -59,6 +59,9 @@ Fixes:
   occurrence, and `remove_scheduler()` landing while the next occurrence is minted.
 - Lock renewal survives a Redis error while the lease still holds; the job is not
   run twice.
+- A worker's presence record counts a failure once its commit has landed, as it
+  counts completions and cancellations: a run that lost its lock and then raised
+  commits nothing, and used to count.
 - A finish is re-sent through a Redis blip while the lease holds, and one whose first
   send ran but lost its reply is answered as that send was, with the job it fetched.
   It used to be dropped (the job re-ran after the sweep) and, once re-sent, refused as

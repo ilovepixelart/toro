@@ -993,7 +993,6 @@ class Worker:
         self, job: Job, exc: Exception
     ) -> tuple[str, dict[str, str]] | None:
         """Record the traceback being handled and fail the job with `exc`."""
-        self._failed += 1
         return await self._finish_failed(job, exc, traceback.format_exc())
 
     async def _finish_failed(
@@ -1039,6 +1038,9 @@ class Worker:
         if res in (scripts.LOCK_LOST, scripts.NOT_ACTIVE):  # finish script's int sentinel
             await self._finish_lost(job.id)
             return None
+        # Counted once committed, like a completion or a cancellation: a run that lost
+        # its lock failed nothing the queue has a record of.
+        self._failed += 1
         job.failed_reason = str(exc)
         self._emit("failed" if res[0] == scripts.OUTCOME_FAILED else "retrying", job, exc)
         return self._next_from(res)
