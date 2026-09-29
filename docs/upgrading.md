@@ -62,6 +62,11 @@ Fixes:
 
 CI now runs the suite on the declared redis-py floor (5.0.1) as well as Redis 6.2.
 
+New: a `backoff` dict accepts `max` (a cap in ms; exponential backoff otherwise
+doubles without limit) and `jitter` (0 to 1: up to that share of the delay, added at
+random). Without jitter, every job of a batch that failed together retried on the same
+millisecond. Neither is on by default.
+
 ## 1.0.2
 
 Nothing breaks. One fix.

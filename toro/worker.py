@@ -25,6 +25,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import socket
 import time
 import traceback
@@ -131,18 +132,28 @@ def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
 PRESENCE_TTL_MS = 24 * 60 * 60 * 1000
 
 
-def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
+def compute_backoff(
+    backoff: Backoff, attempts_made: int, *, rand: Callable[[], float] = random.random
+) -> int:
     """Delay (ms) before the next attempt. `backoff` is None/0, an int (fixed ms),
-    or {"type": "fixed"|"exponential", "delay": ms}. Exponential doubles per attempt.
+    or {"type": "fixed"|"exponential", "delay": ms, "max": ms, "jitter": 0..1}.
+    Exponential doubles per attempt; `max` caps the delay; `jitter` adds up to that
+    share of the delay at random, so jobs that failed together do not retry together.
     Pure function so it can be unit-tested without a Redis-bound Worker.
     """
     if not backoff:
         return 0
     if isinstance(backoff, (int, float)):
         return int(backoff)
-    delay = backoff.get("delay", 0)
+    delay = float(backoff.get("delay", 0))
     if backoff.get("type") == "exponential":
-        return int(delay * (2 ** (attempts_made - 1)))
+        delay *= 2 ** (attempts_made - 1)
+    cap = backoff.get("max")
+    if cap:
+        delay = min(delay, float(cap))
+    jitter = backoff.get("jitter")
+    if jitter:
+        delay *= 1 + jitter * rand()
     return int(delay)
 
 

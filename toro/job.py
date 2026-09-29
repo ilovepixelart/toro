@@ -24,10 +24,15 @@ FINISHED_STATES: tuple[JobState, ...] = ("completed", "failed", "cancelled")
 
 
 class BackoffOpts(TypedDict, total=False):
-    """Retry backoff as a dict: ``{"type": "fixed"|"exponential", "delay": ms}``."""
+    """Retry backoff as a dict: ``{"type": "fixed"|"exponential", "delay": ms}``, with
+    an optional ``"max"`` (a cap, ms) and ``"jitter"`` (0 to 1, the share of the delay
+    added at random).
+    """
 
     type: Literal["fixed", "exponential"]
     delay: int
+    max: int
+    jitter: float
 
 
 class Deduplication(TypedDict):
@@ -105,8 +110,21 @@ def _backoff(value: Backoff) -> Backoff:
         if kind not in ("fixed", "exponential"):
             msg = f"backoff type must be 'fixed' or 'exponential', not {kind!r}"
             raise ValueError(msg)
-        return {**value, "delay": _whole(value.get("delay"), "backoff delay")}
+        out = {**value, "delay": _whole(value.get("delay"), "backoff delay")}
+        if value.get("max") is not None:
+            out["max"] = _whole(value["max"], "backoff max", minimum=1)
+        if value.get("jitter") is not None:
+            out["jitter"] = _share(value["jitter"], "backoff jitter")
+        return cast("BackoffOpts", out)
     return _whole(value, "backoff")
+
+
+def _share(value: object, what: str) -> float:
+    """Check a fraction from 0 to 1 (a bool is not one) and return it as a float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        msg = f"{what} must be a number from 0 to 1, not {value!r}"
+        raise ValueError(msg)
+    return float(value)
 
 
 def _retention(value: RemoveOption, what: str) -> RemoveOption:
