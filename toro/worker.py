@@ -561,13 +561,7 @@ class Worker:
                 # a job, and a delayed job is promoted at its due time by whichever
                 # comes first, the wake or the block ending.
                 loaded = await self._acquire()
-                # Keep processing as long as each finish hands us the next job. No
-                # `_running` check here: a job in hand is already claimed, and stop()
-                # can land during the very round trip that claimed it. Dropped, it
-                # would sit locked in `active` until the sweep. Shutdown ends the
-                # chain by itself: a stopping worker finishes with fetch=0.
-                while loaded is not None:
-                    loaded = await self._handle(loaded)
+                await self._handle_chain(loaded)
                 if not self._running:
                     break
                 timeout = block_for(self._pop_timeout, self._due_ms, _now_ms())
@@ -588,6 +582,24 @@ class Worker:
                 self._loop_failed("a claim", exc)
                 await asyncio.sleep(pause)
                 pause = min(pause * 2, self.block_timeout)
+
+    async def _handle_chain(self, loaded: tuple[str, dict[str, str]] | None) -> None:
+        """Run the claimed job, and every job its finish hands over in turn.
+
+        No `_running` check between them: a job in hand is already claimed, and stop()
+        can land during the very round trip that claimed it. Dropped, it would sit
+        locked in `active` until the sweep. Shutdown ends the chain by itself: a
+        stopping worker finishes with fetch=0.
+        """
+        try:
+            while loaded is not None:
+                loaded = await self._handle(loaded)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Not a claim and not retried, so not the claim loop's episode log: the
+            # job in hand stays locked in `active` until the sweep recovers it.
+            logger.exception("handling a job failed; the job waits for the stalled sweep")
 
     def _register_scripts(self) -> None:
         """Register the Lua scripts this worker runs (a local call; Redis is not touched)."""
