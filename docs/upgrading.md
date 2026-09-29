@@ -111,6 +111,9 @@ Fixes:
 - Exponential backoff no longer raises past a job's 1024th failure: the float multiply
   overflowed, the finish never committed, and the job stayed locked until the sweep
   failed it for stalling. The delay stops doubling at 2^62; `max` still applies after.
+- `get_flow()` and `flow_view()` return `None` for an id that names one of the queue's
+  own keys, as `get_job()` does: `meta` hydrated into a tree of one fake job, and a
+  state set raised `WRONGTYPE`.
 
 New: a per-job `timeout` (ms) fails an async processor that runs past it, with a
 `TimeoutError` that names the limit; the job then retries like any other failure.
