@@ -191,9 +191,10 @@ async def test_a_root_the_sweep_fails_places_its_subtree(q, run_until):
     task = asyncio.create_task(w.run())
     root_id, names = await _nested(q)
     assert await run_until(lambda: _in_state(q, root_id, "active"), timeout=10)
-    await w.stop(grace_period=0.1)  # past the grace: the root is abandoned, lock and all
+    await q.redis.delete(q.keys.lock(root_id))  # its lock ran out: the worker is as good as dead
+    await w.stop(grace_period=0.1)  # a shutdown hands back only a job it still holds
     task.cancel()
-    assert await run_until(lambda: _lock_gone(q, root_id), timeout=5)  # its lock ran out
+    assert await _lock_gone(q, root_id)  # nothing handed it back: it is the sweep's
 
     sweeper = Worker(q.name, proc, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
     await sweeper.check_stalled(throttle_ms=0)

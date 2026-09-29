@@ -149,6 +149,7 @@ And the scripts themselves:
 | `EXTEND_LOCK` | renewer | Token-guarded lock renewal; clears the job from `stalled`. Answers `LOCK_CANCEL_REQUESTED` (2) when the job carries a cancellation, which is the backstop for a request whose message never arrived. |
 | `CANCEL_JOB` | producer/dashboard | Stop a job wherever it is: one that has not started ends here (its subtree with it), a running one is flagged and its worker told over the cancel channel. |
 | `MOVE_TO_CANCELLED` | worker finish | Commit a job the worker stopped, token-guarded like the other finishes. |
+| `RELEASE_JOB` | worker shutdown | Hand a job cut off by a shutdown back to `prioritized` at once, lock dropped, nothing counted; token-guarded. |
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
 | `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |
 | `UPDATE_PROGRESS` | processor (`job.update_progress`) | Write progress and publish the `progress` event, only while the job hash exists: a removed job's cleanup cannot recreate it as a stub. |

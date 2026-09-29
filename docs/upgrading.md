@@ -57,8 +57,16 @@ Fixes:
   child was removed by retention runs it instead of parking it for good.
 - `stop()` landing before or during `run()`'s startup ends the run; a worker run
   again reports as running, not draining.
+- A job cut off by `stop()` past the grace period, or by a cancelled `run()`, goes
+  straight back to the queue with its lock dropped. It used to sit locked in `active`
+  until the lock expired and a sweep recovered it, 60 to 90 s later, and that recovery
+  spent one of its `max_stalled_count` stalls: at the default of 1, a job cut off by two
+  deploys in a row was failed for good. A sync processor's job still goes to the sweep.
 - A cancel request applies to the run it was made for: a job id re-added while its
   cancelled run unwinds is no longer cancelled with it.
+- An `add()` or `add_flow()` re-sent by the client after a connection dropped while
+  the reply was on its way no longer enqueues a second copy: each call carries a token
+  the script remembers for a minute (`add:<token>`, a new reserved key namespace).
 - The schedule check, the stalled sweep and the heartbeat log one warning per
   failure episode and one line on recovery, where they were silent.
 - `get_job()` returns `None` for an id that names one of the queue's own keys or a
@@ -76,6 +84,11 @@ Without one, a hung processor renewed its lock forever and kept its slot, its sh
 the global cap and its concurrency key until someone cancelled it.
 
 CI now runs the suite on the declared redis-py floor (5.0.1) as well as Redis 6.2.
+
+New: a `backoff` dict accepts `max` (a cap in ms; exponential backoff otherwise
+doubles without limit) and `jitter` (0 to 1: up to that share of the delay, added at
+random). Without jitter, every job of a batch that failed together retried on the same
+millisecond. Neither is on by default.
 
 ## 1.0.2
 

@@ -25,6 +25,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import socket
 import time
 import traceback
@@ -35,6 +36,9 @@ from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
+from redis.commands.core import AsyncScript
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from . import scripts
 from ._replies import _scored, _str_list
@@ -146,18 +150,28 @@ def block_for(pop_timeout_s: float, due_ms: int | None, now_ms: int) -> float:
 PRESENCE_TTL_MS = 24 * 60 * 60 * 1000
 
 
-def compute_backoff(backoff: Backoff, attempts_made: int) -> int:
+def compute_backoff(
+    backoff: Backoff, attempts_made: int, *, rand: Callable[[], float] = random.random
+) -> int:
     """Delay (ms) before the next attempt. `backoff` is None/0, an int (fixed ms),
-    or {"type": "fixed"|"exponential", "delay": ms}. Exponential doubles per attempt.
+    or {"type": "fixed"|"exponential", "delay": ms, "max": ms, "jitter": 0..1}.
+    Exponential doubles per attempt; `max` caps the delay; `jitter` adds up to that
+    share of the delay at random, so jobs that failed together do not retry together.
     Pure function so it can be unit-tested without a Redis-bound Worker.
     """
     if not backoff:
         return 0
     if isinstance(backoff, (int, float)):
         return int(backoff)
-    delay = backoff.get("delay", 0)
+    delay = float(backoff.get("delay", 0))
     if backoff.get("type") == "exponential":
-        return int(delay * (2 ** (attempts_made - 1)))
+        delay *= 2 ** (attempts_made - 1)
+    cap = backoff.get("max")
+    if cap:
+        delay = min(delay, float(cap))
+    jitter = backoff.get("jitter")
+    if jitter:
+        delay *= 1 + jitter * rand()
     return int(delay)
 
 
@@ -543,6 +557,7 @@ class Worker:
         # job hash, or anything else unexpected costs one beat, never the slot. A
         # job interrupted mid-flight stays locked in `active` until its lock
         # expires and the stalled sweep recovers it - the normal at-least-once path.
+        pause = 0.1
         while self._running:
             try:
                 # The claim comes first: it promotes the delayed jobs that are due and,
@@ -552,6 +567,8 @@ class Worker:
                 # a job, and a delayed job is promoted at its due time by whichever
                 # comes first, the wake or the block ending.
                 loaded = await self._acquire()
+                self._loop_recovered("a claim")
+                pause = 0.1
                 # Keep processing as long as each finish hands us the next job. No
                 # `_running` check here: a job in hand is already claimed, and stop()
                 # can land during the very round trip that claimed it. Dropped, it
@@ -570,9 +587,13 @@ class Worker:
                     await self.redis.zadd(self.keys.marker, {"0": 0})
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("process loop hiccup; the slot lives on")
-                await asyncio.sleep(0.1)
+            except Exception as exc:
+                # One warning per outage, not a traceback per slot every tenth of a
+                # second: with Redis down, every slot lands here at once. The pause
+                # doubles up to the block timeout and resets on the next round trip.
+                self._loop_failed("a claim", exc)
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, self.block_timeout)
 
     def _register_scripts(self) -> None:
         """Register the Lua scripts this worker runs (a local call; Redis is not touched)."""
@@ -582,6 +603,7 @@ class Worker:
         self._move_to_completed = register(scripts.MOVE_TO_COMPLETED)
         self._move_to_failed = register(scripts.MOVE_TO_FAILED)
         self._move_to_cancelled = register(scripts.MOVE_TO_CANCELLED)
+        self._release_job = register(scripts.RELEASE_JOB)
         self._move_stalled = register(scripts.MOVE_STALLED)
         self._add_scheduled = register(scripts.ADD_SCHEDULED)
         self._stamp = register(scripts.STAMP_MODEL)
@@ -781,6 +803,12 @@ class Worker:
         asked = getattr(outer, "cancelling", None)
         stopping = asked() > 0 if asked is not None else not self._running
         if stopping:
+            if self._async_processor:
+                # The processor's task has unwound (awaiting it is what raised), so the
+                # job goes straight back to the queue. A sync processor's thread runs
+                # on and keeps the job; the sweep takes it later.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._release(job), 2.0)
             raise asyncio.CancelledError
         if expired:
             over = TimeoutError(
@@ -833,8 +861,9 @@ class Worker:
         task.cancel()
 
     async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
-        res = await self._move_to_cancelled(
-            keys=[
+        res = await self._committed(
+            self._move_to_cancelled,
+            [
                 self.keys.active,
                 self.keys.cancelled,
                 self.keys.job(job.id),
@@ -844,7 +873,13 @@ class Worker:
                 self.keys.base,
                 self.keys.events,
             ],
-            args=[job.id, _now_ms(), self.token, scripts.METRICS_RETENTION_MS, _claim(job)],
+            lambda _fetch: [
+                job.id,
+                _now_ms(),
+                self.token,
+                scripts.METRICS_RETENTION_MS,
+                _claim(job),
+            ],
         )
         if int(res) < 0:
             # its lock is gone, so nothing was committed: a removal took the job, or
@@ -855,6 +890,60 @@ class Worker:
         self._cancelled += 1
         self._emit("cancelled", job)
         return None
+
+    async def _release(self, job: Job) -> None:
+        """Hand a job cut off by a shutdown back to the queue at once, its lock dropped.
+
+        Left in `active`, it waited out its lock and a sweep pass before running again,
+        and that recovery counted toward `max_stalled_count`: at the default of 1, a
+        job cut off by two deploys in a row was failed for good.
+        """
+        res = await self._release_job(
+            keys=[
+                self.keys.active,
+                self.keys.prioritized,
+                self.keys.job(job.id),
+                self.keys.lock(job.id),
+                self.keys.marker,
+                self.keys.base,
+                self.keys.pc,
+            ],
+            args=[job.id, self.token, _claim(job)],
+        )
+        if int(res) < 0:
+            await self._finish_lost(job.id)  # another run owns it: nothing to hand back
+
+    async def _committed(
+        self,
+        script: AsyncScript,
+        keys: list[str],
+        args: Callable[[str], list[Any]],
+    ) -> Any:
+        """Run a finish script, re-sending it through a Redis blip while the lease holds.
+
+        A finish is idempotent: the token and claim guards refuse the replay of one
+        that ran but whose reply was lost, so re-sending is safe, and a blip of a few
+        seconds becomes a late commit rather than a re-run of the job after the sweep.
+        A retry never fetches the next job: a replay cannot tell whether the first
+        attempt claimed one. The lease was renewed at most lock_renew_time ago, so it
+        holds for lock_duration less that; past it the finish is given up as before.
+        """
+        deadline = time.monotonic() + max(0.0, (self.lock_duration - self.lock_renew_time) / 1000)
+        pause = 0.2
+        fetch = self._fetch_flag()
+        while True:
+            try:
+                res = await script(keys=keys, args=args(fetch))
+            except (RedisConnectionError, RedisTimeoutError) as exc:
+                if time.monotonic() + pause > deadline:
+                    raise
+                self._loop_failed("a finish", exc)
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, 2.0)
+                fetch = "0"
+                continue
+            self._loop_recovered("a finish")
+            return res
 
     async def _finish_lost(self, job_id: str) -> None:
         """Our finish committed nothing: the job was taken over or removed while we
@@ -867,8 +956,10 @@ class Worker:
         await self.redis.zadd(self.keys.marker, {"0": 0})
 
     async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict[str, str]] | None:
-        res = await self._move_to_completed(
-            keys=[
+        returnvalue = json.dumps(result)
+        res = await self._committed(
+            self._move_to_completed,
+            [
                 self.keys.active,
                 self.keys.completed,
                 self.keys.job(job.id),
@@ -882,12 +973,12 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=scripts.completed_args(
+            lambda fetch: scripts.completed_args(
                 job_id=job.id,
-                returnvalue=json.dumps(result),
+                returnvalue=returnvalue,
                 now=_now_ms(),
                 token=self.token,
-                fetch=self._fetch_flag(),
+                fetch=fetch,
                 lock_duration=self.lock_duration,
                 rl_max=self.rl_max,
                 rl_duration=self.rl_duration,
@@ -912,8 +1003,10 @@ class Worker:
     async def _finish_failed(
         self, job: Job, exc: Exception, stacktrace: str = ""
     ) -> tuple[str, dict[str, str]] | None:
-        res = await self._move_to_failed(
-            keys=[
+        backoff = self._backoff_delay(job)
+        res = await self._committed(
+            self._move_to_failed,
+            [
                 self.keys.active,
                 self.keys.prioritized,
                 self.keys.delayed,
@@ -928,16 +1021,16 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=[
+            lambda fetch: [
                 *scripts.failed_args(
                     job_id=job.id,
                     reason=str(exc),
                     now=_now_ms(),
                     attempts_made=job.attempts_made,
                     max_attempts=job.opts.attempts,
-                    backoff=self._backoff_delay(job),
+                    backoff=backoff,
                     token=self.token,
-                    fetch=self._fetch_flag(),
+                    fetch=fetch,
                     lock_duration=self.lock_duration,
                     rl_max=self.rl_max,
                     rl_duration=self.rl_duration,

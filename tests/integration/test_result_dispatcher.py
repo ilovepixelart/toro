@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+import toro.queue as queue_module
 from toro import Queue, scripts
 from toro.errors import JobFailedError
 
@@ -232,3 +233,35 @@ async def test_close_ends_a_read_back_still_in_flight(q, run_until, monkeypatch)
         held.set()
     with pytest.raises(RuntimeError, match="queue closed"):
         await waiting
+
+
+async def test_a_result_whose_event_was_lost_is_still_delivered(q, run_until, monkeypatch):
+    """A pub/sub reconnect (redis-py re-subscribes without a word) drops whatever was
+    published in the gap. The waiter re-reads the job's hash while it waits, so a job
+    that finished meanwhile is delivered rather than timed out."""
+    monkeypatch.setattr(queue_module, "RESULT_RECHECK_S", 0.2)
+    waiting = asyncio.create_task(q.result("quiet", timeout=5))
+    assert await run_until(lambda: _waiting(q, "quiet"))
+
+    now = int(time.time() * 1000)
+    await q.redis.hset(  # the finish landed in the hash; its event never arrived
+        q.keys.job("quiet"),
+        mapping={"id": "quiet", "state": "completed", "timestamp": now, "returnvalue": '"done"'},
+    )
+
+    assert await asyncio.wait_for(waiting, 3) == "done"  # well inside the 5 s timeout
+
+
+async def test_a_failure_whose_event_was_lost_is_still_raised(q, run_until, monkeypatch):
+    monkeypatch.setattr(queue_module, "RESULT_RECHECK_S", 0.2)
+    waiting = asyncio.create_task(q.result("quiet-fail", timeout=5))
+    assert await run_until(lambda: _waiting(q, "quiet-fail"))
+
+    now = int(time.time() * 1000)
+    await q.redis.hset(
+        q.keys.job("quiet-fail"),
+        mapping={"id": "quiet-fail", "state": "failed", "timestamp": now, "failedReason": "boom"},
+    )
+
+    with pytest.raises(JobFailedError, match="boom"):
+        await asyncio.wait_for(waiting, 3)

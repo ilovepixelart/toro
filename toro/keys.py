@@ -199,7 +199,7 @@ class Keys:
 
     # Where a custom job id could land on a key that is not its own: the namespaces
     # built under the base (`de:` only in Lua) and the suffixes of a job's aux keys.
-    _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:", "ck:", "held:")
+    _NAMESPACES = ("repeat:", "worker:", "metrics:", "de:", "ck:", "held:", "add:")
     _JOB_SUFFIXES = (":lock", ":logs", ":deps", ":results", ":cfail", ":ccancel", ":live")
 
     def job_id_conflict(self, job_id: str) -> str | None:
