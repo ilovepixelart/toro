@@ -60,6 +60,11 @@ Fixes:
   and now costs about 1 ms. The Redis floor is unchanged (`ZMSCORE` joins
   `ZDIFFSTORE`, both 6.2).
 
+New: a per-job `timeout` (ms) fails an async processor that runs past it, with a
+`TimeoutError` that names the limit; the job then retries like any other failure.
+Without one, a hung processor renewed its lock forever and kept its slot, its share of
+the global cap and its concurrency key until someone cancelled it.
+
 CI now runs the suite on the declared redis-py floor (5.0.1) as well as Redis 6.2.
 
 ## 1.0.2

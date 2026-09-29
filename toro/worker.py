@@ -687,37 +687,21 @@ class Worker:
         its lock is still held and it is still in `active`, so either commit would
         otherwise succeed and stand.
         """
+        timer, expired = self._arm_timeout(job, task)
         try:
             result = await task
         except asyncio.CancelledError:  # NOSONAR
             # Absorbing this one IS the feature: a cancellation that killed the process
             # loop would take the worker's slot with it, so the usual "always re-raise"
             # rule cannot hold here. It IS re-raised in every case that is not ours.
-            #
-            # Ours only when the PROCESSOR is what was stopped. The same error arrives
-            # when this WORKER is being stopped, and absorbing that one commits a job
-            # and carries on through a shutdown. Cancelling the awaiting task cancels
-            # the awaited one too, so the inner task cannot tell them apart; the
-            # outer task's own pending-cancellation count can (3.11+, with the
-            # shutdown flag as the fallback: run() clears it before cancelling us).
-            outer = asyncio.current_task()
-            asked = getattr(outer, "cancelling", None)
-            stopping = asked() > 0 if asked is not None else not self._running
-            if stopping:
-                raise
-            if self._cancelling.get(job.id) is not task:
-                # Nobody cancelled this run and the worker is not stopping: the
-                # processor raised it itself (it awaited something that was
-                # cancelled), which is the processor failing like any other error.
-                stray = RuntimeError(
-                    "the processor raised CancelledError; the job was not cancelled"
-                )
-                return await self._processing_failed(job, stray)
-            return await self._finish_cancelled(job)
+            return await self._cancelled_outcome(job, task, expired[0])
         except Exception as exc:
             if self._cancelling.get(job.id) is not task:
                 return await self._processing_failed(job, exc)
             result = None  # a cleanup that raised while cancelled: committed below
+        finally:
+            if timer is not None:
+                timer.cancel()
         if self._cancelling.get(job.id) is task:
             return await self._finish_cancelled(job)
         try:
@@ -730,6 +714,55 @@ class Worker:
             return await self._processing_failed(job, exc)
         self._processed += 1
         return committed
+
+    def _arm_timeout(
+        self, job: Job, task: asyncio.Task[Any]
+    ) -> tuple[asyncio.TimerHandle | None, list[bool]]:
+        """Start the job's timeout, if it has one: a timer that cancels the processor's
+        task and raises a flag, which tells that cancellation from every other one, so
+        a TimeoutError the processor raises itself is still its own failure. A sync
+        processor's thread cannot be taken back: no timer.
+        """
+        expired = [False]
+        timeout = job.opts.timeout if self._async_processor else None
+        if not timeout:
+            return None, expired
+
+        def expire() -> None:
+            expired[0] = True
+            task.cancel()
+
+        return asyncio.get_running_loop().call_later(timeout / 1000, expire), expired
+
+    async def _cancelled_outcome(
+        self, job: Job, task: asyncio.Task[Any], expired: bool
+    ) -> tuple[str, dict[str, str]] | None:
+        """Commit what a processor task that ended in CancelledError means.
+
+        Ours only when the PROCESSOR is what was stopped. The same error arrives
+        when this WORKER is being stopped, and absorbing that one commits a job
+        and carries on through a shutdown. Cancelling the awaiting task cancels
+        the awaited one too, so the inner task cannot tell them apart; the
+        outer task's own pending-cancellation count can (3.11+, with the
+        shutdown flag as the fallback: run() clears it before cancelling us).
+        """
+        outer = asyncio.current_task()
+        asked = getattr(outer, "cancelling", None)
+        stopping = asked() > 0 if asked is not None else not self._running
+        if stopping:
+            raise asyncio.CancelledError
+        if expired:
+            over = TimeoutError(
+                f"the processor ran over the job's timeout of {job.opts.timeout} ms"
+            )
+            return await self._processing_failed(job, over)
+        if self._cancelling.get(job.id) is not task:
+            # Nobody cancelled this run and the worker is not stopping: the
+            # processor raised it itself (it awaited something that was
+            # cancelled), which is the processor failing like any other error.
+            stray = RuntimeError("the processor raised CancelledError; the job was not cancelled")
+            return await self._processing_failed(job, stray)
+        return await self._finish_cancelled(job)
 
     def _request_cancel(self, job_id: str, claim: str | None = None) -> None:
         """Stop a job this worker is running, once.
