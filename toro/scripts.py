@@ -29,6 +29,9 @@ KEYS[]. This keeps the scripts simple for a single Redis; running on Redis Clust
 would require hash-tagging the keys (e.g. `{queue}`) so a queue's keys share a slot.
 """
 
+import json
+from collections.abc import Mapping
+
 from .job import DEFAULT_KEEP_COMPLETED, DEFAULT_KEEP_FAILED
 
 # Priority score packing constants (kept well under 2^53 so ZSET double scores
@@ -1614,6 +1617,32 @@ return {rc(KEYS[1]), rc(KEYS[2]), rc(KEYS[3]), rc(KEYS[4]), rc(KEYS[5]), rc(KEYS
 # The ARGV of the scripts with many parameters, in the order their headers document.
 # Built here and nowhere else: a hand-rolled list keeps "working" when the layout
 # changes, with its values in the wrong slots.
+def scheduled_args(
+    *,
+    occurrence_id: str,
+    template: Mapping[str, str],
+    now: int,
+    when: int,
+    scheduler_id: str,
+) -> list[str | int]:
+    """ARGV for ADD_SCHEDULED, from the scheduler's stored template: the producer's
+    first occurrence and every one a worker mints are built the same way.
+    """
+    opts = json.loads(template["opts"])
+    return [
+        occurrence_id,
+        template["name"],
+        template["data"],
+        template["opts"],
+        now,
+        when,
+        opts.get("priority", 0),
+        scheduler_id,
+        opts.get("concurrencyKey") or "",
+        METRICS_RETENTION_MS,
+    ]
+
+
 def add_job_args(
     *,
     name: str,
