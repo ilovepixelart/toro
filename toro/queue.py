@@ -1374,7 +1374,8 @@ class Queue:
     def _remove_job_keys(self) -> list[str]:
         """Build the KEYS the REMOVE_JOB script takes (every state set plus the base;
         the job id rides in as an ARGV) - one definition so remove_job and clean can't
-        drift apart. `held` is last: the base sat there before the state existed.
+        drift apart. The base sits among the states, where it was before `held`,
+        `cancelled` and the cancel channel were added after it.
         """
         return [
             self.keys.prioritized,
@@ -1410,9 +1411,11 @@ class Queue:
 
         A job that has not started ends here and now. A RUNNING job is asked to stop:
         its worker owns the processor, so only the worker can cancel it, which it does
-        as soon as it hears (over the events channel, or at its next lock renewal).
-        Either way the job ends in `cancelled`, which is not a failure and is not
-        retried. A job that has already finished, or that is gone, returns False.
+        as soon as it hears (over the cancel channel, or at its next lock renewal), and
+        the job ends in `cancelled`, which is not a failure and is not retried. True
+        means asked: a run whose processor had already returned when the request
+        landed commits as it ran. A job that has already finished, or that is gone,
+        returns False.
         """
         res = await self._cancel_job(
             keys=[

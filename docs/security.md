@@ -62,9 +62,11 @@ None of these is a hole, and each is a shape to design around:
 - **A `concurrency_key` is a queue of its own.** The key is taken at enqueue, so a job
   delayed by an hour holds its key for that hour and everything sharing it waits. If
   the key comes from user input, that is a one-call stall of everything on it.
-- **The root-first listings scan the state set.** `roots_counts()` and
-  `get_jobs_roots()` diff the whole set; at tens of millions of retained finished jobs
-  that is a slow script. Bounded retention (the default) keeps it far from that.
+- **The root-first listings walk a state set.** `roots_counts()` walks the smaller of
+  the state set and the flow-children index in chunks of 500, and `get_jobs_roots()`
+  diffs the whole set for a page that starts past 10,000 roots; at tens of millions of
+  retained finished jobs that is a slow script. Bounded retention (the default) keeps
+  it far from that.
 - **A `pending()` buffer has no ceiling.** It is a per-transaction object by design;
   holding one across requests grows it without limit.
 - **`search()` is a bounded scan, not an index.** The bound is the caller's

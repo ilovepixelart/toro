@@ -1504,6 +1504,7 @@ return {failed, recovered}
 # call, so a single fixed key is safe (scripts never interleave).
 # KEYS[1] state zset  KEYS[2] children zset  KEYS[3] scratch zset
 # ARGV[1] start  ARGV[2] stop (inclusive)  ARGV[3] rev (1 = ZREVRANGE)
+# ARGV[4] chunk (ids per ZMSCORE walk)  ARGV[5] deep (a start at or past it diffs)
 # The roots scripts read a state set in chunks of this many ids (one ZMSCORE each),
 # and a page starting this deep in the roots diffs the whole state instead.
 ROOTS_CHUNK = 500
@@ -1587,12 +1588,13 @@ return {total, ids}
 )
 
 # Exact roots-only count per state - the root-first counterpart of counts().
-# Each ZSET state is diffed against the children index in turn through one shared
-# scratch key (DELeted between uses); `active` is a LIST, so its roots are
-# counted by membership in the children index. One atomic round trip for all seven.
+# Each ZSET state is its size less the children in it, found by walking the smaller
+# of the state and the children index in chunks (ZMSCORE against the other); `active`
+# is a LIST, so its roots are counted by membership in the children index. One atomic
+# round trip for all eight.
 # KEYS[1] prioritized  KEYS[2] delayed  KEYS[3] completed  KEYS[4] failed
 # KEYS[5] waiting-children  KEYS[6] active (LIST)  KEYS[7] held
-# KEYS[8] children  KEYS[9] scratch  KEYS[10] cancelled
+# KEYS[8] children  KEYS[9] cancelled  ARGV[1] chunk
 ROOTS_COUNTS = (
     _ROOTS_LIB
     + """
