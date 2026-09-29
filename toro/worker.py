@@ -250,6 +250,10 @@ class Worker:
         self.heartbeat_interval = heartbeat_interval
 
         self._running = False
+        # Raised right before the slots are cancelled (stop() past its grace period, a
+        # cancelled run()): before 3.11 it is how a slot tells that cancellation from
+        # a job it asked to stop itself.
+        self._cut_off = False
         self._tasks: list[asyncio.Task[None]] = []
         self._process_tasks: list[asyncio.Task[None]] = []
 
@@ -332,6 +336,7 @@ class Worker:
         # must not run a claim loop against a model it cannot read.
         await stamp_data_model(self._stamp, self.keys, self.name)
         self._running = True
+        self._cut_off = False
         self._state = "running"  # a worker run again after stop() is no longer draining
         self.started_at = _now_ms()
         await self._write_heartbeat()  # register at once so the worker shows up immediately
@@ -365,9 +370,10 @@ class Worker:
         except asyncio.CancelledError:
             # run() cancelled outright (a framework cancelling its tasks, Ctrl-C under
             # asyncio.run): end the loops as stop() does without the grace period, and
-            # lower the flag first, so a slot can tell this from a job it was asked to
-            # cancel where the task's own cancellation count is not there to tell it.
+            # raise the cut-off flag first, so a slot can tell this from a job it was
+            # asked to cancel where the task's own cancellation count is not there.
             self._running = False
+            self._cut_off = True
             for t in self._tasks:
                 t.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -395,6 +401,8 @@ class Worker:
         if self._process_tasks:
             await asyncio.wait(self._process_tasks, timeout=grace)
         # Force-cancel anything left (jobs past the grace period + background loops).
+        # The flag goes up first: from here every cancellation a slot sees is this one.
+        self._cut_off = True
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -793,12 +801,15 @@ class Worker:
         when this WORKER is being stopped, and absorbing that one commits a job
         and carries on through a shutdown. Cancelling the awaiting task cancels
         the awaited one too, so the inner task cannot tell them apart; the
-        outer task's own pending-cancellation count can (3.11+, with the
-        shutdown flag as the fallback: run() clears it before cancelling us).
+        outer task's own pending-cancellation count can (3.11+). Before that
+        the cut-off flag stands in, raised by stop() and by a cancelled run()
+        right before they cancel the slots. The running flag cannot: stop()
+        clears it before the grace wait, and a timeout or a cancel request
+        landing in that window is this worker's own doing, not the shutdown.
         """
         outer = asyncio.current_task()
         asked = getattr(outer, "cancelling", None)
-        stopping = asked() > 0 if asked is not None else not self._running
+        stopping = asked() > 0 if asked is not None else self._cut_off
         if stopping:
             if self._async_processor:
                 # The processor's task has unwound (awaiting it is what raised), so the
