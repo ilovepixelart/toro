@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import scripts
-from .job import FINISHED_STATES, JobOptions
+from .job import FINISHED_STATES, JobOptions, _job_name
 
 OnFail = Literal["fail_parent", "continue"]
 
@@ -48,8 +48,7 @@ class FlowChild:
         on_fail: OnFail = "fail_parent",
         **opts: Any,
     ) -> None:
-        if not name or not isinstance(name, str):
-            raise ValueError("a flow node needs a non-empty job name")
+        _job_name(name)
         if on_fail not in ("fail_parent", "continue"):
             raise ValueError("on_fail must be 'fail_parent' or 'continue'")
         if "job_id" in opts:
@@ -61,7 +60,7 @@ class FlowChild:
             # fail typos at construction, where the node is in hand (queue
             # defaults merge later - node_options re-validates after the merge)
             local_options = JobOptions(**opts)
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
             raise ValueError(f"flow node {name!r}: {exc}") from None
         if self.children and local_options.delay > 0:
             raise ValueError(
@@ -92,7 +91,7 @@ def node_options(node: FlowChild, defaults: dict[str, Any]) -> JobOptions:
     """
     try:
         options = JobOptions(**{**defaults, **node.opts})
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"flow node {node.name!r}: {exc}") from None
     options.priority = clamp_priority(options.priority)
     if node.children and options.delay > 0:
