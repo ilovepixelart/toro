@@ -69,8 +69,11 @@ async def test_result_short_circuits_for_already_finished_jobs(q):
 
 
 async def test_result_times_out_with_a_clear_message(q):
+    t0 = time.monotonic()
     with pytest.raises(TimeoutError, match="ghost-never"):
         await q.result("ghost-never", timeout=0.2)
+    # the timeout is the timeout: a short one is not stretched to the recheck interval
+    assert time.monotonic() - t0 < 2
 
 
 def _waiting(q, *job_ids):

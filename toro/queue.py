@@ -621,12 +621,7 @@ class Queue:
             loop = asyncio.get_running_loop()
             deadline = None if timeout is None else loop.time() + timeout
             while True:
-                wait = RESULT_RECHECK_S
-                if deadline is not None:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
-                    wait = min(remaining, RESULT_RECHECK_S)
+                wait = self._next_wait(deadline, job_id, timeout)
                 try:
                     return await asyncio.wait_for(asyncio.shield(fut), wait)
                 except (TimeoutError, asyncio.TimeoutError):
@@ -640,6 +635,18 @@ class Queue:
                     waiters.remove(fut)
                 if not waiters:
                     del self._result_waiters[job_id]
+
+    @staticmethod
+    def _next_wait(deadline: float | None, job_id: str, timeout: float | None) -> float:
+        """How long result()'s next wait may last: the recheck interval, clipped to
+        what is left of the deadline; raises TimeoutError once nothing is left.
+        """
+        if deadline is None:
+            return RESULT_RECHECK_S
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
+        return min(remaining, RESULT_RECHECK_S)
 
     @staticmethod
     def _settled(job: Job | None) -> tuple[bool, Any]:
