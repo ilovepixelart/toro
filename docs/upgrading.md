@@ -112,7 +112,10 @@ worker at once and a change needs no rollout; `await queue.limits()` reads them 
 (`None` for a queue with no limits of its own).
 A worker's `global_concurrency` and `rate_limit` arguments still work, and apply only
 to a queue whose limits were never set; `set_limits()` with no arguments gives the
-queue limits of its own, none, and the workers' arguments no longer apply.
+queue limits of its own, none, and the workers' arguments no longer apply. Both limits
+are validated like every option: whole numbers of at least 1 (a whole float such as
+`60_000 / 2` is fine), and a string, a fraction or a bool raises `ValueError` where
+`rate_limit` used to coerce them.
 
 ## 1.0.2
 

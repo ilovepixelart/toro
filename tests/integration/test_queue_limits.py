@@ -10,8 +10,9 @@ to a queue whose limits were never set.
 import asyncio
 
 import pytest
+from redis.exceptions import ResponseError
 
-from toro import Queue, Worker
+from toro import Job, Queue, Worker
 
 PREFIX = "torotest"
 
@@ -123,3 +124,33 @@ async def test_limits_that_cannot_be_enforced_are_refused(q, bad):
     with pytest.raises(ValueError):
         await q.set_limits(**bad)
     assert await q.limits() is None
+
+
+async def test_a_queue_limit_that_is_not_a_number_stops_a_finish_before_it_commits(q):
+    """A finish read the queue's limits only when it fetched, after it had committed,
+    so a field edited into something that is not a number erred past the commit: the
+    job was completed and the worker saw an error. The limits are read and checked
+    before the first write, like the cap argument, so nothing is committed under a
+    limit that cannot be read."""
+    await q.add("x", {})
+    w = _worker(q)
+    loaded = await w._acquire()
+    assert loaded is not None
+    w._running = True  # a running worker's finish fetches the next job
+    await q.redis.hset(q.keys.meta, "globalConcurrency", "x")
+
+    with pytest.raises(ResponseError):
+        await w._finish_completed(Job.from_hash(*loaded), None)
+
+    assert (await q.get_job(loaded[0])).state == "active"
+    assert await q.redis.get(q.keys.lock(loaded[0])) == w.token
+
+
+async def test_a_queue_rate_limit_with_no_duration_refuses_the_claim(q):
+    """rlMax with rlDuration 0 made the refill infinite and every claim allowed: a
+    rate limit that silently meant none. A limit must never fail open."""
+    await q.add("x", {})
+    await q.redis.hset(q.keys.meta, mapping={"rlMax": 5, "rlDuration": 0})
+
+    with pytest.raises(ResponseError):
+        await _worker(q)._acquire()
