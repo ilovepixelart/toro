@@ -106,6 +106,8 @@ Fixes:
   call: on 200,000 waiting jobs a dashboard refresh cost 30 to 100 ms of Redis time
   and now costs about 1 ms. The Redis floor is unchanged (`ZMSCORE` joins
   `ZDIFFSTORE`, both 6.2).
+- `clean()` returns how many jobs it removed, as documented, rather than how many ids
+  it listed: an id whose hash was already gone removes nothing and is not counted.
 - Exponential backoff no longer raises past a job's 1024th failure: the float multiply
   overflowed, the finish never committed, and the job stayed locked until the sweep
   failed it for stalling. The delay stops doubling at 2^62; `max` still applies after.

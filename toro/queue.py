@@ -1595,9 +1595,14 @@ class Queue:
         pipe = self.redis.pipeline(transaction=False)
         keys = self._remove_job_keys()
         for job_id in ids:
+            pipe.hexists(self.keys.job(job_id), "timestamp")  # there to remove, or gone
+        for job_id in ids:
             pipe.evalsha(sha, len(keys), *keys, job_id, now)
-        await pipe.execute()
-        return len(ids)
+        res = await pipe.execute()
+        # The listed jobs that were there to remove. Not the removals' own answers: a
+        # flow parent's removal takes its listed children with it, and theirs then
+        # find nothing; an id whose hash was already gone removed nothing.
+        return sum(1 for r in res[: len(ids)] if r)
 
     # ---- queue control ----------------------------------------------------
 
