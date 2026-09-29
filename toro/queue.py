@@ -717,7 +717,7 @@ class Queue:
         """Resolve a waiter from a completion event.
 
         From the result's JSON text when it travelled with it, the decoded `result` a
-        worker before 1.0.3 sends, or else a read of the job's hash, where the finish
+        worker before 1.1.0 sends, or else a read of the job's hash, where the finish
         script already wrote it.
         """
         if "resultJson" in event:

@@ -2,7 +2,7 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
-## 1.0.3
+## 1.1.0
 
 Five things change for a caller, and two for a rolling upgrade. The rest are fixes.
 
@@ -35,10 +35,10 @@ second later, an idle slot sends one claim and one blocking pop per `block_timeo
 and the schedule check that shared the sweep's loop runs every five seconds.
 
 **Rolling upgrade.** Where `result()` is used with `remove_on_complete=True`, upgrade
-producers before workers: a 1.0.3 worker publishes such a result inside the event
+producers before workers: a 1.1.0 worker publishes such a result inside the event
 only (`resultJson`), and a 1.0.2 producer reads it from the job's hash, which is
 already gone, and resolves `None`. A job delayed by a 1.0.2 producer does not wake a
-1.0.3 worker, which sees it at its next claim or idle poll (`block_timeout`, 5 s by
+1.1.0 worker, which sees it at its next claim or idle poll (`block_timeout`, 5 s by
 default); 1.0.2 workers keep their own sweep.
 
 Fixes:
