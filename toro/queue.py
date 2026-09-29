@@ -1115,8 +1115,8 @@ class Queue:
 
     async def latency(self) -> int:
         """How long (ms) the next-to-run waiting job has been runnable - 0 when
-        nothing is waiting. A job added with a delay becomes runnable when the delay
-        passes, not when it is added.
+        nothing is waiting. A job becomes runnable when it enters the queue: at its
+        add, at the end of its delay or backoff, at its promotion, retry or release.
 
         The queue-health headline number: depth says how much is queued,
         latency says how far behind the workers actually are.
@@ -1124,9 +1124,14 @@ class Queue:
         head = _str_list(await self.redis.zrange(self.keys.prioritized, 0, 0))
         if not head:
             return 0
-        ts, opts = await self.redis.hmget(self.keys.job(head[0]), "timestamp", "opts")
+        since, ts, opts = await self.redis.hmget(
+            self.keys.job(head[0]), "enqueuedOn", "timestamp", "opts"
+        )
         if not ts:  # the head job was removed between the two reads
             return 0
+        if since:
+            return max(0, _now_ms() - int(since))
+        # a job enqueued before 1.1.0 stamped it: the add and the delay it was given
         delay = (json.loads(opts).get("delay") or 0) if opts else 0
         return max(0, _now_ms() - int(ts) - int(delay))
 
@@ -1441,7 +1446,7 @@ class Queue:
                 self.keys.job(job_id),
                 self.keys.pc,
             ],
-            args=[job_id],
+            args=[job_id, _now_ms()],
         )
         return bool(res)
 

@@ -92,7 +92,7 @@ _CONSTANTS = (
 # Shared routines, prepended to every script that enqueues or acquires a job.
 # This is the single definition of "how a job is ordered, woken, claimed":
 #   priorityScore  - (priority, seq) -> ZSET score (lower score = sooner)
-#   enqueue        - put a job into `prioritized` + arm the base marker
+#   enqueue        - put a job into `prioritized`, stamp enqueuedOn + arm the base marker
 #   wakeAt         - tell an idle worker when the next delayed job is due
 #   promoteDue     - move the delayed jobs whose time has come into `prioritized`
 #   lockAndLoad    - lock a job already on `active`, stamp it, return its hash
@@ -106,7 +106,9 @@ local function priorityScore(priority, pcKey)
   local seq = redis.call("INCR", pcKey) % 4294967296
   return (1048576 - priority) * 4294967296 + seq
 end
-local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
+local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey, jobKey, now)
+  -- when the job last became runnable: what latency() measures from
+  redis.call("HSET", jobKey, "enqueuedOn", now)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
   redis.call("ZADD", markerKey, 0, "0")
 end
@@ -134,7 +136,7 @@ local function promoteDue(base, prioritizedKey, pcKey, now)
     -- create it, and the claim would run an empty job that a finish then records.
     if redis.call("EXISTS", base .. jobId) == 1 then
       local priority = tonumber(redis.call("HGET", base .. jobId, "priority")) or 0
-      redis.call("HSET", base .. jobId, "state", "wait", "delay", 0)
+      redis.call("HSET", base .. jobId, "state", "wait", "delay", 0, "enqueuedOn", now)
       redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
     end
   end
@@ -189,7 +191,7 @@ local function releaseKey(base, jobKey, jobId, now)
         redis.call("ZADD", base .. "delayed", due, nid)
         wakeAt(base, due)
       else
-        redis.call("HSET", base .. nid, "state", "wait")
+        redis.call("HSET", base .. nid, "state", "wait", "enqueuedOn", now)
         redis.call("ZADD", base .. "prioritized", tonumber(nxt[2]), nid)
         redis.call("ZADD", base .. "marker", 0, "0")
       end
@@ -611,7 +613,8 @@ local function releaseParent(base, parentId, now)
   local ckey = redis.call("HGET", parentKey, "ckey") or ""
   if takeKey(base, parentKey, parentId, ckey, priority, base .. "pc", now) then
     redis.call("HSET", parentKey, "state", "wait")
-    enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc")
+    enqueue(base .. "prioritized", base .. "marker", parentId, priority, base .. "pc",
+            parentKey, now)
   end
 end
 local function settleChildCompleted(base, jobId, parentId, returnvalue, now)
@@ -761,7 +764,7 @@ if takeKey(base, jobKey, jobId, ARGV[11], tonumber(ARGV[6]), KEYS[6], now) then
   else
     state = "wait"
     redis.call("HSET", jobKey, "state", state)
-    enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6])
+    enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6], jobKey, now)
   end
 end
 -- only real inserts count (dedup hits and id replays returned above)
@@ -828,7 +831,7 @@ local function createNode(node, parentId, rootId)
       else
         redis.call("HSET", jobKey, "state", "wait")
         enqueue(base .. "prioritized", base .. "marker", jobId,
-                tonumber(node.priority), base .. "pc")
+                tonumber(node.priority), base .. "pc", jobKey, now)
       end
     end
   end
@@ -1014,7 +1017,7 @@ if attemptsMade < maxAttempts then
   else
     local priority = tonumber(redis.call("HGET", KEYS[5], "priority")) or 0
     redis.call("HSET", KEYS[5], "state", "wait")
-    enqueue(KEYS[2], KEYS[7], ARGV[1], priority, KEYS[10])
+    enqueue(KEYS[2], KEYS[7], ARGV[1], priority, KEYS[10], KEYS[5], tonumber(ARGV[3]))
   end
   outcome = 0
 else
@@ -1116,14 +1119,14 @@ return 1
 
 # Promote a delayed job to run now (admin/dashboard action).
 # KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] job hash  KEYS[5] pc
-# ARGV[1] jobId
+# ARGV[1] jobId  ARGV[2] now(ms)
 PROMOTE_JOB = (
     _LIB
     + """
 if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then return 0 end
 local priority = tonumber(redis.call("HGET", KEYS[4], "priority")) or 0
 redis.call("HSET", KEYS[4], "state", "wait", "delay", 0)
-enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
+enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5], KEYS[4], tonumber(ARGV[2]))
 return 1
 """
 )
@@ -1187,7 +1190,7 @@ local priority = tonumber(redis.call("HGET", KEYS[4], "priority")) or 0
 local ckey = redis.call("HGET", KEYS[4], "ckey") or ""
 if takeKey(base, KEYS[4], ARGV[1], ckey, priority, KEYS[5], tonumber(ARGV[2])) then
   redis.call("HSET", KEYS[4], "state", "wait")
-  enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5])
+  enqueue(KEYS[2], KEYS[3], ARGV[1], priority, KEYS[5], KEYS[4], tonumber(ARGV[2]))
 end
 return 1
 """
@@ -1277,6 +1280,7 @@ return existed
 # KEYS[1] active  KEYS[2] prioritized  KEYS[3] job hash  KEYS[4] lock  KEYS[5] marker
 # KEYS[6] base  KEYS[7] pc
 # ARGV[1] jobId  ARGV[2] token  ARGV[3] the claim's processedOn ("" = unchecked)
+# ARGV[4] now(ms)
 # Returns -2 lock lost, -3 not active, 1 released.
 RELEASE_JOB = (
     _LIB
@@ -1287,7 +1291,7 @@ if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return -3 end
 redis.call("DEL", KEYS[4])
 local priority = tonumber(redis.call("HGET", KEYS[3], "priority")) or 0
 redis.call("HSET", KEYS[3], "state", "wait")
-enqueue(KEYS[2], KEYS[5], ARGV[1], priority, KEYS[7])
+enqueue(KEYS[2], KEYS[5], ARGV[1], priority, KEYS[7], KEYS[3], tonumber(ARGV[4]))
 return 1
 """
 )
@@ -1474,7 +1478,7 @@ if #stalling > 0 then
         else
           local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0
           redis.call("HSET", jobKey, "state", "wait")
-          enqueue(KEYS[3], KEYS[7], jobId, priority, KEYS[8])
+          enqueue(KEYS[3], KEYS[7], jobId, priority, KEYS[8], jobKey, tonumber(ARGV[2]))
           table.insert(recovered, jobId)
         end
       end
