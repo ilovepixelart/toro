@@ -30,6 +30,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `completed` | ZSET | Successfully-finished ids, scored by retention position: finish time, except a running flow's children (above every timestamp) and a settled flow's children (just above their root). |
 | `failed` | ZSET | Terminally-failed ids, scored the same way. |
 | `waiting-children` | ZSET | Flow parents parked until their children settle, scored by enqueue time. |
+| `children` | ZSET | Every flow child id, scored by its add time: what the root-first listings and counts leave out of a state set. |
 | `held` | ZSET | Jobs waiting on a concurrency key, scored by enqueue time (the listing). |
 | `cancelled` | ZSET | Jobs stopped on purpose, scored like the other finished sets. |
 | `ck:<key>` | STRING | The job that holds a concurrency key. Exists only while a job holds it. |
@@ -40,7 +41,7 @@ Redis Cluster slot, which the multi-key Lua scripts require.
 | `limiter` | HASH | The queue-wide rate-limit token bucket (`{tokens, ts}`), shared by every worker. |
 | `stalled` | SET | Candidate ids for the mark-and-sweep recovery pass. |
 | `stalled-check` | string (PX) | Throttle key so the stalled sweep runs about once per interval cluster-wide. |
-| `roots-scratch` | ZSET (transient) | Working set for the root-only listing and counts; written and deleted inside one script call. |
+| `roots-scratch` | ZSET (transient) | Working set for a root-only listing page that starts past 10,000 roots (the counts and shallower pages walk the state set instead); written and deleted inside one script call. |
 | `repeat` | ZSET | Scheduler id -> next-run timestamp. |
 | `workers` | ZSET | Live worker id -> last-heartbeat ms; stale entries pruned on read, and entries a day old by any worker's heartbeat. |
 | `departed` | LIST (capped) | Recent worker departures: graceful `stopped` or `lost` (crashed). |

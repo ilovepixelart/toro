@@ -86,9 +86,11 @@ processors `await`-y.
 
 ## Events
 
-toro publishes events to a Redis pub/sub channel: `added` when a job is enqueued
-(published by the add script, atomically with the enqueue; a flow announces its root
-only, and a scheduler occurrence announces nothing), `progress` from a running processor
+toro publishes events to a Redis pub/sub channel: `added` when an add returns a job
+(published by the add script, atomically with the enqueue, and also on a dedup hit or
+an id replay, which return the job already there; the `added` counter excludes those.
+A flow announces its root only, and a scheduler occurrence announces nothing),
+`progress` from a running processor
 (`job.update_progress`), and `completed` / `failed` / `cancelled`, which the finish Lua
 scripts publish atomically with the state change. `failed` fires only on terminal failure,
 not on a retry. A second channel carries cancellation requests to workers and nothing
