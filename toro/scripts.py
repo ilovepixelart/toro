@@ -249,6 +249,11 @@ local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   redis.call("SREM", stalledKey, jobId)
   -- attemptsMade counts runs that FINISHED (the finish scripts bump it): a run cut
   -- short by a stall or a shutdown spends none of the job's attempts.
+  -- processedOn names the run (the finish memo, the cancel message): a job claimed
+  -- again within the millisecond of its last claim, as a retry with no backoff is by
+  -- the finish that failed it, is stamped one later, or the two runs would be one.
+  local last = tonumber(redis.call("HGET", jobKey, "processedOn"))
+  if last and tonumber(now) <= last then now = tostring(last + 1) end
   redis.call("HSET", jobKey, "processedOn", now, "state", "active")
   return {redis.call("HGETALL", jobKey), jobId}
 end
