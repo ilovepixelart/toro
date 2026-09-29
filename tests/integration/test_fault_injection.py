@@ -162,11 +162,10 @@ async def test_concurrent_stalled_sweeps_recover_exactly_once(q):
 
 
 async def test_concurrent_delayed_promotion_promotes_each_once(q):
-    # Two workers promote the same due batch at once. Lua runs serially, so the
-    # first promotes the whole batch and the second finds an empty range: every
-    # due job lands in `prioritized` exactly once, none lost or duplicated.
-    from toro import scripts
-
+    # Two workers claim, and promote the same due batch, at once. Lua runs serially,
+    # so the first promotes the whole batch and the second finds an empty range:
+    # every due job is promoted exactly once, none lost or duplicated, and each
+    # claim takes one of them.
     now = await _server_now_ms(q)
     ids = [f"d{i}" for i in range(5)]
     for jid in ids:
@@ -178,14 +177,12 @@ async def test_concurrent_delayed_promotion_promotes_each_once(q):
 
     w1 = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
     w2 = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
-    keys = [q.keys.delayed, q.keys.prioritized, q.keys.marker, q.keys.base, q.keys.pc]
-    await asyncio.gather(
-        w1._promote_delayed(keys=keys, args=[now, scripts.PROMOTE_BATCH]),
-        w2._promote_delayed(keys=keys, args=[now, scripts.PROMOTE_BATCH]),
-    )
+    first, second = await asyncio.gather(w1._acquire(), w2._acquire())
 
-    promoted = sorted(await q.redis.zrange(q.keys.prioritized, 0, -1))
-    assert promoted == sorted(ids)  # each due job promoted exactly once, none duplicated
+    claimed = sorted([first[0], second[0]])
+    waiting = sorted(await q.redis.zrange(q.keys.prioritized, 0, -1))
+    assert sorted(claimed + waiting) == sorted(ids)  # each due job once, none duplicated
+    assert sorted(await q.redis.lrange(q.keys.active, 0, -1)) == claimed
     assert await q.redis.zcard(q.keys.delayed) == 0  # nothing left behind
 
 

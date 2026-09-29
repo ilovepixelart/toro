@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from toro import Queue, Worker, scripts
+from toro import Queue
 
 PREFIX = "torotest"
 
@@ -60,21 +60,6 @@ async def test_a_promoted_job_is_in_wait(q):
     assert (await q.get_job(j.id)).state == "wait"
     assert await q.cancel_job(j.id) is True
     assert j.id not in await q.redis.zrange(q.keys.prioritized, 0, -1)
-
-
-async def test_the_promote_sweep_moves_a_due_job_to_wait(q):
-    """A delayed job the worker's sweep finds due is in `wait` with no delay left.
-    Left reading `delayed` with its delay, it is listed where it is not, and a key
-    handed to it later parks it in `delayed` again for a delay it already served."""
-    j = await q.add("x", {}, delay=60_000)
-    w = Worker(q.name, lambda job: None, prefix=PREFIX, connection=q.redis)
-    keys = [q.keys.delayed, q.keys.prioritized, q.keys.marker, q.keys.base, q.keys.pc]
-
-    await w._promote_delayed(keys=keys, args=[j.timestamp + 60_000, scripts.PROMOTE_BATCH])
-
-    assert await q.redis.zrange(q.keys.prioritized, 0, -1) == [j.id]
-    assert (await q.get_job(j.id)).state == "wait"
-    assert await q.redis.hget(q.keys.job(j.id), "delay") == "0"
 
 
 async def test_promote_missing_job_returns_false(q):

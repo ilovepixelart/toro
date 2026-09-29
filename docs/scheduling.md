@@ -56,7 +56,8 @@ scheduler was removed in the meantime, no successor is minted and the chain ends
 
 Only `remove_scheduler` ends a schedule. Dropping its queued occurrence
 (`cancel_job`, `remove_job`, `clean("delayed")`) skips that one run: once its slot
-has passed, a worker's promote sweep enqueues the next slot after now.
+has passed, a worker's schedule check (every five seconds) enqueues the next slot
+after now.
 
 ## Managing schedules
 

@@ -36,9 +36,9 @@ from .job import DEFAULT_KEEP_COMPLETED, DEFAULT_KEEP_FAILED
 PRIORITY_OFFSET = 1048576  # 2^20  - max priority (most urgent)
 SEQ_MOD = 4294967296  # 2^32  - sequence wrap window
 
-# Max due jobs one PROMOTE_DELAYED call moves (~6 Redis commands each). Bounds
-# how long a sweep can block Redis (~3ms a batch); callers loop until a short
-# batch signals the backlog is drained.
+# Max due delayed jobs one claim promotes before it picks (~5 Redis commands each).
+# Bounds how long a claim can block Redis (~3ms a batch); a longer backlog is
+# promoted by the claims that follow.
 PROMOTE_BATCH = 1000
 
 # How long per-minute metrics buckets live: enough history for dashboard
@@ -69,6 +69,7 @@ HIST_BUCKETS = 26
 
 # Lua → Python return protocol: sentinels the scripts emit, decoded in worker.py.
 RL_SENTINEL = "__rl__"  # ACQUIRE hit the rate limiter; res[1] = ms until a token frees
+DUE_SENTINEL = "__due__"  # ACQUIRE found nothing; res[1] = when the next delayed job is due
 LOCK_LOST = -2  # a finish script: the worker's lock was lost (job already reclaimed)
 NOT_ACTIVE = -3  # a finish script: the job was no longer in `active`
 OUTCOME_FAILED = 1  # MOVE_TO_FAILED outcome: terminally failed (vs 0 = will retry)
@@ -82,6 +83,7 @@ LIVE_SCORE = 2**52
 _CONSTANTS = (
     f"local DEFAULT_KEEP_COMPLETED = {DEFAULT_KEEP_COMPLETED}\n"
     f"local DEFAULT_KEEP_FAILED = {DEFAULT_KEEP_FAILED}\n"
+    f"local PROMOTE_BATCH = {PROMOTE_BATCH}\n"
     f"local LIVE = {LIVE_SCORE}\n"
     # as a string: Lua formats a number it concatenates with %.14g, four short of LIVE
     f'local LIVE_BOUND = "({LIVE_SCORE}"\n'
@@ -91,9 +93,12 @@ _CONSTANTS = (
 # This is the single definition of "how a job is ordered, woken, claimed":
 #   priorityScore  - (priority, seq) -> ZSET score (lower score = sooner)
 #   enqueue        - put a job into `prioritized` + arm the base marker
+#   wakeAt         - tell an idle worker when the next delayed job is due
+#   promoteDue     - move the delayed jobs whose time has come into `prioritized`
 #   lockAndLoad    - lock a job already on `active`, stamp it, return its hash
-#   acquireNext    - ZPOPMIN the next job into `active`, then lockAndLoad it
-# To add markers-with-delay or grouping later, we change only these functions.
+#   acquireNext    - promote what is due, ZPOPMIN the next job into `active`, then
+#                    lockAndLoad it; or say when the next delayed job is due
+# To add grouping later, we change only these functions.
 _LIB = (
     _CONSTANTS
     + """
@@ -104,6 +109,28 @@ end
 local function enqueue(prioritizedKey, markerKey, jobId, priority, pcKey)
   redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
   redis.call("ZADD", markerKey, 0, "0")
+end
+-- A worker with nothing to claim blocks until the due time its claim answered
+-- with, so a job delayed to an earlier time has to wake one: "1" is that wake,
+-- scored at the earliest due time marked ("0" says work is waiting now). LT keeps
+-- the earlier of two; an idle worker pops it, asks again, and blocks until then.
+local function wakeAt(base, due)
+  redis.call("ZADD", base .. "marker", "LT", due, "1")
+end
+-- Due delayed jobs join the queue before a claim picks, so no claim passes over a
+-- job whose time has come and no sweep has to move them. A batch per claim: a
+-- backlog coming due at once (a backoff storm after an outage) holds Redis for
+-- milliseconds per claim, never for the whole backlog. `delay` is cleared with the
+-- state: a concurrency key handed to the job later would park it for it again.
+local function promoteDue(base, prioritizedKey, pcKey, now)
+  local delayedKey = base .. "delayed"
+  local due = redis.call("ZRANGEBYSCORE", delayedKey, 0, now, "LIMIT", 0, PROMOTE_BATCH)
+  for _, jobId in ipairs(due) do
+    redis.call("ZREM", delayedKey, jobId)
+    local priority = tonumber(redis.call("HGET", base .. jobId, "priority")) or 0
+    redis.call("HSET", base .. jobId, "state", "wait", "delay", 0)
+    redis.call("ZADD", prioritizedKey, priorityScore(priority, pcKey), jobId)
+  end
 end
 -- A cancellation names the CLAIM it is meant for, not just the job: an id is free
 -- again the moment its job is gone, so a bare id can land on the next job to wear it.
@@ -153,6 +180,7 @@ local function releaseKey(base, jobKey, jobId, now)
       if due > now then
         redis.call("HSET", base .. nid, "state", "delayed")
         redis.call("ZADD", base .. "delayed", due, nid)
+        wakeAt(base, due)
       else
         redis.call("HSET", base .. nid, "state", "wait")
         redis.call("ZADD", base .. "prioritized", tonumber(nxt[2]), nid)
@@ -218,6 +246,7 @@ end
 local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
                            base, pcKey, metaKey, token, lockMs, now,
                            rlKey, rlMax, rlDuration, cap)
+  promoteDue(base, prioritizedKey, pcKey, now)
   if redis.call("EXISTS", metaKey) == 1 then return false end  -- queue paused
   if cap > 0 and redis.call("LLEN", activeKey) >= cap then return false end
   local res = redis.call("ZPOPMIN", prioritizedKey)
@@ -226,6 +255,10 @@ local function acquireNext(prioritizedKey, activeKey, markerKey, stalledKey,
     -- frees, so resetting it while any of them waits would sort a later job ahead of
     -- an earlier one. Nothing waiting anywhere: the counter is free to start over.
     if redis.call("ZCARD", base .. "held") == 0 then redis.call("DEL", pcKey) end
+    -- Nothing to claim: say when the next delayed job is due, so the caller blocks
+    -- until then instead of polling for it.
+    local head = redis.call("ZRANGE", base .. "delayed", 0, 0, "WITHSCORES")
+    if head[2] then return {"__due__", head[2]} end
     return false
   end
   local jobId = res[1]
@@ -664,6 +697,7 @@ if takeKey(base, jobKey, jobId, ARGV[11], tonumber(ARGV[6]), KEYS[6], now) then
     state = "delayed"
     redis.call("HSET", jobKey, "state", state)
     redis.call("ZADD", KEYS[4], now + delay, jobId)
+    wakeAt(base, now + delay)
   else
     state = "wait"
     redis.call("HSET", jobKey, "state", state)
@@ -730,6 +764,7 @@ local function createNode(node, parentId, rootId)
       if delay > 0 then
         redis.call("HSET", jobKey, "state", "delayed")
         redis.call("ZADD", base .. "delayed", now + delay, jobId)
+        wakeAt(base, now + delay)
       else
         redis.call("HSET", jobKey, "state", "wait")
         enqueue(base .. "prioritized", base .. "marker", jobId,
@@ -760,8 +795,10 @@ return rootId
 # ARGV[1] token  ARGV[2] lockDuration(ms)  ARGV[3] now(ms)
 # ARGV[4] rlMax (0 = no limit)  ARGV[5] rlDuration(ms)
 # ARGV[6] globalConcurrency (0 = no cap)
-# Returns false (none/paused/capped), {jobHash, jobId}, or {"__rl__", retryMs} when
-# rate limited.
+# Promotes the delayed jobs that are due first (a batch of PROMOTE_BATCH at most).
+# Returns false (paused/capped/nothing), {jobHash, jobId}, {"__rl__", retryMs} when
+# rate limited, or {"__due__", dueMs} when nothing waits but a delayed job is due
+# at dueMs: the worker blocks until then rather than polling for it.
 MOVE_TO_ACTIVE = (
     _LIB
     + """
@@ -810,7 +847,8 @@ return 0
 # ARGV[7] rlMax  ARGV[8] rlDuration(ms)  ARGV[9] metricsRetention(ms)
 # ARGV[10] globalConcurrency (0 = no cap)  ARGV[11] inline the result in the event?
 # ARGV[12] the claim's processedOn ("" = unchecked)
-# Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}.
+# Returns -2 lock lost, -3 not active, {1} committed, {1, nextHash, nextId}, or
+# {1, "__due__", dueMs} (nothing to fetch, a delayed job is due at dueMs).
 MOVE_TO_COMPLETED = (
     _LIB
     + """
@@ -877,7 +915,8 @@ return {1}
 # ARGV[10] rlMax  ARGV[11] rlDuration(ms)  ARGV[12] metricsRetention(ms)
 # ARGV[13] globalConcurrency (0 = no cap)  ARGV[14] the claim's processedOn ("" = unchecked)
 # ARGV[15] the failure's traceback ("" = none), written only past the guards
-# Returns -2/-3, else {outcome} or {outcome, nextHash, nextId}; outcome 1=failed 0=retry.
+# Returns -2/-3, else {outcome}, {outcome, nextHash, nextId} or {outcome, "__due__",
+# dueMs} (see MOVE_TO_COMPLETED); outcome 1=failed 0=retry.
 MOVE_TO_FAILED = (
     _LIB
     + """
@@ -897,6 +936,7 @@ if attemptsMade < maxAttempts then
   if backoff > 0 then
     redis.call("HSET", KEYS[5], "state", "delayed")
     redis.call("ZADD", KEYS[3], tonumber(ARGV[3]) + backoff, ARGV[1])
+    wakeAt(KEYS[9], tonumber(ARGV[3]) + backoff)
   else
     local priority = tonumber(redis.call("HGET", KEYS[5], "priority")) or 0
     redis.call("HSET", KEYS[5], "state", "wait")
@@ -990,6 +1030,7 @@ redis.call("HSET", jobKey,
 if takeKey(base, jobKey, ARGV[1], ARGV[9], tonumber(ARGV[7]), base .. "pc", now) then
   redis.call("HSET", jobKey, "state", "delayed")
   redis.call("ZADD", KEYS[1], tonumber(ARGV[6]), ARGV[1])
+  wakeAt(base, tonumber(ARGV[6]))
 end
 -- an occurrence is a job: counted where it is created, like every other enqueue
 recordMetrics(base, "added", now, 0, tonumber(ARGV[10]))
@@ -1370,26 +1411,6 @@ while i <= #active do
   i = j + 1
 end
 return {failed, recovered}
-"""
-)
-
-# Move delayed jobs whose time has come into `prioritized` (at their priority),
-# at most ARGV[2] per call so a big due-backlog can't block Redis for one long
-# sweep - callers loop while a full batch comes back (see Worker._promote_loop).
-# KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] key base  KEYS[5] pc
-# ARGV[1] now(ms)  ARGV[2] max jobs per call
-PROMOTE_DELAYED = (
-    _LIB
-    + """
-local jobs = redis.call("ZRANGEBYSCORE", KEYS[1], 0, ARGV[1], "LIMIT", 0, tonumber(ARGV[2]))
-for _, jobId in ipairs(jobs) do
-  redis.call("ZREM", KEYS[1], jobId)
-  local jobKey = KEYS[4] .. jobId
-  local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0
-  redis.call("HSET", jobKey, "state", "wait", "delay", 0)
-  enqueue(KEYS[2], KEYS[3], jobId, priority, KEYS[5])
-end
-return #jobs
 """
 )
 

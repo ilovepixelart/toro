@@ -1,9 +1,10 @@
 """Integration: what a worker says when a background loop keeps failing.
 
-The delayed-job sweep, the stalled-job sweep and the heartbeat each retry every
+The schedule check, the stalled-job sweep and the heartbeat each retry every
 interval whatever went wrong, which is right: a Redis blip must not end them. They
-also swallowed every error, so a worker whose sweeps had been failing for an hour
-looked healthy, with delayed jobs never promoted and stalled ones never recovered.
+also swallowed every error, so a worker whose loops had been failing for an hour
+looked healthy, with dropped schedules never resumed and stalled jobs never
+recovered.
 """
 
 import logging
@@ -17,12 +18,18 @@ LOOPS = [
         id="heartbeat",
     ),
     pytest.param(
-        ("_promote_delayed", {"stalled_interval": 0}, "the delayed-job sweep"), id="promote"
+        ("_resume_orphaned_schedules", {"stalled_interval": 0}, "the schedule check"),
+        id="schedules",
     ),
     pytest.param(
         ("check_stalled", {"stalled_interval": 50}, "the stalled-job sweep"), id="stalled"
     ),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _fast_schedule_check(monkeypatch):
+    monkeypatch.setattr("toro.worker.SCHEDULE_CHECK_S", 0.05)
 
 
 @pytest.mark.parametrize("case", LOOPS)
