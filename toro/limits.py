@@ -40,17 +40,15 @@ def limit_fields(
     coerced, a fractional value truncated and a bool read as 1, and `set_limits`
     then stored the coerced value for every worker on the queue.
     """
-    # int(): an int subclass (an IntEnum) passes `_whole` and would reach Redis as its
-    # repr, which Lua reads as no number at all.
     cap = (
         0
         if global_concurrency is None
-        else int(_whole(global_concurrency, "global_concurrency", minimum=1))
+        else _whole(global_concurrency, "global_concurrency", minimum=1)
     )
     if rate_limit is None:
         return cap, 0, 0
     return (
         cap,
-        int(_whole(rate_limit.get("max"), "rate_limit max", minimum=1)),
-        int(_whole(rate_limit.get("duration"), "rate_limit duration (ms)", minimum=1)),
+        _whole(rate_limit.get("max"), "rate_limit max", minimum=1),
+        _whole(rate_limit.get("duration"), "rate_limit duration (ms)", minimum=1),
     )

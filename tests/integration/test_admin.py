@@ -169,19 +169,24 @@ async def test_removing_something_that_is_not_a_job_touches_nothing(q):
     """A job id arrives from a URL, and a job hash lives beside the queue's own keys:
     `remove_job("totals")` used to delete the lifetime counters, `remove_job("meta")`
     the data-model stamp, and `remove_job("worker:<token>")` a live worker's presence
-    record, which then read as a crashed worker. A job hash is one with options on it,
-    and nothing else is a job whatever its name.
+    record, which then read as a crashed worker. A job hash is one stamped at its
+    add, and nothing else is a job whatever its name: a scheduler's template carries
+    options like a job does, and `remove_job("repeat:<id>")` deleted it, leaving the
+    schedule listed but ending it after its pending occurrence.
     """
     await q.add("real", {})  # so the totals and the marker exist
+    await q.add_scheduler("nightly", every=3_600_000)
     worker_key = f"worker:{uuid.uuid4().hex}"
     await q.redis.hset(q.keys.base + worker_key, mapping={"id": "w1", "host": "h"})
 
-    for name in ("totals", "meta", worker_key):
+    added = await q.redis.hget(q.keys.totals, "added")
+    for name in ("totals", "meta", worker_key, "repeat:nightly"):
         assert await q.remove_job(name) is False, name
 
-    assert await q.redis.hget(q.keys.totals, "added") == "1"
+    assert await q.redis.hget(q.keys.totals, "added") == added
     assert await q.redis.hget(q.keys.meta, "model") is not None
     assert await q.redis.exists(q.keys.base + worker_key) == 1
+    assert await q.redis.hget(q.keys.scheduler("nightly"), "every") == "3600000"
     await q.redis.delete(q.keys.base + worker_key)
 
 
