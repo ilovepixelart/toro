@@ -44,6 +44,83 @@ async def test_the_timeout_failure_names_the_limit_and_is_terminal_at_one_attemp
     assert (await q.get_job(job.id)).state == "failed"
 
 
+async def _ended(q, job_id: str) -> bool:
+    job = await q.get_job(job_id)
+    return job is not None and job.state in ("cancelled", "failed")
+
+
+async def test_a_processor_that_swallows_the_timeout_still_fails(q, run_worker):
+    """The timer's cancellation is the job's failure whatever the processor does with
+    it: one that caught it and returned was committed completed, with its partial
+    result, and never retried."""
+
+    async def proc(job):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return "partial"
+
+    async with run_worker(q, proc, stalled_interval=0):
+        job = await q.add("swallows", {}, timeout=200)
+        with pytest.raises(JobFailedError, match="timeout of 200 ms"):
+            await q.result(job.id, timeout=10)
+    assert (await q.get_job(job.id)).state == "failed"
+
+
+async def test_a_cancel_followed_by_the_timeout_is_one_signal(q, run_worker, run_until):
+    """A cancel request already unwinding the processor is not interrupted again when
+    the timer fires during its cleanup, and the job ends cancelled, as the request
+    said: the first signal decides."""
+    signals: list[str] = []
+    started = asyncio.Event()
+
+    async def proc(job):
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            signals.append("cancelled")
+            await asyncio.sleep(0.4)  # a cleanup the timer must not cut short
+            signals.append("cleaned up")
+            raise
+
+    async with run_worker(q, proc, stalled_interval=0):
+        job = await q.add("cleanup", {}, timeout=300)
+        await asyncio.wait_for(started.wait(), 5)
+        await q.cancel_job(job.id)  # now; the timer fires at 300 ms, mid-cleanup
+        assert await run_until(lambda: _ended(q, job.id), timeout=5)
+
+    assert signals == ["cancelled", "cleaned up"]
+    assert (await q.get_job(job.id)).state == "cancelled"
+
+
+async def test_the_timeout_followed_by_a_cancel_is_one_signal(q, run_worker, run_until):
+    """The timer's cancellation already unwinding the processor is not interrupted
+    again by a cancel request that lands during its cleanup; the first signal
+    decides, so the job fails on its timeout."""
+    signals: list[str] = []
+
+    async def proc(job):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            signals.append("cancelled")
+            await asyncio.sleep(0.4)  # a cleanup the request must not cut short
+            signals.append("cleaned up")
+            raise
+
+    async with run_worker(q, proc, stalled_interval=0):
+        job = await q.add("cleanup", {}, timeout=200)
+        assert await run_until(lambda: len(signals) == 1, timeout=5)  # the timer fired
+        await q.cancel_job(job.id)  # lands during the cleanup
+        assert await run_until(lambda: _ended(q, job.id), timeout=5)
+
+    assert signals == ["cancelled", "cleaned up"]
+    failed = await q.get_job(job.id)
+    assert failed.state == "failed"
+    assert "timeout of 200 ms" in failed.failed_reason
+
+
 async def test_a_timeout_error_the_processor_raises_itself_keeps_its_own_message(q, run_worker):
     """The worker tells its timer's cancellation from every other one, so an upstream
     call's TimeoutError is reported as the processor's failure, not the job's limit."""

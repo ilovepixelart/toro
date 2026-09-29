@@ -20,7 +20,13 @@ from redis.exceptions import ResponseError, WatchError
 
 from . import scripts
 from ._replies import _hash_replies, _scored, _str_dict, _str_list
-from .connection import confirm_subscribed, connect
+from .connection import (
+    DEFAULT_BLOCK_TIMEOUT,
+    confirm_subscribed,
+    connect,
+    pop_timeout,
+    read_timeout,
+)
 from .errors import IncompatibleDataModelError, JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
 from .flow import clamp_priority as _clamp_priority
@@ -664,9 +670,14 @@ class Queue:
 
     async def _dispatch_events(self, pubsub: PubSub) -> None:
         """Consume the shared events subscription and route each message."""
+        # Each read is bounded under the connection's read timeout and the loop goes
+        # again on silence: on redis-py 5 a read with no timeout falls back to the
+        # socket timeout and raises after that much silence on the channel, which
+        # ended the dispatcher and failed every waiter well inside its own timeout.
+        timeout = pop_timeout(read_timeout(self.redis), DEFAULT_BLOCK_TIMEOUT)
         try:
             while True:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=None)
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
                 if msg is not None:
                     self._route_event(msg["data"])
         except asyncio.CancelledError:
