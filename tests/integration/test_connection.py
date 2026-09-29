@@ -6,7 +6,7 @@ import hashlib
 import pytest
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from toro import Queue, scripts
+from toro import FlowChild, Queue, scripts
 from toro.connection import connect
 
 PREFIX = "torotest"
@@ -72,6 +72,79 @@ async def test_a_reply_that_times_out_does_not_run_the_script_twice(q):
         with pytest.raises(RedisTimeoutError):
             await proxied.add("once", {})
         assert (await q.counts())["wait"] == 1
+    finally:
+        await proxied.close()
+        await conn.aclose()
+        proxy.close()
+
+
+async def _drop_link_after_first(sha: str, upstream_port: int = 6379):
+    """A TCP proxy to Redis that, for the first EVALSHA of `sha`, lets the command
+    through and then cuts the client's connection before the reply reaches it: the
+    command ran, and the client sees a dropped connection instead of an answer."""
+    dropped = {"done": False}
+
+    async def pipe(reader, writer, state, from_client):
+        try:
+            while data := await reader.read(65536):
+                if from_client and not dropped["done"] and sha.encode() in data:
+                    dropped["done"] = True
+                    state["cut"] = True
+                elif not from_client and state.get("cut"):
+                    state["cut"] = False
+                    writer.close()  # the reply is on its way: the link goes instead
+                    return
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def handle(client_reader, client_writer):
+        server_reader, server_writer = await asyncio.open_connection("localhost", upstream_port)
+        state: dict[str, bool] = {}
+        await asyncio.gather(
+            pipe(client_reader, server_writer, state, True),
+            pipe(server_reader, client_writer, state, False),
+        )
+
+    return await asyncio.start_server(handle, "localhost", 0)
+
+
+async def test_an_add_re_sent_after_a_dropped_connection_makes_one_job(q):
+    """The command reached Redis and ran; the connection dropped with the reply on
+    its way; the client re-sent it on a new connection, as it does for a connection
+    error. Two jobs came out of one add(). The call's token now names the job it
+    made, and the re-sent call is answered with that job."""
+    sha = hashlib.sha1(scripts.ADD_JOB.encode()).hexdigest()  # noqa: S324 - Redis names scripts by SHA1
+    await q.redis.script_load(scripts.ADD_JOB)  # cached: the replay must be the add, not a NOSCRIPT
+    proxy = await _drop_link_after_first(sha)
+    port = proxy.sockets[0].getsockname()[1]
+    conn = connect(f"redis://localhost:{port}", blocking_timeout=0.1)
+    proxied = Queue(q.name, prefix=PREFIX, connection=conn)
+    try:
+        job = await proxied.add("once", {"n": 1})
+        assert (await q.counts())["wait"] == 1
+        assert [j.id for j in await q.get_jobs("wait")] == [job.id]
+    finally:
+        await proxied.close()
+        await conn.aclose()
+        proxy.close()
+
+
+async def test_a_flow_re_sent_after_a_dropped_connection_makes_one_tree(q):
+    sha = hashlib.sha1(scripts.ADD_FLOW.encode()).hexdigest()  # noqa: S324 - Redis names scripts by SHA1
+    await q.redis.script_load(scripts.ADD_FLOW)
+    proxy = await _drop_link_after_first(sha)
+    port = proxy.sockets[0].getsockname()[1]
+    conn = connect(f"redis://localhost:{port}", blocking_timeout=0.1)
+    proxied = Queue(q.name, prefix=PREFIX, connection=conn)
+    try:
+        root = await proxied.add_flow("root", {}, children=[FlowChild("leaf", {})])
+        assert (await q.counts())["wait"] == 1  # the one leaf
+        assert (await q.counts())["waiting-children"] == 1  # the one root
+        assert (await q.get_job(root.id)) is not None
     finally:
         await proxied.close()
         await conn.aclose()

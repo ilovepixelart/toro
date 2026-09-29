@@ -36,6 +36,9 @@ from typing import Any, TypedDict, cast
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
+from redis.commands.core import AsyncScript
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from . import scripts
 from ._replies import _scored, _str_list
@@ -536,12 +539,15 @@ class Worker:
         # job hash, or anything else unexpected costs one beat, never the slot. A
         # job interrupted mid-flight stays locked in `active` until its lock
         # expires and the stalled sweep recovers it - the normal at-least-once path.
+        pause = 0.1
         while self._running:
             try:
                 # The marker only wakes us; the real claim is the atomic
                 # MOVE_TO_ACTIVE below. A timeout (None) is fine - we still try
                 # to acquire, so a missed marker can never strand a job.
                 woke = await self.redis.bzpopmin(self.keys.marker, self._pop_timeout)
+                self._loop_recovered("a claim")
+                pause = 0.1
                 if not self._running:
                     # Shutting down - don't claim a new job. A marker we popped was
                     # a wake for a worker that still can, so hand it on: swallowed,
@@ -559,9 +565,13 @@ class Worker:
                     loaded = await self._handle(loaded)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("process loop hiccup; the slot lives on")
-                await asyncio.sleep(0.1)
+            except Exception as exc:
+                # One warning per outage, not a traceback per slot every tenth of a
+                # second: with Redis down, every slot lands here at once. The pause
+                # doubles up to the block timeout and resets on the next round trip.
+                self._loop_failed("a claim", exc)
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, self.block_timeout)
 
     def _register_scripts(self) -> None:
         """Register the Lua scripts this worker runs (a local call; Redis is not touched)."""
@@ -698,37 +708,21 @@ class Worker:
         its lock is still held and it is still in `active`, so either commit would
         otherwise succeed and stand.
         """
+        timer, expired = self._arm_timeout(job, task)
         try:
             result = await task
         except asyncio.CancelledError:  # NOSONAR
             # Absorbing this one IS the feature: a cancellation that killed the process
             # loop would take the worker's slot with it, so the usual "always re-raise"
             # rule cannot hold here. It IS re-raised in every case that is not ours.
-            #
-            # Ours only when the PROCESSOR is what was stopped. The same error arrives
-            # when this WORKER is being stopped, and absorbing that one commits a job
-            # and carries on through a shutdown. Cancelling the awaiting task cancels
-            # the awaited one too, so the inner task cannot tell them apart; the
-            # outer task's own pending-cancellation count can (3.11+, with the
-            # shutdown flag as the fallback: run() clears it before cancelling us).
-            outer = asyncio.current_task()
-            asked = getattr(outer, "cancelling", None)
-            stopping = asked() > 0 if asked is not None else not self._running
-            if stopping:
-                raise
-            if self._cancelling.get(job.id) is not task:
-                # Nobody cancelled this run and the worker is not stopping: the
-                # processor raised it itself (it awaited something that was
-                # cancelled), which is the processor failing like any other error.
-                stray = RuntimeError(
-                    "the processor raised CancelledError; the job was not cancelled"
-                )
-                return await self._processing_failed(job, stray)
-            return await self._finish_cancelled(job)
+            return await self._cancelled_outcome(job, task, expired[0])
         except Exception as exc:
             if self._cancelling.get(job.id) is not task:
                 return await self._processing_failed(job, exc)
             result = None  # a cleanup that raised while cancelled: committed below
+        finally:
+            if timer is not None:
+                timer.cancel()
         if self._cancelling.get(job.id) is task:
             return await self._finish_cancelled(job)
         try:
@@ -741,6 +735,55 @@ class Worker:
             return await self._processing_failed(job, exc)
         self._processed += 1
         return committed
+
+    def _arm_timeout(
+        self, job: Job, task: asyncio.Task[Any]
+    ) -> tuple[asyncio.TimerHandle | None, list[bool]]:
+        """Start the job's timeout, if it has one: a timer that cancels the processor's
+        task and raises a flag, which tells that cancellation from every other one, so
+        a TimeoutError the processor raises itself is still its own failure. A sync
+        processor's thread cannot be taken back: no timer.
+        """
+        expired = [False]
+        timeout = job.opts.timeout if self._async_processor else None
+        if not timeout:
+            return None, expired
+
+        def expire() -> None:
+            expired[0] = True
+            task.cancel()
+
+        return asyncio.get_running_loop().call_later(timeout / 1000, expire), expired
+
+    async def _cancelled_outcome(
+        self, job: Job, task: asyncio.Task[Any], expired: bool
+    ) -> tuple[str, dict[str, str]] | None:
+        """Commit what a processor task that ended in CancelledError means.
+
+        Ours only when the PROCESSOR is what was stopped. The same error arrives
+        when this WORKER is being stopped, and absorbing that one commits a job
+        and carries on through a shutdown. Cancelling the awaiting task cancels
+        the awaited one too, so the inner task cannot tell them apart; the
+        outer task's own pending-cancellation count can (3.11+, with the
+        shutdown flag as the fallback: run() clears it before cancelling us).
+        """
+        outer = asyncio.current_task()
+        asked = getattr(outer, "cancelling", None)
+        stopping = asked() > 0 if asked is not None else not self._running
+        if stopping:
+            raise asyncio.CancelledError
+        if expired:
+            over = TimeoutError(
+                f"the processor ran over the job's timeout of {job.opts.timeout} ms"
+            )
+            return await self._processing_failed(job, over)
+        if self._cancelling.get(job.id) is not task:
+            # Nobody cancelled this run and the worker is not stopping: the
+            # processor raised it itself (it awaited something that was
+            # cancelled), which is the processor failing like any other error.
+            stray = RuntimeError("the processor raised CancelledError; the job was not cancelled")
+            return await self._processing_failed(job, stray)
+        return await self._finish_cancelled(job)
 
     def _request_cancel(self, job_id: str, claim: str | None = None) -> None:
         """Stop a job this worker is running, once.
@@ -780,8 +823,9 @@ class Worker:
         task.cancel()
 
     async def _finish_cancelled(self, job: Job) -> tuple[str, dict[str, str]] | None:
-        res = await self._move_to_cancelled(
-            keys=[
+        res = await self._committed(
+            self._move_to_cancelled,
+            [
                 self.keys.active,
                 self.keys.cancelled,
                 self.keys.job(job.id),
@@ -791,7 +835,13 @@ class Worker:
                 self.keys.base,
                 self.keys.events,
             ],
-            args=[job.id, _now_ms(), self.token, scripts.METRICS_RETENTION_MS, _claim(job)],
+            lambda _fetch: [
+                job.id,
+                _now_ms(),
+                self.token,
+                scripts.METRICS_RETENTION_MS,
+                _claim(job),
+            ],
         )
         if int(res) < 0:
             # its lock is gone, so nothing was committed: a removal took the job, or
@@ -802,6 +852,38 @@ class Worker:
         self._cancelled += 1
         self._emit("cancelled", job)
         return None
+
+    async def _committed(
+        self,
+        script: AsyncScript,
+        keys: list[str],
+        args: Callable[[str], list[Any]],
+    ) -> Any:
+        """Run a finish script, re-sending it through a Redis blip while the lease holds.
+
+        A finish is idempotent: the token and claim guards refuse the replay of one
+        that ran but whose reply was lost, so re-sending is safe, and a blip of a few
+        seconds becomes a late commit rather than a re-run of the job after the sweep.
+        A retry never fetches the next job: a replay cannot tell whether the first
+        attempt claimed one. The lease was renewed at most lock_renew_time ago, so it
+        holds for lock_duration less that; past it the finish is given up as before.
+        """
+        deadline = time.monotonic() + max(0.0, (self.lock_duration - self.lock_renew_time) / 1000)
+        pause = 0.2
+        fetch = self._fetch_flag()
+        while True:
+            try:
+                res = await script(keys=keys, args=args(fetch))
+            except (RedisConnectionError, RedisTimeoutError) as exc:
+                if time.monotonic() + pause > deadline:
+                    raise
+                self._loop_failed("a finish", exc)
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, 2.0)
+                fetch = "0"
+                continue
+            self._loop_recovered("a finish")
+            return res
 
     async def _finish_lost(self, job_id: str) -> None:
         """Our finish committed nothing: the job was taken over or removed while we
@@ -814,8 +896,10 @@ class Worker:
         await self.redis.zadd(self.keys.marker, {"0": 0})
 
     async def _finish_completed(self, job: Job, result: Any) -> tuple[str, dict[str, str]] | None:
-        res = await self._move_to_completed(
-            keys=[
+        returnvalue = json.dumps(result)
+        res = await self._committed(
+            self._move_to_completed,
+            [
                 self.keys.active,
                 self.keys.completed,
                 self.keys.job(job.id),
@@ -829,12 +913,12 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=scripts.completed_args(
+            lambda fetch: scripts.completed_args(
                 job_id=job.id,
-                returnvalue=json.dumps(result),
+                returnvalue=returnvalue,
                 now=_now_ms(),
                 token=self.token,
-                fetch=self._fetch_flag(),
+                fetch=fetch,
                 lock_duration=self.lock_duration,
                 rl_max=self.rl_max,
                 rl_duration=self.rl_duration,
@@ -859,8 +943,10 @@ class Worker:
     async def _finish_failed(
         self, job: Job, exc: Exception, stacktrace: str = ""
     ) -> tuple[str, dict[str, str]] | None:
-        res = await self._move_to_failed(
-            keys=[
+        backoff = self._backoff_delay(job)
+        res = await self._committed(
+            self._move_to_failed,
+            [
                 self.keys.active,
                 self.keys.prioritized,
                 self.keys.delayed,
@@ -875,16 +961,16 @@ class Worker:
                 self.keys.meta_paused,
                 self.keys.limiter,
             ],
-            args=[
+            lambda fetch: [
                 *scripts.failed_args(
                     job_id=job.id,
                     reason=str(exc),
                     now=_now_ms(),
                     attempts_made=job.attempts_made,
                     max_attempts=job.opts.attempts,
-                    backoff=self._backoff_delay(job),
+                    backoff=backoff,
                     token=self.token,
-                    fetch=self._fetch_flag(),
+                    fetch=fetch,
                     lock_duration=self.lock_duration,
                     rl_max=self.rl_max,
                     rl_duration=self.rl_duration,

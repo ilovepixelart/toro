@@ -155,6 +155,9 @@ class JobOptions:
     remove_on_fail: RemoveOption = None
     # Jobs that share a key run one at a time, in the order they were added.
     concurrency_key: str | None = None
+    # ms an async processor may run before the job fails (and retries like any other
+    # failure); None = no limit. A sync processor's thread cannot be taken back: ignored.
+    timeout: int | None = None
 
     def __post_init__(self) -> None:
         # Validated here rather than in Queue.add, so every way of enqueuing - a job,
@@ -166,6 +169,8 @@ class JobOptions:
         self.backoff = _backoff(self.backoff)
         self.remove_on_complete = _retention(self.remove_on_complete, "remove_on_complete")
         self.remove_on_fail = _retention(self.remove_on_fail, "remove_on_fail")
+        if self.timeout is not None:
+            self.timeout = _whole(self.timeout, "timeout", minimum=1)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -176,6 +181,7 @@ class JobOptions:
             "removeOnComplete": self.remove_on_complete,
             "removeOnFail": self.remove_on_fail,
             "concurrencyKey": self.concurrency_key,
+            "timeout": self.timeout,
         }
 
     @classmethod
@@ -188,6 +194,7 @@ class JobOptions:
             remove_on_complete=d.get("removeOnComplete"),
             remove_on_fail=d.get("removeOnFail"),
             concurrency_key=d.get("concurrencyKey"),
+            timeout=d.get("timeout"),
         )
 
 

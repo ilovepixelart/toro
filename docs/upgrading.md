@@ -49,6 +49,9 @@ Fixes:
   again reports as running, not draining.
 - A cancel request applies to the run it was made for: a job id re-added while its
   cancelled run unwinds is no longer cancelled with it.
+- An `add()` or `add_flow()` re-sent by the client after a connection dropped while
+  the reply was on its way no longer enqueues a second copy: each call carries a token
+  the script remembers for a minute (`add:<token>`, a new reserved key namespace).
 - The delayed-job sweep, the stalled sweep and the heartbeat log one warning per
   failure episode and one line on recovery, where they were silent.
 - `get_job()` returns `None` for an id that names one of the queue's own keys or a
@@ -59,6 +62,11 @@ Fixes:
   call: on 200,000 waiting jobs a dashboard refresh cost 30 to 100 ms of Redis time
   and now costs about 1 ms. The Redis floor is unchanged (`ZMSCORE` joins
   `ZDIFFSTORE`, both 6.2).
+
+New: a per-job `timeout` (ms) fails an async processor that runs past it, with a
+`TimeoutError` that names the limit; the job then retries like any other failure.
+Without one, a hung processor renewed its lock forever and kept its slot, its share of
+the global cap and its concurrency key until someone cancelled it.
 
 CI now runs the suite on the declared redis-py floor (5.0.1) as well as Redis 6.2.
 

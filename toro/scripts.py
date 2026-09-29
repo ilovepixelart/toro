@@ -44,6 +44,9 @@ PROMOTE_BATCH = 1000
 # How long per-minute metrics buckets live: enough history for dashboard
 # charts, bounded key count (at most 480 small hashes per queue).
 METRICS_RETENTION_MS = 8 * 60 * 60 * 1000
+# How long an add() call's token names the job it made: a client that re-sends the
+# command after a dropped connection does so within its retry budget, seconds at most.
+ADD_REPLAY_WINDOW_MS = 60 * 1000
 
 # The version of the KEY LAYOUT, which is not the library's version: it changes only
 # when the stored shape changes incompatibly, and a library that finds a higher one
@@ -601,8 +604,9 @@ end
 # ARGV[4] now(ms)  ARGV[5] delay(ms)  ARGV[6] priority  ARGV[7] custom id ("" = auto)
 # ARGV[8] dedup id ("" = none)  ARGV[9] dedup ttl(ms)  -- throttle window
 # ARGV[10] metricsRetention(ms)  ARGV[11] concurrency key ("" = none)
-# Returns {jobId, state}: on a dedup hit or an id replay, the id of the job that is
-# already there and the state it is really in.
+# ARGV[12] the call's token ("" = none)  ARGV[13] how long it names its job (ms)
+# Returns {jobId, state}: on a dedup hit, an id replay or a re-sent call, the id of the
+# job that is already there and the state it is really in.
 ADD_JOB = (
     _LIB
     + """
@@ -618,6 +622,13 @@ end
 local function alreadyThere(jobId)
   announce(jobId)
   return {tostring(jobId), redis.call("HGET", base .. jobId, "state") or ""}
+end
+-- A re-sent call: a connection dropped while the reply was on its way makes the
+-- client send the same command again, and an auto id would be minted twice. The
+-- call's token names the job it made for the length of the window.
+if ARGV[12] ~= "" then
+  local made = redis.call("GET", base .. "add:" .. ARGV[12])
+  if made then return alreadyThere(made) end
 end
 -- Throttle dedup: within the TTL window, a repeat dedup id is ignored and the
 -- already-queued job's id is returned (self-expiring, no finish-side cleanup).
@@ -637,6 +648,9 @@ local jobKey = base .. jobId
 redis.call("HSET", jobKey,
   "id", jobId, "name", ARGV[1], "data", ARGV[2], "opts", ARGV[3],
   "timestamp", ARGV[4], "attemptsMade", 0, "priority", ARGV[6])
+if ARGV[12] ~= "" then
+  redis.call("SET", base .. "add:" .. ARGV[12], jobId, "PX", tonumber(ARGV[13]))
+end
 if dedupKey then
   redis.call("SET", dedupKey, jobId, "PX", tonumber(ARGV[9]))
   redis.call("HSET", jobKey, "deid", ARGV[8])
@@ -669,7 +683,8 @@ return {tostring(jobId), state}
 # Node `data`/`opts` arrive pre-encoded as JSON strings (stored verbatim).
 # KEYS[1] id counter  KEYS[2] key base
 # ARGV[1] now(ms)  ARGV[2] flow tree (json)  ARGV[3] metricsRetention(ms)
-# Returns the parent (root) job id.
+# ARGV[4] the call's token ("" = none)  ARGV[5] how long it names its root (ms)
+# Returns the parent (root) job id; for a re-sent call, the root the first one made.
 ADD_FLOW = (
     _LIB
     + """
@@ -677,6 +692,11 @@ local base = KEYS[2]
 local now = tonumber(ARGV[1])
 local retention = tonumber(ARGV[3])
 local total = 0
+-- A re-sent call (see ADD_JOB): the whole tree would be created twice.
+if ARGV[4] and ARGV[4] ~= "" then
+  local made = redis.call("GET", base .. "add:" .. ARGV[4])
+  if made then return made end
+end
 local function createNode(node, parentId, rootId)
   local jobId = tostring(redis.call("INCR", KEYS[1]))
   local jobKey = base .. jobId
@@ -725,6 +745,9 @@ local rootId = createNode(cjson.decode(ARGV[2]), false, false)
 recordMetrics(base, "added", now, 0, retention, nil, total)
 redis.call("PUBLISH", base .. "events",
   cjson.encode({jobId = rootId, event = "added"}))
+if ARGV[4] and ARGV[4] ~= "" then
+  redis.call("SET", base .. "add:" .. ARGV[4], rootId, "PX", tonumber(ARGV[5]))
+end
 return rootId
 """
 )
@@ -1477,8 +1500,9 @@ def add_job_args(
     dedup_id: str,
     dedup_ttl: int,
     concurrency_key: str,
+    token: str,
 ) -> list[str | int]:
-    """ARGV for ADD_JOB."""
+    """ARGV for ADD_JOB. `token` names this call, so a re-sent one adds nothing."""
     return [
         name,
         data,
@@ -1491,6 +1515,8 @@ def add_job_args(
         dedup_ttl,
         METRICS_RETENTION_MS,
         concurrency_key,
+        token,
+        ADD_REPLAY_WINDOW_MS,
     ]
 
 

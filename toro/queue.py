@@ -9,6 +9,7 @@ import functools
 import json
 import math
 import time
+import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass
 from typing import Any, ParamSpec, TypedDict, TypeVar, cast
@@ -181,6 +182,9 @@ def _percentile(buckets: list[int], q: float) -> int:
 # children sit at scripts.LIVE_SCORE and above (see scripts.recordFinished). A
 # ZSET bound, exclusive.
 SETTLED = f"({scripts.LIVE_SCORE}"
+# How often a result() waiter re-reads the job's hash while the event has not come:
+# a pub/sub reconnect loses what was published in the gap (see result()).
+RESULT_RECHECK_S = 5.0
 
 
 def _interval_ms(every: object) -> int:
@@ -376,6 +380,7 @@ class Queue:
                 dedup_id=dedup_id,
                 dedup_ttl=dedup_ttl,
                 concurrency_key=options.concurrency_key or "",
+                token=uuid.uuid4().hex,  # names this call: a re-sent one adds nothing
             ),
             build=build,
         )
@@ -433,7 +438,13 @@ class Queue:
         return _Staged(
             script=self._add_flow_script,
             keys=[self.keys.id, self.keys.base],
-            args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
+            args=[
+                now,
+                json.dumps(tree),
+                scripts.METRICS_RETENTION_MS,
+                uuid.uuid4().hex,  # names this call: a re-sent one adds nothing
+                scripts.ADD_REPLAY_WINDOW_MS,
+            ],
             build=build,
         )
 
@@ -586,17 +597,26 @@ class Queue:
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._result_waiters.setdefault(job_id, []).append(fut)
         try:
-            job = await self.get_job(job_id)
-            if job is not None and job.state == "completed":
-                return job.returnvalue
-            if job is not None and job.state == "failed":
-                raise JobFailedError(job.failed_reason)
-            if job is not None and job.state == "cancelled":
-                raise JobCancelledError(job_id, job.cancel_reason)
-            try:
-                return await asyncio.wait_for(fut, timeout)
-            except (TimeoutError, asyncio.TimeoutError):
-                raise TimeoutError(f"job {job_id} did not finish within {timeout}s") from None
+            settled, value = self._settled(await self.get_job(job_id))
+            if settled:
+                return value
+            # The event is the fast path; the hash is the truth. A pub/sub reconnect
+            # (redis-py re-subscribes without a word) drops whatever was published in
+            # the gap, so the waiter re-reads the hash every RESULT_RECHECK_S and once
+            # more before giving up, and a finished job is delivered, not timed out.
+            deadline = asyncio.get_running_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(fut), min(remaining, RESULT_RECHECK_S)
+                    )
+                except (TimeoutError, asyncio.TimeoutError):
+                    settled, value = self._settled(await self.get_job(job_id))
+                    if settled:
+                        return value
         finally:
             waiters = self._result_waiters.get(job_id)
             if waiters is not None:
@@ -604,6 +624,21 @@ class Queue:
                     waiters.remove(fut)
                 if not waiters:
                     del self._result_waiters[job_id]
+
+    @staticmethod
+    def _settled(job: Job | None) -> tuple[bool, Any]:
+        """Read a finished job's outcome: (True, value) for a completed one, raising
+        for a failed or cancelled one, (False, None) while it is still to run.
+        """
+        if job is None:
+            return False, None
+        if job.state == "completed":
+            return True, job.returnvalue
+        if job.state == "failed":
+            raise JobFailedError(job.failed_reason)
+        if job.state == "cancelled":
+            raise JobCancelledError(job.id, job.cancel_reason)
+        return False, None
 
     async def _ensure_dispatcher(self) -> None:
         """Start the shared events listener (or restart it after a crash)."""
