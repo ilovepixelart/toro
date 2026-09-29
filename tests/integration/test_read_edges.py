@@ -7,6 +7,7 @@ job's wait from the moment it was added, not from the moment it could run.
 
 import asyncio
 
+import toro.queue as queue_module
 from toro import Queue
 from toro.queue import _now_ms
 
@@ -71,3 +72,54 @@ async def test_latency_counts_from_when_a_delayed_job_could_first_run(q, run_wor
         since_add = _now_ms() - job.timestamp
     assert latency <= since_add - 400, (latency, since_add)  # the 500 ms delay is not lateness
     await asyncio.sleep(0)
+
+
+async def test_latency_of_a_scheduler_occurrence_counts_from_its_due_time(
+    q, run_worker, run_until, monkeypatch
+):
+    """An occurrence is minted a whole cadence ahead, with its wait in the hash rather
+    than in its options: once due, it read as a full hour late the moment it became
+    runnable, on a queue no worker was behind on."""
+    real_now = _now_ms()
+    monkeypatch.setattr(queue_module, "_now_ms", lambda: real_now - 3_600_000)
+    await q.add_scheduler("hourly", every=3_600_000)  # minted an hour ago: due about now
+    monkeypatch.undo()
+    await q.pause()
+    async with run_worker(q, lambda job: None, stalled_interval=0):  # promotes, claims nothing
+        assert await run_until(_count_is(q, "wait", 1), timeout=5)
+        latency = await q.latency()
+    assert latency < 1_000, latency
+
+
+async def test_latency_of_a_retry_counts_from_the_end_of_its_backoff(q, run_worker, run_until):
+    """A retry waits out its backoff in `delayed` with the wait nowhere in its options:
+    promoted, it read as late by the backoff and the failed run before it."""
+
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    await q.add("flaky", {}, attempts=2, backoff=1_000)
+    async with run_worker(q, proc, stalled_interval=0):
+        assert await run_until(_count_is(q, "delayed", 1), timeout=5)
+        await q.pause()
+        assert await run_until(_count_is(q, "wait", 1), timeout=5)
+        latency = await q.latency()
+    assert latency < 500, latency
+
+
+async def test_latency_of_a_retried_job_counts_from_the_retry(q, run_worker, run_until):
+    """A failed job put back by retry_job() has been runnable since the retry, not
+    since its add: the time it spent failed is history, not lateness."""
+
+    async def proc(job):
+        raise RuntimeError("boom")
+
+    job = await q.add("flaky", {}, attempts=1)
+    async with run_worker(q, proc, stalled_interval=0):
+        assert await run_until(_count_is(q, "failed", 1), timeout=5)
+        await q.pause()
+        await asyncio.sleep(0.3)  # time spent failed
+        assert await q.retry_job(job.id) is True
+        assert await run_until(_count_is(q, "wait", 1), timeout=5)
+        latency = await q.latency()
+    assert latency < 200, latency

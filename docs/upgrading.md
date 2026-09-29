@@ -85,7 +85,9 @@ Fixes:
 - `get_job()` returns `None` for an id that names one of the queue's own keys or a
   hash that is not a job's; `get_jobs()` reads a negative index from the end and an
   inverted range as empty in every state; `latency()` counts from when the head job
-  could first run rather than from its add.
+  last became runnable (its add, the end of its delay or backoff, its promotion,
+  retry or release) rather than from its add: a scheduler occurrence read as late by
+  its whole cadence the moment it was promoted, and a retry by its backoff.
 - `roots_counts()` and `get_jobs_roots()` no longer diff the whole state on every
   call: on 200,000 waiting jobs a dashboard refresh cost 30 to 100 ms of Redis time
   and now costs about 1 ms. The Redis floor is unchanged (`ZMSCORE` joins

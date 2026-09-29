@@ -901,7 +901,7 @@ class Worker:
                 self.keys.base,
                 self.keys.pc,
             ],
-            args=[job.id, self.token, _claim(job)],
+            args=[job.id, self.token, _claim(job), _now_ms()],
         )
         if int(res) < 0:
             await self._finish_lost(job.id)  # another run owns it: nothing to hand back
