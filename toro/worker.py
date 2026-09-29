@@ -48,6 +48,7 @@ from .connection import (
     connect,
     pop_timeout,
     read_timeout,
+    require_decoded,
 )
 from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
@@ -215,6 +216,7 @@ class Worker:
         self.redis = connection or connect(
             url, max_connections=max(50, concurrency + 10), blocking_timeout=block_timeout
         )
+        require_decoded(self.redis)
         # A connection we opened is ours to give back when we stop; one handed to us
         # belongs to the caller, who may still be using it elsewhere.
         self._owns_connection = connection is None

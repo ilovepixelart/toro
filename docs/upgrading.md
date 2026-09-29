@@ -50,6 +50,9 @@ Fixes:
   hash every five seconds and once more before giving up.
 - `result(timeout=None)` waits without limit, as it did before the re-read loop, which
   raised `TypeError` on it.
+- A `connection=` client that hands back bytes (redis-py's default) is refused where
+  it is handed over. A worker on one ran every job with no name, no data and no
+  cancel flag, and never committed a finish.
 - A `result()` waiter on redis-py 5.x outlives channel silence longer than the
   connection's read timeout: the events subscription read with no timeout, which that
   redis-py turns into the socket timeout, so ten quiet seconds ended the subscription
