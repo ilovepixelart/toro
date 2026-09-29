@@ -9,6 +9,7 @@ import functools
 import json
 import math
 import time
+import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass
 from typing import Any, ParamSpec, TypedDict, TypeVar, cast
@@ -376,6 +377,7 @@ class Queue:
                 dedup_id=dedup_id,
                 dedup_ttl=dedup_ttl,
                 concurrency_key=options.concurrency_key or "",
+                token=uuid.uuid4().hex,  # names this call: a re-sent one adds nothing
             ),
             build=build,
         )
@@ -433,7 +435,13 @@ class Queue:
         return _Staged(
             script=self._add_flow_script,
             keys=[self.keys.id, self.keys.base],
-            args=[now, json.dumps(tree), scripts.METRICS_RETENTION_MS],
+            args=[
+                now,
+                json.dumps(tree),
+                scripts.METRICS_RETENTION_MS,
+                uuid.uuid4().hex,  # names this call: a re-sent one adds nothing
+                scripts.ADD_REPLAY_WINDOW_MS,
+            ],
             build=build,
         )
 

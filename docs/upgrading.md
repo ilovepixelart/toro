@@ -49,6 +49,9 @@ Fixes:
   again reports as running, not draining.
 - A cancel request applies to the run it was made for: a job id re-added while its
   cancelled run unwinds is no longer cancelled with it.
+- An `add()` or `add_flow()` re-sent by the client after a connection dropped while
+  the reply was on its way no longer enqueues a second copy: each call carries a token
+  the script remembers for a minute (`add:<token>`, a new reserved key namespace).
 - The delayed-job sweep, the stalled sweep and the heartbeat log one warning per
   failure episode and one line on recovery, where they were silent.
 - `get_job()` returns `None` for an id that names one of the queue's own keys or a
