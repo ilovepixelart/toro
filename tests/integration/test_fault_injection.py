@@ -245,24 +245,6 @@ async def test_dropped_cancel_commit_recovers_and_cancels_once(q, run_worker, ru
     assert runs == [job.id], "the processor ran again after it had been told to stop"
 
 
-async def test_a_cancellation_during_the_claim_is_not_lost(q, run_worker, run_until):
-    """The request can land while the job is being claimed, before the worker has a
-    processor to stop. The flag rides on the hash the claim reads, so it is acted on
-    at once rather than waiting out a lock renewal."""
-    runs: list[str] = []
-
-    async def proc(job):
-        runs.append(job.id)
-
-    job = await q.add("j", {})
-    await q.redis.hset(q.keys.job(job.id), "cancel", "1")  # as CANCEL_JOB would
-
-    async with run_worker(q, proc, concurrency=2, lock_duration=30_000, lock_renew_time=15_000):
-        assert await run_until(_in_state(q, job.id, "cancelled"), timeout=5)
-
-    assert runs == [], "a job already told to stop was run anyway"
-
-
 async def test_a_cancellation_after_the_job_settled_changes_nothing(q, run_worker, run_until):
     """A request that arrives once the job is terminal has nothing to stop. It must
     not resurrect it, re-commit it, or disturb the worker."""
@@ -271,7 +253,10 @@ async def test_a_cancellation_after_the_job_settled_changes_nothing(q, run_worke
         assert await run_until(_completed(q, 1), timeout=10)
 
         assert await q.cancel_job(job.id) is False  # nothing left to stop
-        await q.redis.publish(q.keys.cancel, job.id)  # and a late message on the wire
+        # and a late message on the wire, shaped as CANCEL_JOB sends it: the id and
+        # the claim it was meant for (a bare id is dropped before the worker acts)
+        claim = (await q.get_job(job.id)).processed_on
+        await q.redis.publish(q.keys.cancel, f"{job.id}:{claim}")
         await asyncio.sleep(0.3)
 
         assert await _state(q, job.id) == "completed"

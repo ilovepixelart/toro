@@ -204,6 +204,7 @@ async def test_stopped_worker_leaks_no_tasks(q, run_until):
     async def proc(job):
         done.append(job.id)
 
+    before = asyncio.all_tasks()
     worker = Worker(q.name, proc, prefix=PREFIX, connection=q.redis, heartbeat_interval=50)
     task = asyncio.create_task(worker.run())
     await q.add("j", {})
@@ -213,8 +214,10 @@ async def test_stopped_worker_leaks_no_tasks(q, run_until):
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
-    # every background loop (stalled / heartbeat / promote) is done, none lingering
-    assert all(t.done() for t in worker._tasks), [t for t in worker._tasks if not t.done()]
+    # Nothing the worker started is still pending: its background loops, and the
+    # per-run tasks (a job's lock renewer, its processor) that stop() does not gather.
+    leaked = asyncio.all_tasks() - before
+    assert not leaked, [t.get_name() for t in leaked]
     await worker.stop()  # idempotent: a second stop must not raise
 
 

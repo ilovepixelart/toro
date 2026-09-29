@@ -314,7 +314,9 @@ async def test_stall_escalated_job_resolves_result_waiters(q):
     from toro import JobFailedError
 
     with pytest.raises(JobFailedError, match="stalled"):
-        await waiter  # the event published from the sweep, not a 10s timeout
+        # bounded well under the waiter's own 5 s re-read of the hash: the sweep's
+        # event resolves it, not the fallback
+        await asyncio.wait_for(waiter, 3)
 
 
 async def test_remove_on_fail_applies_to_eagerly_failed_parents(q, run_worker, run_until):

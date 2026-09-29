@@ -287,7 +287,7 @@ async def test_result_reports_a_cancellation(q):
     assert await q.cancel_job(job.id) is True
 
     with pytest.raises(JobCancelledError):
-        await waiting
+        await asyncio.wait_for(waiting, 3)  # the event, not the waiter's 5 s re-read
     with pytest.raises(JobCancelledError):  # and asking after the fact
         await q.result(job.id, timeout=5)
 
@@ -591,7 +591,7 @@ async def test_result_reports_the_reason_to_a_waiter(q):
     assert await q.cancel_job(job.id, reason="duplicate request") is True
 
     with pytest.raises(JobCancelledError, match="duplicate request"):
-        await waiting
+        await asyncio.wait_for(waiting, 3)  # the event, not the waiter's 5 s re-read
 
 
 async def test_a_cancelled_child_is_not_recorded_as_a_failure(q):
