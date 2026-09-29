@@ -9,12 +9,39 @@ import json
 import time
 
 import pytest
+import redis.asyncio as aioredis
 
 import toro.queue as queue_module
 from toro import Queue, scripts
 from toro.errors import JobFailedError
 
 PREFIX = "torotest"
+
+
+async def test_a_waiter_outlives_channel_silence_longer_than_the_read_timeout(
+    q, run_worker, run_until
+):
+    """The events subscription read with no timeout, and on the declared redis-py
+    floor (5.0.1) a read with none falls back to the connection's socket timeout:
+    after that much silence on the channel the read raised, the dispatcher died
+    and failed every waiter with a Redis TimeoutError, well inside the waiter's
+    own timeout. The read is bounded under the socket timeout and loops."""
+    conn = aioredis.from_url("redis://localhost:6379", socket_timeout=0.5, decode_responses=True)
+    producer = Queue(q.name, prefix=PREFIX, connection=conn)
+    started = asyncio.Event()
+
+    async def slow(job):
+        started.set()
+        await asyncio.sleep(1.2)  # longer than the socket timeout, no event meanwhile
+        return "late"
+
+    try:
+        job = await producer.add("slow", {})
+        async with run_worker(q, slow):
+            assert await producer.result(job.id, timeout=5) == "late"
+    finally:
+        await producer.close()
+        await conn.aclose()
 
 
 async def _publish(q, job_id, event="completed", **extra):
