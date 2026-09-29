@@ -858,21 +858,15 @@ class Queue:
     async def _enqueue_occurrence(
         self, scheduler_id: str, when: int, template: dict[str, str]
     ) -> None:
-        opts = json.loads(template["opts"])
         await self._add_scheduled(
             keys=[self.keys.delayed, self.keys.base],
-            args=[
-                f"repeat:{scheduler_id}:{when}",
-                template["name"],
-                template["data"],
-                template["opts"],
-                _now_ms(),
-                when,
-                opts.get("priority", 0),
-                scheduler_id,
-                opts.get("concurrencyKey") or "",
-                scripts.METRICS_RETENTION_MS,
-            ],
+            args=scripts.scheduled_args(
+                occurrence_id=f"repeat:{scheduler_id}:{when}",
+                template=template,
+                now=_now_ms(),
+                when=when,
+                scheduler_id=scheduler_id,
+            ),
         )
 
     @_writes

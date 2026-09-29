@@ -41,7 +41,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from . import scripts
-from ._replies import _scored, _str_list
+from ._replies import _scored, _str_dict, _str_list
 from .connection import (
     DEFAULT_BLOCK_TIMEOUT,
     confirm_subscribed,
@@ -1081,7 +1081,7 @@ class Worker:
         clock is ahead) would otherwise compute its own slot again, collide with its
         own id, and enqueue nothing.
         """
-        template = await self.redis.hgetall(self.keys.scheduler(scheduler_id))
+        template = _str_dict(await self.redis.hgetall(self.keys.scheduler(scheduler_id)))
         scheduled = await self.redis.zscore(self.keys.repeat, scheduler_id)
         if not template or scheduled is None:
             return  # scheduler was removed - stop the chain
@@ -1098,21 +1098,15 @@ class Worker:
         moved = await self.redis.zadd(self.keys.repeat, {scheduler_id: when}, xx=True, ch=True)
         if not moved:
             return
-        opts = json.loads(template["opts"])
         await self._add_scheduled(
             keys=[self.keys.delayed, self.keys.base],
-            args=[
-                f"repeat:{scheduler_id}:{when}",
-                template["name"],
-                template["data"],
-                template["opts"],
-                now,
-                when,
-                opts.get("priority", 0),
-                scheduler_id,
-                opts.get("concurrencyKey") or "",
-                scripts.METRICS_RETENTION_MS,
-            ],
+            args=scripts.scheduled_args(
+                occurrence_id=f"repeat:{scheduler_id}:{when}",
+                template=template,
+                now=now,
+                when=when,
+                scheduler_id=scheduler_id,
+            ),
         )
 
     def _fetch_flag(self) -> str:
