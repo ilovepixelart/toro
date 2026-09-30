@@ -303,7 +303,8 @@ programming error and stays one.
 A `Queue` builds its connection pool when created and connects on first use; it starts no background work, and the
 first `result()` call starts a small shared event listener. Call
 `await queue.close()` when you're done with it (anyone still inside `result()`
-fails fast rather than waiting out their timeout).
+fails fast rather than waiting out their timeout, and a `result()` call after it
+raises `RuntimeError`).
 
 Repeatable and cron schedules are their own page: [Scheduling](scheduling.md).
 What happens to a job after a worker picks it up: [Processing](processing.md).

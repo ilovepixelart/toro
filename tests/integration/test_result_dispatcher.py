@@ -309,3 +309,40 @@ async def test_result_with_no_timeout_waits_for_the_job(q, run_worker, monkeypat
     async with run_worker(q, slow):
         job = await q.add("slow", {})
         assert await q.result(job.id, timeout=None) == "eventually"
+
+
+async def test_close_during_the_first_result_leaves_no_dispatcher(monkeypatch):
+    """The first result() starts the events dispatcher: subscribe, confirm, then a
+    task. A close() landing inside that round trip found no task and no pub/sub to
+    end, closed the client, and the dispatcher then started on a queue already
+    closed: a task and a subscription outliving close(), and a waiter left to sit
+    out its timeout instead of failing fast."""
+    queue = Queue("torotest-close-first", prefix=PREFIX)
+    subscribed = asyncio.Event()
+    release = asyncio.Event()
+    confirm = queue_module.confirm_subscribed
+
+    async def held(pubsub):
+        await confirm(pubsub)
+        subscribed.set()
+        await release.wait()  # close() lands while the first result() subscribes
+
+    monkeypatch.setattr(queue_module, "confirm_subscribed", held)
+    waiter = asyncio.create_task(queue.result("ghost", timeout=10))
+    await subscribed.wait()
+    closing = asyncio.create_task(queue.close())
+    await asyncio.sleep(0.05)
+    release.set()
+    await closing
+    with pytest.raises(RuntimeError, match="queue closed"):
+        await asyncio.wait_for(waiter, 2)
+    assert queue._events_task is None
+    assert queue._events_pubsub is None
+
+
+async def test_result_after_close_starts_no_dispatcher():
+    queue = Queue("torotest-closed", prefix=PREFIX)
+    await queue.close()
+    with pytest.raises(RuntimeError, match="queue closed"):
+        await queue.result("ghost", timeout=1)
+    assert queue._events_task is None
