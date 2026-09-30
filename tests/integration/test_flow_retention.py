@@ -541,8 +541,9 @@ async def test_a_mid_gone_while_its_leaves_are_live_does_not_strand_them(q, run_
         mid_node = next(n for n in tree["children"] if n["job"].name == "mid")
         mid_id = mid_node["job"].id
         leaves = [n["job"].id for n in mid_node["children"]]
-        # what an old worker's rank trim does to the mid: hash and entry, no cascade
-        await q.redis.delete(q.keys.job(mid_id))
+        # what an old worker's rank trim does to the mid: hash, entry and its results
+        # list, no cascade
+        await q.redis.delete(q.keys.job(mid_id), q.keys.results(mid_id))
         await q.redis.zrem(q.keys.completed, mid_id)
         gate.set()
         assert await root.result(timeout=10) == ["mid", "slow"]

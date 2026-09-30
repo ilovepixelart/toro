@@ -86,14 +86,111 @@ async def _clear(queue: Queue) -> None:
         await queue.redis.delete(*keys)
 
 
+# ---- the queue's global invariants, held by every state a test leaves behind ------
+
+_STATE_SETS = ("prioritized", "active", "delayed", "completed", "failed", "waiting_children")
+# counts() key -> the keys.py property backing it. They line up one-to-one except
+# `wait`: the waiting set is the priority-ordered zset, so its key is `prioritized`
+# (the state is named for what it means; the key for what it is).
+_COUNT_TO_SET = {
+    "wait": "prioritized",
+    "active": "active",
+    "delayed": "delayed",
+    "completed": "completed",
+    "failed": "failed",
+    "waiting-children": "waiting_children",
+}
+
+
+async def snapshot_members(queue: Queue) -> dict[str, set[str]]:
+    """Current id membership of every state set (active is a LIST, rest ZSETs)."""
+    out: dict[str, set[str]] = {}
+    for name in _STATE_SETS:
+        key = getattr(queue.keys, name)
+        ids = (
+            await queue.redis.lrange(key, 0, -1)
+            if name == "active"
+            else await queue.redis.zrange(key, 0, -1)
+        )
+        out[name] = set(ids)
+    return out
+
+
+async def check_invariants(queue: Queue) -> None:
+    """Assert what every reachable queue state must satisfy:
+
+    1. counts() equals the real set cardinalities.
+    2. no job id is in two state sets at once (atomic moves never duplicate).
+    3. no orphan aux key (:deps/:results/:cfail/:lock) outlives its job hash.
+
+    Read after each step of the random-operation fuzzers (test_invariants.py) and
+    at the teardown of every passing integration test.
+    """
+    members = await snapshot_members(queue)
+
+    # 1. counts() agrees with the real cardinalities
+    counts = await queue.counts()
+    for cname, sname in _COUNT_TO_SET.items():
+        assert counts[cname] == len(members[sname]), f"{cname} count {counts[cname]} != {sname}"
+
+    # 2. no id lives in two state sets at once
+    seen: dict[str, str] = {}
+    for sname, ids in members.items():
+        for jid in ids:
+            assert jid not in seen, f"{jid} in both {seen[jid]} and {sname}"
+            seen[jid] = sname
+
+    # 3. no orphan aux keys (a removed job leaves nothing behind)
+    base = queue.keys.base
+    for suffix in (":deps", ":results", ":cfail", ":lock"):
+        for key in await queue.redis.keys(f"{base}*{suffix}"):
+            jid = key[len(base) : -len(suffix)]
+            assert await queue.redis.exists(queue.keys.job(jid)), f"orphan {suffix} for {jid}"
+
+
 @pytest.fixture
-async def q():
-    """A clean, isolated queue (own prefix; wiped before and after each test)."""
+def invariants():
+    """`await invariants(q)`: assert the queue's invariants hold right now."""
+    return check_invariants
+
+
+@pytest.fixture
+def members():
+    """`await members(q)`: the id membership of every state set."""
+    return snapshot_members
+
+
+_CALL_PASSED = pytest.StashKey[bool]()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if report.when == "call":
+        item.stash[_CALL_PASSED] = report.passed  # read by q's teardown
+    return report
+
+
+@pytest.fixture
+async def q(request):
+    """A clean, isolated queue (own prefix; wiped before and after each test).
+
+    A test that passed is also held to the queue's invariants at teardown, so one
+    that leaves a job in two states or an orphan key fails here, naming the
+    invariant, rather than a later test that reads the state failing for a reason
+    it cannot show. A failed test already reports; a load test is exempt, its sets
+    being the size the check would spend minutes reading.
+    """
     queue = Queue("torotest", prefix=PREFIX)
     await _clear(queue)
     yield queue
-    await _clear(queue)
-    await queue.close()
+    try:
+        passed = request.node.stash.get(_CALL_PASSED, False)
+        if passed and not request.node.get_closest_marker("load"):
+            await check_invariants(queue)
+    finally:
+        await _clear(queue)
+        await queue.close()
 
 
 @pytest.fixture(autouse=True)

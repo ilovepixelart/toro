@@ -6,11 +6,9 @@ A deterministic seeded fuzzer (not Hypothesis): processing is driven by hand via
 _acquire + _finish_* so each step is atomic with nothing else mutating - no live
 worker, no timing races - and a failing case reproduces exactly from its seed.
 
-Invariants per step:
-  1. counts() equals the real set cardinalities.
-  2. no job id is in two state sets at once (atomic moves never duplicate).
-  3. no orphan aux key (:deps/:results/:cfail/:lock) outlives its job hash.
-Final invariant after a full drain:
+The per-step invariants are the shared checker in tests/conftest.py (`invariants`),
+which the `q` fixture also runs at the teardown of every passing integration test.
+Final invariant after a full drain, this module's own:
   4. flows always settle - waiting-children is empty (no parent stranded).
 """
 
@@ -23,56 +21,6 @@ from toro import Queue, Worker
 from toro.job import Job
 
 PREFIX = "torotest"
-
-_STATE_SETS = ("prioritized", "active", "delayed", "completed", "failed", "waiting_children")
-# counts() key -> the keys.py property backing it. They line up one-to-one except
-# `wait`: the waiting set is the priority-ordered zset, so its key is `prioritized`
-# (the state is named for what it means; the key for what it is).
-_COUNT_TO_SET = {
-    "wait": "prioritized",
-    "active": "active",
-    "delayed": "delayed",
-    "completed": "completed",
-    "failed": "failed",
-    "waiting-children": "waiting_children",
-}
-
-
-async def _members(q: Queue) -> dict[str, set[str]]:
-    """Current id membership of every state set (active is a LIST, rest ZSETs)."""
-    out: dict[str, set[str]] = {}
-    for name in _STATE_SETS:
-        key = getattr(q.keys, name)
-        ids = (
-            await q.redis.lrange(key, 0, -1)
-            if name == "active"
-            else await q.redis.zrange(key, 0, -1)
-        )
-        out[name] = set(ids)
-    return out
-
-
-async def _check_invariants(q: Queue) -> None:
-    members = await _members(q)
-
-    # 1. counts() agrees with the real cardinalities
-    counts = await q.counts()
-    for cname, sname in _COUNT_TO_SET.items():
-        assert counts[cname] == len(members[sname]), f"{cname} count {counts[cname]} != {sname}"
-
-    # 2. no id lives in two state sets at once
-    seen: dict[str, str] = {}
-    for sname, ids in members.items():
-        for jid in ids:
-            assert jid not in seen, f"{jid} in both {seen[jid]} and {sname}"
-            seen[jid] = sname
-
-    # 3. no orphan aux keys (a removed job leaves nothing behind)
-    base = q.keys.base
-    for suffix in (":deps", ":results", ":cfail", ":lock"):
-        for key in await q.redis.keys(f"{base}*{suffix}"):
-            jid = key[len(base) : -len(suffix)]
-            assert await q.redis.exists(q.keys.job(jid)), f"orphan {suffix} for {jid}"
 
 
 async def _process_one(w: Worker, *, succeed: bool) -> bool:
@@ -90,13 +38,15 @@ async def _process_one(w: Worker, *, succeed: bool) -> bool:
     return True
 
 
-async def _rand_member(q: Queue, rng: random.Random, *names: str) -> str | None:
-    members = await _members(q)
+async def _rand_member(q: Queue, ctr: dict, rng: random.Random, *names: str) -> str | None:
+    members = await ctr["members"](q)
     pool = sorted(jid for n in names for jid in members[n])
     return rng.choice(pool) if pool else None
 
 
 # ---- the random operations (module level, so the test body stays simple) -----------
+# `ctr` is the run's context: the job counter, the held jobs of the cap fuzz, and the
+# `members` snapshot fixture, which a module-level helper cannot import from conftest.
 
 
 async def _op_add(q, w, rng, ctr):
@@ -123,13 +73,13 @@ async def _op_process(q, w, rng, ctr):
 
 
 async def _op_retry(q, w, rng, ctr):
-    jid = await _rand_member(q, rng, "failed")
+    jid = await _rand_member(q, ctr, rng, "failed")
     if jid:
         await q.retry_job(jid)
 
 
 async def _op_remove(q, w, rng, ctr):
-    jid = await _rand_member(q, rng, "prioritized", "active", "delayed", "completed", "failed")
+    jid = await _rand_member(q, ctr, rng, "prioritized", "active", "delayed", "completed", "failed")
     if jid:
         await q.remove_job(jid)
 
@@ -139,7 +89,7 @@ async def _op_clean(q, w, rng, ctr):
 
 
 async def _op_promote(q, w, rng, ctr):
-    jid = await _rand_member(q, rng, "delayed")
+    jid = await _rand_member(q, ctr, rng, "delayed")
     if jid:
         await q.promote_job(jid)
 
@@ -182,17 +132,17 @@ async def _settle_diagnostic(q: Queue) -> str:
 
 
 @pytest.mark.parametrize("seed", range(12))
-async def test_invariants_hold_under_random_ops(q, seed):
+async def test_invariants_hold_under_random_ops(q, seed, invariants, members):
     rng = random.Random(seed)  # noqa: S311 - a reproducible test fuzzer, not crypto
     w = Worker(q.name, lambda j: None, prefix=PREFIX, connection=q.redis)
-    ctr = {"j": 0}
+    ctr = {"j": 0, "members": members}
 
     for _ in range(40):
         await rng.choice(_OPS)(q, w, rng, ctr)
-        await _check_invariants(q)
+        await invariants(q)
 
     await _recover_and_drain(q, w)
-    await _check_invariants(q)
+    await invariants(q)
     settled = (await q.counts())["waiting-children"] == 0
     assert settled, "a flow never settled -> " + await _settle_diagnostic(q)
 
@@ -243,16 +193,16 @@ _CAP_OPS = [
 
 
 @pytest.mark.parametrize("seed", range(12))
-async def test_cap_holds_under_random_ops(q, seed):
+async def test_cap_holds_under_random_ops(q, seed, invariants, members):
     rng = random.Random(seed)  # noqa: S311 - a reproducible test fuzzer, not crypto
     w = Worker(q.name, lambda j: None, prefix=PREFIX, connection=q.redis, global_concurrency=_CAP)
     w._running = True  # finish with fetch-next, as a running worker does
-    ctr = {"j": 0, "held": []}
+    ctr = {"j": 0, "held": [], "members": members}
     peak = 0
 
     for _ in range(60):
         await rng.choice(_CAP_OPS)(q, w, rng, ctr)
-        await _check_invariants(q)
+        await invariants(q)
         active = await q.redis.llen(q.keys.active)
         assert active <= _CAP, f"{active} active jobs under a cap of {_CAP}"
         peak = max(peak, active)
@@ -262,7 +212,7 @@ async def test_cap_holds_under_random_ops(q, seed):
     for job in ctr["held"]:
         await w._finish_completed(job, {"ok": 1})
     await _recover_and_drain(q, w)
-    await _check_invariants(q)
+    await invariants(q)
     settled = (await q.counts())["waiting-children"] == 0
     assert settled, "a flow never settled -> " + await _settle_diagnostic(q)
 
