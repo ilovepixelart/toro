@@ -1101,8 +1101,9 @@ return redis.call("HGET", KEYS[1], "model")
 
 # Add a delayed job with a caller-provided id, idempotently. Used by schedulers:
 # the deterministic id `repeat:<schedulerId>:<nextMillis>` means the same
-# occurrence can never be enqueued twice. Returns 1 if added, 0 if it existed.
-# KEYS[1] delayed  KEYS[2] key base
+# occurrence can never be enqueued twice. Returns 1 if added, 0 if it existed or the
+# schedule no longer points at this slot.
+# KEYS[1] delayed  KEYS[2] key base  KEYS[3] repeat
 # ARGV[1] jobId  ARGV[2] name  ARGV[3] data(json)  ARGV[4] opts(json)
 # ARGV[5] now(ms)  ARGV[6] processAt(ms)  ARGV[7] priority  ARGV[8] schedulerId
 # ARGV[9] concurrency key ("" = none)  ARGV[10] metrics retention(ms)
@@ -1111,6 +1112,10 @@ ADD_SCHEDULED = (
     + """
 local base = KEYS[2]
 local jobKey = base .. ARGV[1]
+-- Only a schedule still at this slot gets its occurrence: the move to the slot and
+-- this add are two round trips, and a schedule removed, or registered again at
+-- another slot, between them would otherwise run once more from the template in hand.
+if tonumber(redis.call("ZSCORE", KEYS[3], ARGV[8])) ~= tonumber(ARGV[6]) then return 0 end
 if redis.call("EXISTS", jobKey) == 1 then return 0 end
 local now = tonumber(ARGV[5])
 redis.call("HSET", jobKey,
@@ -1129,6 +1134,19 @@ recordMetrics(base, "added", now, 0, tonumber(ARGV[10]))
 return 1
 """
 )
+
+# Unregister a schedule and drop its template in one step, so a worker minting the
+# next occurrence sees the schedule either there or gone, never half removed.
+# KEYS[1] repeat  KEYS[2] scheduler template
+# ARGV[1] schedulerId
+# Returns the slot the schedule pointed at (its pending occurrence's id carries it),
+# or nil for a schedule that was not registered.
+REMOVE_SCHEDULER = """
+local slot = redis.call("ZSCORE", KEYS[1], ARGV[1])
+redis.call("ZREM", KEYS[1], ARGV[1])
+redis.call("DEL", KEYS[2])
+return slot
+"""
 
 # Promote a delayed job to run now (admin/dashboard action).
 # KEYS[1] delayed  KEYS[2] prioritized  KEYS[3] marker  KEYS[4] job hash  KEYS[5] pc

@@ -234,6 +234,7 @@ class Queue:
         self._remove_job = self.redis.register_script(scripts.REMOVE_JOB)
         self._cancel_job = self.redis.register_script(scripts.CANCEL_JOB)
         self._add_scheduled = self.redis.register_script(scripts.ADD_SCHEDULED)
+        self._remove_scheduler = self.redis.register_script(scripts.REMOVE_SCHEDULER)
         self._stamp = self.redis.register_script(scripts.STAMP_MODEL)
         # Asked once per process, on the first WRITE. Not on a read: a dashboard opens
         # a queue for every name it is given, and stamping on a read would create the
@@ -859,7 +860,7 @@ class Queue:
         self, scheduler_id: str, when: int, template: dict[str, str]
     ) -> None:
         await self._add_scheduled(
-            keys=[self.keys.delayed, self.keys.base],
+            keys=[self.keys.delayed, self.keys.base, self.keys.repeat],
             args=scripts.scheduled_args(
                 occurrence_id=f"repeat:{scheduler_id}:{when}",
                 template=template,
@@ -872,11 +873,11 @@ class Queue:
     @_writes
     async def remove_scheduler(self, scheduler_id: str) -> None:
         """Stop a schedule and drop its pending occurrence."""
-        score = await self.redis.zscore(self.keys.repeat, scheduler_id)
-        await self.redis.zrem(self.keys.repeat, scheduler_id)
-        await self.redis.delete(self.keys.scheduler(scheduler_id))
-        if score is not None:
-            await self.remove_job(f"repeat:{scheduler_id}:{int(score)}")
+        slot = await self._remove_scheduler(
+            keys=[self.keys.repeat, self.keys.scheduler(scheduler_id)], args=[scheduler_id]
+        )
+        if slot is not None:
+            await self.remove_job(f"repeat:{scheduler_id}:{int(float(slot))}")
 
     @_writes
     async def trigger_scheduler(self, scheduler_id: str) -> bool:
