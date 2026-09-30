@@ -131,6 +131,20 @@ end
 -- backlog coming due at once (a backoff storm after an outage) holds Redis for
 -- milliseconds per claim, never for the whole backlog. `delay` is cleared with the
 -- state: a concurrency key handed to the job later would park it for it again.
+-- A new job with its key in hand: parked in `delayed` for its delay, else queued now.
+-- Answers the state it was given.
+local function park(base, prioritizedKey, markerKey, delayedKey, pcKey, jobKey, jobId,
+                    priority, delay, now)
+  if delay > 0 then
+    redis.call("HSET", jobKey, "state", "delayed")
+    redis.call("ZADD", delayedKey, now + delay, jobId)
+    wakeAt(base, now + delay)
+    return "delayed"
+  end
+  redis.call("HSET", jobKey, "state", "wait")
+  enqueue(prioritizedKey, markerKey, jobId, priority, pcKey, jobKey, now)
+  return "wait"
+end
 local function promoteDue(base, prioritizedKey, pcKey, now)
   local delayedKey = base .. "delayed"
   -- From -inf, not 0: whatever is scored below now is due, and the head of the set
@@ -252,6 +266,18 @@ end
 local function claimedBy(jobKey, claim)
   return claim == "" or redis.call("HGET", jobKey, "processedOn") == claim
 end
+-- A commit's own guards, shared by every finish: a run that lost its lock, or whose
+-- claim is not this run's, commits nothing (LOCK_LOST); a job no longer in `active`
+-- commits nothing either (NOT_ACTIVE). Past them the lock is gone and the job is out
+-- of `active`; nil says the commit may go on.
+local function releaseRun(activeKey, jobKey, lockKey, token, jobId, claim)
+  if redis.call("GET", lockKey) ~= token or not claimedBy(jobKey, claim or "") then
+    return LOCK_LOST
+  end
+  redis.call("DEL", lockKey)
+  if redis.call("LREM", activeKey, 0, jobId) == 0 then return NOT_ACTIVE end
+  return nil
+end
 local function lockAndLoad(jobId, stalledKey, base, token, lockMs, now)
   local jobKey = base .. jobId
   redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
@@ -362,6 +388,27 @@ local function wakeIfWaiting(prioritizedKey, markerKey)
   if redis.call("ZCARD", prioritizedKey) > 0 then
     redis.call("ZADD", markerKey, 0, "0")
   end
+end
+-- What a finish answers once committed. Asked to fetch, it hands over what the claim
+-- found (a rate limit put the job back: wake a worker to re-check instead); asked
+-- not to, this finish is still the moment a slot frees under a cap, so what is due
+-- moves now and a waiting worker is woken. Either way the answer is recorded for a
+-- re-send, with the fetched job while it is still this worker's to run.
+local function finishAnswer(nxt, fetching, base, prioritizedKey, markerKey, pcKey, now,
+                            token, jobId, claim, outcome, lockMs)
+  if fetching then
+    if nxt and nxt[1] == "__rl__" then
+      redis.call("ZADD", markerKey, 0, "0")
+      nxt = false
+    end
+  else
+    promoteDue(base, prioritizedKey, pcKey, now)
+    wakeIfWaiting(prioritizedKey, markerKey)
+  end
+  local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
+  rememberFinish(base, token, jobId, claim, outcome, fetched, lockMs)
+  if nxt then return {outcome, nxt[1], nxt[2]} end
+  return {outcome}
 end
 -- A job is finished when it will not run again: no attempt left, retention applies.
 -- Every place that asks reads this, so a new terminal state joins them all at once.
@@ -559,6 +606,28 @@ local function reviveSubtree(base, rootId, jobId, now)
     reviveSubtree(base, rootId, cid, now)
   end
 end
+-- Retention by age: what finished more than keepAge seconds ago goes, within this
+-- call's trim budget.
+local function trimByAge(base, setKey, now, keepAge)
+  local cutoff = now - keepAge * 1000
+  local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
+                             "LIMIT", 0, trimBudget)
+  for _, id in ipairs(expired) do
+    if trimBudget <= 0 then break end
+    trimBudget = trimBudget - removeFinished(base, setKey, id)
+  end
+end
+-- Retention by count: the oldest settled entries over keepCount go, within the
+-- budget. The bound counts what has settled: a running flow's children sit above LIVE.
+local function trimByCount(base, setKey, keepCount)
+  local excess = redis.call("ZCOUNT", setKey, "-inf", LIVE_BOUND) - keepCount
+  if excess <= 0 then return end
+  local victims = redis.call("ZRANGE", setKey, 0, math.min(excess, trimBudget) - 1)
+  for _, id in ipairs(victims) do
+    if trimBudget <= 0 then break end
+    trimBudget = trimBudget - removeFinished(base, setKey, id)
+  end
+end
 local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state)
   releaseKey(base, jobKey, jobId, now)  -- terminal: whatever happens below, the key goes on
   local meta = redis.call("HMGET", jobKey, "opts", "parentId", "rootId", "children")
@@ -582,27 +651,10 @@ local function recordFinished(setKey, jobKey, base, jobId, now, prop, val, state
   elseif meta[4] then  -- a settling root: its flow becomes history with it
     settleLive(base, jobId, now)
   end
-  if keepAge >= 0 and trimBudget > 0 then
-    local cutoff = now - keepAge * 1000
-    local expired = redis.call("ZRANGEBYSCORE", setKey, "-inf", "(" .. cutoff,
-                               "LIMIT", 0, trimBudget)
-    for _, id in ipairs(expired) do
-      if trimBudget <= 0 then break end
-      trimBudget = trimBudget - removeFinished(base, setKey, id)
-    end
-  end
-  -- trimBudget > 0 is load-bearing: at 0 the range below would end at -1, the whole set
-  if keepCount > 0 and trimBudget > 0 then
-    -- the bound counts what has settled: a running flow's children sit above LIVE
-    local excess = redis.call("ZCOUNT", setKey, "-inf", LIVE_BOUND) - keepCount
-    if excess > 0 then
-      local victims = redis.call("ZRANGE", setKey, 0, math.min(excess, trimBudget) - 1)
-      for _, id in ipairs(victims) do
-        if trimBudget <= 0 then break end
-        trimBudget = trimBudget - removeFinished(base, setKey, id)
-      end
-    end
-  end
+  if keepAge >= 0 and trimBudget > 0 then trimByAge(base, setKey, now, keepAge) end
+  -- trimBudget > 0 is load-bearing: at 0 the count trim's range would end at -1, the
+  -- whole set
+  if keepCount > 0 and trimBudget > 0 then trimByCount(base, setKey, keepCount) end
 end
 -- Flow plumbing. A parent is parked in the `waiting-children` ZSET with a
 -- `<id>:deps` SET of pending child ids. Children settle into their parent
@@ -763,16 +815,8 @@ local now = tonumber(ARGV[4])
 if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
 local state = "held"  -- takeKey parks it there when the key is taken
 if takeKey(base, jobKey, jobId, ARGV[11], tonumber(ARGV[6]), KEYS[6], now) then
-  if delay > 0 then
-    state = "delayed"
-    redis.call("HSET", jobKey, "state", state)
-    redis.call("ZADD", KEYS[4], now + delay, jobId)
-    wakeAt(base, now + delay)
-  else
-    state = "wait"
-    redis.call("HSET", jobKey, "state", state)
-    enqueue(KEYS[2], KEYS[3], jobId, tonumber(ARGV[6]), KEYS[6], jobKey, now)
-  end
+  state = park(base, KEYS[2], KEYS[3], KEYS[4], KEYS[6], jobKey, jobId,
+               tonumber(ARGV[6]), delay, now)
 end
 -- only real inserts count (dedup hits and id replays returned above)
 recordMetrics(base, "added", tonumber(ARGV[4]), 0, tonumber(ARGV[10]))
@@ -831,15 +875,8 @@ local function createNode(node, parentId, rootId)
     if delay > 0 then redis.call("HSET", jobKey, "delay", delay) end
     if takeKey(base, jobKey, jobId, node.concurrencyKey, tonumber(node.priority),
                base .. "pc", now) then
-      if delay > 0 then
-        redis.call("HSET", jobKey, "state", "delayed")
-        redis.call("ZADD", base .. "delayed", now + delay, jobId)
-        wakeAt(base, now + delay)
-      else
-        redis.call("HSET", jobKey, "state", "wait")
-        enqueue(base .. "prioritized", base .. "marker", jobId,
-                tonumber(node.priority), base .. "pc", jobKey, now)
-      end
+      park(base, base .. "prioritized", base .. "marker", base .. "delayed", base .. "pc",
+           jobKey, jobId, tonumber(node.priority), delay, now)
     end
   end
   return jobId
@@ -934,10 +971,8 @@ local cap, rlMax, rlDuration = 0, tonumber(ARGV[7]), tonumber(ARGV[8])
 if ARGV[5] == "1" then
   cap, rlMax, rlDuration = ownLimits(KEYS[8], requireCap(ARGV[10]), rlMax, rlDuration)
 end
-if redis.call("GET", KEYS[4]) ~= ARGV[4]
-  or not claimedBy(KEYS[3], ARGV[12] or "") then return LOCK_LOST end
-redis.call("DEL", KEYS[4])
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
+local refused = releaseRun(KEYS[1], KEYS[3], KEYS[4], ARGV[4], ARGV[1], ARGV[12])
+if refused then return refused end
 local now = tonumber(ARGV[3])
 -- read BEFORE recordFinished (remove-on-complete may DEL the hash)
 local meta = redis.call("HMGET", KEYS[3],
@@ -970,20 +1005,9 @@ if ARGV[5] == "1" then
   nxt = acquireNext(KEYS[5], KEYS[1], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[11],
                     ARGV[4], tonumber(ARGV[6]), ARGV[3],
                     KEYS[12], rlMax, rlDuration, cap)
-  if nxt and nxt[1] == "__rl__" then
-    redis.call("ZADD", KEYS[6], 0, "0")   -- rate limited: wake a worker to re-check
-    nxt = false
-  end
-else
-  -- Fetching nothing, this finish is still the moment a slot frees under a cap, so
-  -- what is due moves now and the wake below finds it, rather than at the next poll.
-  promoteDue(KEYS[8], KEYS[5], KEYS[9], ARGV[3])
-  wakeIfWaiting(KEYS[5], KEYS[6])
 end
-local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
-rememberFinish(KEYS[8], ARGV[4], ARGV[1], ARGV[12], 1, fetched, tonumber(ARGV[6]))
-if nxt then return {1, nxt[1], nxt[2]} end
-return {1}
+return finishAnswer(nxt, ARGV[5] == "1", KEYS[8], KEYS[5], KEYS[6], KEYS[9], ARGV[3],
+                    ARGV[4], ARGV[1], ARGV[12], 1, tonumber(ARGV[6]))
 """
 )
 
@@ -1010,10 +1034,8 @@ local cap, rlMax, rlDuration = 0, tonumber(ARGV[10]), tonumber(ARGV[11])
 if ARGV[8] == "1" then
   cap, rlMax, rlDuration = ownLimits(KEYS[9], requireCap(ARGV[13]), rlMax, rlDuration)
 end
-if redis.call("GET", KEYS[6]) ~= ARGV[7]
-  or not claimedBy(KEYS[5], ARGV[14] or "") then return LOCK_LOST end
-redis.call("DEL", KEYS[6])
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
+local refused = releaseRun(KEYS[1], KEYS[5], KEYS[6], ARGV[7], ARGV[1], ARGV[14])
+if refused then return refused end
 local attemptsMade = redis.call("HINCRBY", KEYS[5], "attemptsMade", 1)  -- this run finished
 local maxAttempts = tonumber(ARGV[5])
 redis.call("HSET", KEYS[5], "failedReason", ARGV[2])
@@ -1056,18 +1078,9 @@ if ARGV[8] == "1" then
   nxt = acquireNext(KEYS[2], KEYS[1], KEYS[7], KEYS[8], KEYS[9], KEYS[10], KEYS[12],
                     ARGV[7], tonumber(ARGV[9]), ARGV[3],
                     KEYS[13], rlMax, rlDuration, cap)
-  if nxt and nxt[1] == "__rl__" then
-    redis.call("ZADD", KEYS[7], 0, "0")   -- rate limited: wake a worker to re-check
-    nxt = false
-  end
-else
-  promoteDue(KEYS[9], KEYS[2], KEYS[10], ARGV[3])  -- see MOVE_TO_COMPLETED
-  wakeIfWaiting(KEYS[2], KEYS[7])
 end
-local fetched = nxt and nxt[1] ~= "__due__" and nxt[2] or nil
-rememberFinish(KEYS[9], ARGV[7], ARGV[1], ARGV[14], outcome, fetched, tonumber(ARGV[9]))
-if nxt then return {outcome, nxt[1], nxt[2]} end
-return {outcome}
+return finishAnswer(nxt, ARGV[8] == "1", KEYS[9], KEYS[2], KEYS[7], KEYS[10], ARGV[3],
+                    ARGV[7], ARGV[1], ARGV[14], outcome, tonumber(ARGV[9]))
 """
 )
 
@@ -1322,11 +1335,8 @@ MOVE_TO_CANCELLED = (
 local base = KEYS[7]
 local seen = recallFinish(base, ARGV[3], ARGV[1], ARGV[5])
 if seen then return seen[1] end
-if redis.call("GET", KEYS[4]) ~= ARGV[3] or not claimedBy(KEYS[3], ARGV[5] or "") then
-  return LOCK_LOST
-end
-redis.call("DEL", KEYS[4])
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then return NOT_ACTIVE end
+local refused = releaseRun(KEYS[1], KEYS[3], KEYS[4], ARGV[3], ARGV[1], ARGV[5])
+if refused then return refused end
 local now = tonumber(ARGV[2])
 -- read BEFORE recordFinished (retention may DEL the hash)
 local meta = redis.call("HMGET", KEYS[3], "parentId", "onFail", "cancelReason")
@@ -1456,44 +1466,46 @@ if throttle > 0 then
   redis.call("SET", KEYS[5], ARGV[2], "PX", throttle)
 end
 
+-- A job stalled past max_stalled_count fails for good: recorded, announced (the
+-- sweeping worker's own events do not reach the result() waiters) and settled into
+-- its flow, since a dead worker must not leave a parent parked forever.
+local function failStalled(jobKey, jobId, now, retentionMs)
+  local reason = "job stalled more than allowable limit"
+  -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
+  local meta = redis.call("HMGET", jobKey, "name", "parentId", "onFail", "children")
+  recordFinished(KEYS[4], jobKey, KEYS[6], jobId, now, "failedReason", reason, "failed")
+  recordMetrics(KEYS[6], "failed", now, 0, retentionMs, meta[1])
+  redis.call("PUBLISH", KEYS[6] .. "events",
+    cjson.encode({jobId = jobId, event = "failed", reason = reason}))
+  if meta[2] then
+    settleChildGone(KEYS[6], jobId, meta[2], meta[3], reason, now, retentionMs, "failed")
+  elseif meta[4] then
+    -- a released root flow parent that stalled out: count the flow failed
+    recordFlow(KEYS[6], false, now, 0, retentionMs)
+  end
+end
+
 local failed = {}
 local recovered = {}
 local stalling = redis.call("SMEMBERS", KEYS[1])
 if #stalling > 0 then
   redis.call("DEL", KEYS[1])
   local maxStalled = tonumber(ARGV[1])
+  local now = tonumber(ARGV[2])
   for _, jobId in ipairs(stalling) do
     local jobKey = KEYS[6] .. jobId
-    if redis.call("EXISTS", jobKey .. ":lock") == 0 then
-      if redis.call("LREM", KEYS[2], 1, jobId) > 0 then
-        local count = redis.call("HINCRBY", jobKey, "stalledCounter", 1)
-        if count > maxStalled then
-          local now = tonumber(ARGV[2])
-          local reason = "job stalled more than allowable limit"
-          -- read BEFORE recordFinished (remove-on-fail may DEL the hash)
-          local meta = redis.call("HMGET", jobKey, "name", "parentId", "onFail", "children")
-          recordFinished(KEYS[4], jobKey, KEYS[6], jobId, now, "failedReason", reason, "failed")
-          recordMetrics(KEYS[6], "failed", now, 0, tonumber(ARGV[4]), meta[1])
-          -- announce the terminal failure so result() waiters resolve instead
-          -- of timing out (the sweeping worker's local events don't reach them)
-          redis.call("PUBLISH", KEYS[6] .. "events",
-            cjson.encode({jobId = jobId, event = "failed", reason = reason}))
-          -- the crash path settles flow parents too - a dead worker must not
-          -- leave a parent parked forever
-          if meta[2] then
-            settleChildGone(KEYS[6], jobId, meta[2], meta[3], reason, now,
-              tonumber(ARGV[4]), "failed")
-          elseif meta[4] then
-            -- a released root flow parent that stalled out: count the flow failed
-            recordFlow(KEYS[6], false, now, 0, tonumber(ARGV[4]))
-          end
-          table.insert(failed, jobId)
-        else
-          local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0
-          redis.call("HSET", jobKey, "state", "wait")
-          enqueue(KEYS[3], KEYS[7], jobId, priority, KEYS[8], jobKey, tonumber(ARGV[2]))
-          table.insert(recovered, jobId)
-        end
+    -- a lock still held is a run still going; a job no longer in `active` was
+    -- finished (or removed) between the two passes and is not stalled
+    if redis.call("EXISTS", jobKey .. ":lock") == 0
+       and redis.call("LREM", KEYS[2], 1, jobId) > 0 then
+      if redis.call("HINCRBY", jobKey, "stalledCounter", 1) > maxStalled then
+        failStalled(jobKey, jobId, now, tonumber(ARGV[4]))
+        table.insert(failed, jobId)
+      else
+        local priority = tonumber(redis.call("HGET", jobKey, "priority")) or 0
+        redis.call("HSET", jobKey, "state", "wait")
+        enqueue(KEYS[3], KEYS[7], jobId, priority, KEYS[8], jobKey, now)
+        table.insert(recovered, jobId)
       end
     end
   end

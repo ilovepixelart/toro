@@ -1131,3 +1131,54 @@ async def test_an_unknown_option_is_a_value_error_on_add_too(q):
     node; the docs promise `ValueError` for every option error."""
     with pytest.raises(ValueError, match="prority"):
         await q.add("sync", {}, prority=1)
+
+
+async def test_a_finish_for_a_job_no_longer_listed_active_is_refused(q):
+    """The lock is the run's claim and the active list is the queue's: a job taken
+    off that list under a live lock is not this run's to finish, and its finish is
+    refused like a lost lock rather than recorded over whatever moved it."""
+    job = await q.add("x", {})
+    jid = job.id
+    w = Worker(QUEUE, _noop, prefix=PREFIX, connection=q.redis)
+    await _claim(q, jid, w.token)
+    await q.redis.lrem(q.keys.active, 0, jid)
+
+    res = await w._move_to_completed(
+        keys=[
+            q.keys.active,
+            q.keys.completed,
+            q.keys.job(jid),
+            q.keys.lock(jid),
+            q.keys.prioritized,
+            q.keys.marker,
+            q.keys.stalled,
+            q.keys.base,
+            q.keys.pc,
+            q.keys.events,
+            q.keys.meta_paused,
+        ],
+        args=[jid, "{}", _now_ms(), w.token, "0", 30000, -1, -1],
+    )
+    assert res == scripts.NOT_ACTIVE
+    assert await q.redis.zcard(q.keys.completed) == 0
+
+
+async def test_a_job_stalled_out_by_the_sweep_is_announced_to_its_waiters(q, run_until):
+    """The sweeping worker's own events do not reach a result() waiter, so the sweep
+    publishes the failure itself: without it the waiter learns of the job's end from
+    its next re-read of the hash, RESULT_RECHECK_S later."""
+    job = await q.add("x", {"n": 1})
+    jid = job.id
+    w = Worker(QUEUE, _noop, prefix=PREFIX, max_stalled_count=0, connection=q.redis)
+    waiter = asyncio.create_task(q.result(jid, timeout=10))
+    assert await run_until(lambda: jid in q._result_waiters)
+
+    # A worker grabbed it and died: on `active`, no lock. Marked, then stalled out.
+    await q.redis.zrem(q.keys.prioritized, jid)
+    await q.redis.rpush(q.keys.active, jid)
+    await w.check_stalled(throttle_ms=0)
+    failed, _ = await w.check_stalled(throttle_ms=0)
+    assert failed == [jid]
+
+    with pytest.raises(JobFailedError, match="stalled"):
+        await asyncio.wait_for(waiter, 1.0)  # the event, well inside the re-read
