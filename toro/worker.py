@@ -49,6 +49,7 @@ from .connection import (
     pop_timeout,
     read_timeout,
     require_decoded,
+    warn_if_evicting,
 )
 from .job import FINISHED_STATES, Backoff, Job, JobContext
 from .keys import Keys
@@ -335,6 +336,7 @@ class Worker:
         # Before anything is claimed: a worker writes more than a producer does, and
         # must not run a claim loop against a model it cannot read.
         await stamp_data_model(self._stamp, self.keys, self.name)
+        await warn_if_evicting(self.redis)
         self._running = True
         self._cut_off = False
         self._state = "running"  # a worker run again after stop() is no longer draining

@@ -1,6 +1,8 @@
 """Integration: the tuned Redis connection factory used by Queue/Worker."""
 
+import contextlib
 import hashlib
+import logging
 
 import pytest
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -82,3 +84,61 @@ async def test_a_flow_re_sent_after_a_dropped_connection_makes_one_tree(q, drop_
         await proxied.close()
         await conn.aclose()
         proxy.close()
+
+
+# ---- the eviction policy of the Redis behind the queue -----------------------------
+
+
+async def _policy(q: Queue) -> str:
+    return (await q.redis.config_get("maxmemory-policy"))["maxmemory-policy"]
+
+
+@contextlib.asynccontextmanager
+async def _policy_set_to(q: Queue, policy: str):
+    """The dev Redis under this policy for the block, and back after."""
+    original = await _policy(q)
+    await q.redis.config_set("maxmemory-policy", policy)
+    try:
+        yield
+    finally:
+        await q.redis.config_set("maxmemory-policy", original)
+
+
+def _policy_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "maxmemory-policy" in r.getMessage()]
+
+
+async def test_an_evicting_policy_is_warned_about_once_at_the_first_write(q, caplog):
+    """An `allkeys-*` policy evicts queue keys under memory pressure, jobs and all,
+    and nothing can tell an evicted job from one never added. The first write says
+    so, once per connection: a dashboard opening a queue per name over one client
+    is told once, not per queue."""
+    async with _policy_set_to(q, "allkeys-lru"):
+        with caplog.at_level(logging.WARNING, logger="toro"):
+            await q.add("x", {})
+            await q.add("y", {})
+            another = Queue(q.name, prefix=PREFIX, connection=q.redis)
+            await another.add("z", {})
+    warned = _policy_warnings(caplog)
+    assert len(warned) == 1, warned
+    assert "allkeys-lru" in warned[0]
+
+
+async def test_a_policy_that_keeps_the_queue_is_not_warned_about(q, caplog):
+    """`noeviction` refuses writes instead, which surfaces as an error, and a
+    `volatile-*` policy touches only keys with a TTL, which a job hash never has."""
+    async with _policy_set_to(q, "volatile-lru"):
+        with caplog.at_level(logging.WARNING, logger="toro"):
+            await q.add("x", {})
+    assert _policy_warnings(caplog) == []
+
+
+async def test_a_worker_warns_at_start_on_a_connection_of_its_own(q, caplog, run_worker, run_until):
+    """A worker process never writes through a Queue, so it checks at its own start."""
+    async with _policy_set_to(q, "allkeys-random"):
+        with caplog.at_level(logging.WARNING, logger="toro"):
+            async with run_worker(q, lambda job: None):
+                assert await run_until(lambda: bool(_policy_warnings(caplog)))
+    warned = _policy_warnings(caplog)
+    assert len(warned) == 1, warned
+    assert "allkeys-random" in warned[0]
