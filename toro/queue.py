@@ -252,6 +252,7 @@ class Queue:
         self._events_pubsub: PubSub | None = None
         self._events_task: asyncio.Task[None] | None = None
         self._dispatcher_lock = asyncio.Lock()
+        self._closed = False
 
     def _custom_job_id(self, job_id: object) -> str:
         """Validate a custom job id: it becomes the job's Redis key, `<base><id>`."""
@@ -617,6 +618,8 @@ class Queue:
         """
         job_id = str(job_id)
         await self._ensure_dispatcher()
+        if self._closed:  # closed while the listener above was starting
+            raise RuntimeError("queue closed while waiting for a result")
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._result_waiters.setdefault(job_id, []).append(fut)
         try:
@@ -677,6 +680,8 @@ class Queue:
         if self._events_task is not None and not self._events_task.done():
             return
         async with self._dispatcher_lock:
+            if self._closed:
+                raise RuntimeError("queue closed while waiting for a result")
             if self._events_task is not None and not self._events_task.done():
                 return  # someone else won the race while we awaited the lock
             if self._events_pubsub is not None:  # a crashed listener's leftovers
@@ -1657,19 +1662,24 @@ class Queue:
         return {"global_concurrency": int(cap) or None, "rate_limit": rate}
 
     async def close(self) -> None:
+        self._closed = True
         # Every step in a finally: a pub/sub close that raises would otherwise skip
         # the connection close and leak the pool, which is the one thing this method
         # exists to prevent.
         try:
-            if self._events_task is not None:
-                self._events_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._events_task
-                self._events_task = None
-            if self._events_pubsub is not None:
-                with contextlib.suppress(Exception):
-                    await self._events_pubsub.aclose()
-                self._events_pubsub = None
+            # The first result() starts the listener under the lock, subscribe and
+            # confirm before the task exists. Waiting for the lock ends what a start
+            # in flight creates, instead of leaving it running on a closed queue.
+            async with self._dispatcher_lock:
+                if self._events_task is not None:
+                    self._events_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._events_task
+                    self._events_task = None
+                if self._events_pubsub is not None:
+                    with contextlib.suppress(Exception):
+                        await self._events_pubsub.aclose()
+                    self._events_pubsub = None
             # Fail anyone still awaiting result() fast, rather than leaving them to
             # sit out their timeout against a closed connection.
             for waiters in self._result_waiters.values():
