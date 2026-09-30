@@ -152,7 +152,8 @@ And the scripts themselves:
 | `MOVE_TO_CANCELLED` | worker finish | Commit a job the worker stopped, token-guarded like the other finishes. |
 | `RELEASE_JOB` | worker shutdown | Hand a job cut off by a shutdown back to `prioritized` at once, lock dropped, nothing counted; token-guarded. |
 | `MOVE_STALLED` | sweep | Mark-and-sweep recovery of jobs whose lock expired. |
-| `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent). |
+| `ADD_SCHEDULED` | scheduler | Enqueue a scheduler occurrence under a deterministic id (idempotent), only while the schedule still points at that slot. |
+| `REMOVE_SCHEDULER` | producer/dashboard | Unregister a schedule and drop its template in one step, returning the slot it pointed at so its pending occurrence can go. |
 | `UPDATE_PROGRESS` | processor (`job.update_progress`) | Write progress and publish the `progress` event, only while the job hash exists: a removed job's cleanup cannot recreate it as a stub. |
 | `APPEND_LOG` | processor (`job.log`) | Append a log line, only while the job hash exists, for the same reason. |
 | `STAMP_MODEL` | queue/worker | Stamp the queue's data-model version on first use and return the version it holds, so a newer model is refused. |

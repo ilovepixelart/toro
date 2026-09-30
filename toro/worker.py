@@ -1098,7 +1098,7 @@ class Worker:
         if not moved:
             return
         await self._add_scheduled(
-            keys=[self.keys.delayed, self.keys.base],
+            keys=[self.keys.delayed, self.keys.base, self.keys.repeat],
             args=scripts.scheduled_args(
                 occurrence_id=f"repeat:{scheduler_id}:{when}",
                 template=template,

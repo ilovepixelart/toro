@@ -382,3 +382,36 @@ async def test_a_scheduler_name_is_validated_like_a_job_name(q):
         await q.add_scheduler("nightly", every=3_600_000, name="x" * 129)
     with pytest.raises(ValueError, match="job name"):
         await q.add_scheduler("nightly", every=3_600_000, name="tab\there")
+
+
+async def test_removing_a_schedule_between_the_move_and_the_enqueue_leaves_nothing(
+    q, run_worker, run_until
+):
+    """The other gap of the mint above: the schedule has moved to its next slot and
+    the occurrence is not enqueued yet. remove_scheduler() landing there read the new
+    slot, found no occurrence at it and removed nothing, so the occurrence enqueued
+    right after ran once more with no schedule behind it."""
+    minting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def proc(job):
+        pass
+
+    async with run_worker(q, proc) as worker:
+        add_occurrence = worker._add_scheduled
+
+        async def held(**kw):
+            minting.set()
+            await release.wait()  # remove_scheduler() lands between the two writes
+            return await add_occurrence(**kw)
+
+        worker._add_scheduled = held
+        await q.add_scheduler("tick", every=1000)
+        await asyncio.wait_for(minting.wait(), 5)
+
+        await q.remove_scheduler("tick")
+        release.set()
+        assert await run_until(lambda: not worker._current, timeout=5.0)
+
+        assert await q.schedulers() == []
+        assert await q.redis.zcard(q.keys.delayed) == 0
