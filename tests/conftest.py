@@ -88,7 +88,16 @@ async def _clear(queue: Queue) -> None:
 
 # ---- the queue's global invariants, held by every state a test leaves behind ------
 
-_STATE_SETS = ("prioritized", "active", "delayed", "completed", "failed", "waiting_children")
+_STATE_SETS = (
+    "prioritized",
+    "active",
+    "delayed",
+    "held",
+    "completed",
+    "failed",
+    "cancelled",
+    "waiting_children",
+)
 # counts() key -> the keys.py property backing it. They line up one-to-one except
 # `wait`: the waiting set is the priority-ordered zset, so its key is `prioritized`
 # (the state is named for what it means; the key for what it is).
@@ -96,27 +105,42 @@ _COUNT_TO_SET = {
     "wait": "prioritized",
     "active": "active",
     "delayed": "delayed",
+    "held": "held",
     "completed": "completed",
     "failed": "failed",
+    "cancelled": "cancelled",
     "waiting-children": "waiting_children",
 }
 
 
 async def snapshot_members(queue: Queue) -> dict[str, set[str]]:
-    """Current id membership of every state set (active is a LIST, rest ZSETs)."""
-    out: dict[str, set[str]] = {}
+    """Current id membership of every state set (active is a LIST, rest ZSETs).
+
+    One MULTI/EXEC, so the snapshot is an instant: read set by set under a live
+    worker, a job moving between two reads shows up in both, or in neither.
+    """
+    pipe = queue.redis.pipeline(transaction=True)
     for name in _STATE_SETS:
         key = getattr(queue.keys, name)
-        ids = (
-            await queue.redis.lrange(key, 0, -1)
-            if name == "active"
-            else await queue.redis.zrange(key, 0, -1)
-        )
-        out[name] = set(ids)
-    return out
+        if name == "active":
+            pipe.lrange(key, 0, -1)
+        else:
+            pipe.zrange(key, 0, -1)
+    replies = await pipe.execute()
+    return {name: set(ids) for name, ids in zip(_STATE_SETS, replies, strict=True)}
 
 
-async def check_invariants(queue: Queue) -> None:
+async def _still_orphan(queue: Queue, key: str, jid: str) -> bool:
+    """Whether `key` exists while its job hash does not, read as one instant: a job
+    removed between the KEYS scan and this read took both, and is no orphan."""
+    pipe = queue.redis.pipeline(transaction=True)
+    pipe.exists(key)
+    pipe.exists(queue.keys.job(jid))
+    still, hashed = await pipe.execute()
+    return bool(still) and not hashed
+
+
+async def check_invariants(queue: Queue, *, live: bool = False) -> None:
     """Assert what every reachable queue state must satisfy:
 
     1. counts() equals the real set cardinalities.
@@ -124,14 +148,17 @@ async def check_invariants(queue: Queue) -> None:
     3. no orphan aux key (:deps/:results/:cfail/:lock) outlives its job hash.
 
     Read after each step of the random-operation fuzzers (test_invariants.py) and
-    at the teardown of every passing integration test.
+    at the teardown of every passing integration test. `live` is for a queue with
+    workers running (test_live_invariants.py): counts() is a second, separate read
+    that a claim in flight legitimately puts one off, so it is left out there.
     """
     members = await snapshot_members(queue)
 
     # 1. counts() agrees with the real cardinalities
-    counts = await queue.counts()
-    for cname, sname in _COUNT_TO_SET.items():
-        assert counts[cname] == len(members[sname]), f"{cname} count {counts[cname]} != {sname}"
+    if not live:
+        counts = await queue.counts()
+        for cname, sname in _COUNT_TO_SET.items():
+            assert counts[cname] == len(members[sname]), f"{cname} count {counts[cname]} != {sname}"
 
     # 2. no id lives in two state sets at once
     seen: dict[str, str] = {}
@@ -145,7 +172,7 @@ async def check_invariants(queue: Queue) -> None:
     for suffix in (":deps", ":results", ":cfail", ":lock"):
         for key in await queue.redis.keys(f"{base}*{suffix}"):
             jid = key[len(base) : -len(suffix)]
-            assert await queue.redis.exists(queue.keys.job(jid)), f"orphan {suffix} for {jid}"
+            assert not await _still_orphan(queue, key, jid), f"orphan {suffix} for {jid}"
 
 
 @pytest.fixture
