@@ -183,6 +183,7 @@ SETTLED = f"({scripts.LIVE_SCORE}"
 # How often a result() waiter re-reads the job's hash while the event has not come:
 # a pub/sub reconnect loses what was published in the gap (see result()).
 RESULT_RECHECK_S = 5.0
+_QUEUE_CLOSED = "queue closed while waiting for a result"
 
 
 def _interval_ms(every: object) -> int:
@@ -619,7 +620,7 @@ class Queue:
         job_id = str(job_id)
         await self._ensure_dispatcher()
         if self._closed:  # closed while the listener above was starting
-            raise RuntimeError("queue closed while waiting for a result")
+            raise RuntimeError(_QUEUE_CLOSED)
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._result_waiters.setdefault(job_id, []).append(fut)
         try:
@@ -681,7 +682,7 @@ class Queue:
             return
         async with self._dispatcher_lock:
             if self._closed:
-                raise RuntimeError("queue closed while waiting for a result")
+                raise RuntimeError(_QUEUE_CLOSED)
             if self._events_task is not None and not self._events_task.done():
                 return  # someone else won the race while we awaited the lock
             if self._events_pubsub is not None:  # a crashed listener's leftovers
@@ -1685,7 +1686,7 @@ class Queue:
             for waiters in self._result_waiters.values():
                 for fut in waiters:
                     if not fut.done():
-                        fut.set_exception(RuntimeError("queue closed while waiting for a result"))
+                        fut.set_exception(RuntimeError(_QUEUE_CLOSED))
             # A read-back still in flight would use the client after the close below,
             # and redis-py quietly reconnects it: a connection nothing would close.
             # Its waiter already failed above, so there is nothing left to wait for.
