@@ -58,7 +58,9 @@ class _Fleet:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        await w.redis.aclose()
+        # the whole pool, its pub/sub connection included: a dead process takes its
+        # sockets with it, and a client closed alone left the cancel subscription up
+        await w.redis.aclose(close_connection_pool=True)
         self.start()
 
     async def stop(self) -> None:
@@ -233,3 +235,7 @@ async def test_no_job_is_lost_under_live_workers_killed_at_random(
     settled = now["completed"] | now["cancelled"]
     assert expected <= settled, f"lost: {sorted(expected - settled)}"
     assert await q.redis.keys(q.keys.base + "*:lock") == []
+    # a dead process takes its sockets with it and Redis drops their subscriptions:
+    # a killed worker must leave none either, or the next test on the channel inherits
+    # a subscriber it cannot see
+    assert await q.redis.pubsub_numsub(q.keys.cancel) == [(q.keys.cancel, 0)]
