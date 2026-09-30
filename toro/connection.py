@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import weakref
 
 import redis.asyncio as aioredis
 from redis.asyncio.client import PubSub
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
+
+logger = logging.getLogger(__name__)
 
 # How long an idle worker slot blocks on the marker by default. It lives here, not
 # in worker.py, because every connection toro builds is sized for it: a Queue's
@@ -126,3 +131,35 @@ def pop_timeout(read_timeout_s: float | None, block_timeout: float) -> float:
         return block_timeout
     ceiling = max(read_timeout_s - 1.0, read_timeout_s / 2)
     return min(block_timeout, ceiling)
+
+
+# The pools already asked about their eviction policy: once per pool, not per queue,
+# since a dashboard opens a queue per name over one client.
+_policy_checked: weakref.WeakSet[aioredis.ConnectionPool] = weakref.WeakSet()
+
+
+async def warn_if_evicting(client: aioredis.Redis) -> None:
+    """Warn once per connection pool when the server may evict the queue's keys.
+
+    An `allkeys-*` maxmemory-policy drops any key under memory pressure, job hashes
+    included, and nothing here can tell a job evicted from one never added.
+    `noeviction` refuses writes instead, which surfaces as an error, and a
+    `volatile-*` policy touches only keys with a TTL, which a job hash never
+    carries. A server that hides CONFIG (most managed offerings) is left alone.
+    """
+    pool = client.connection_pool
+    if pool in _policy_checked:
+        return
+    _policy_checked.add(pool)
+    try:
+        reply = await client.config_get("maxmemory-policy")
+    except ResponseError:  # CONFIG disabled or renamed: nothing to read
+        return
+    policy = str(reply.get("maxmemory-policy", ""))
+    if policy.startswith("allkeys-"):
+        logger.warning(
+            "Redis maxmemory-policy is %s: under memory pressure it evicts queue keys, "
+            "and an evicted job is a lost job. Give the queue a Redis with "
+            "maxmemory-policy noeviction (or a volatile-* policy).",
+            policy,
+        )

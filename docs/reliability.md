@@ -115,6 +115,13 @@ Two different counters bound two different failure modes:
   renewer and gets treated as dead. See [Processing jobs](processing.md).
 - **Durability is Redis's.** "Never lost" holds to the strength of your Redis
   persistence (AOF/RDB) and failover setup.
+- **Run the queue on a Redis that does not evict.** An `allkeys-*` `maxmemory-policy`
+  drops any key under memory pressure, jobs and all, and nothing can tell an evicted
+  job from one never added. Use `noeviction` (writes fail loudly instead), or a
+  `volatile-*` policy, which touches only keys with a TTL, and a job hash carries
+  none. toro reads the policy once per connection, at a queue's first write and a
+  worker's start, and logs a warning when it finds an `allkeys-*` one; a server that
+  hides `CONFIG`, as most managed offerings do, is left alone.
 
 The key layout behind all of this is in the [data model](data-model.md); the
 scripts that implement it are listed in [Architecture](architecture.md).

@@ -27,6 +27,7 @@ from .connection import (
     pop_timeout,
     read_timeout,
     require_decoded,
+    warn_if_evicting,
 )
 from .errors import IncompatibleDataModelError, JobCancelledError, JobFailedError, PartialFlushError
 from .flow import MAX_FLOW_NODES, FlowChild, FlowView, count_nodes, node_options, to_tree
@@ -477,6 +478,7 @@ class Queue:
         if self._model_checked:
             return
         await stamp_data_model(self._stamp, self.keys, self.name)
+        await warn_if_evicting(self.redis)
         self._model_checked = True
 
     def pending(self) -> PendingJobs:
