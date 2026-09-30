@@ -11,7 +11,7 @@ import pytest
 
 from toro import FlowChild as c  # noqa: N813
 from toro import Queue, Worker
-from toro.job import Job
+from toro.job import Job, JobContext
 
 PREFIX = "torotest"
 
@@ -353,3 +353,32 @@ async def _gone_for(q, job_id: str, seconds: float) -> bool:
     """True once the job's hash has stayed absent for `seconds`."""
     await asyncio.sleep(seconds)  # the late failure lands inside this window
     return await q.redis.exists(q.keys.job(job_id)) == 0
+
+
+async def test_progress_and_logs_never_land_on_a_scheduler_template(q):
+    """The guarded writes told a job from the queue's own keys by its options field,
+    which a scheduler's template carries too: pointed at one, a progress report was
+    written onto the template and a log line beside it. No processor receives a
+    template's id today; the rule the other scripts read by (a job hash is one stamped
+    at its add) now holds for every write, whatever entry point comes later."""
+    await q.add_scheduler("nightly", every=3_600_000)
+    worker = Worker(q.name, lambda job: None, prefix=PREFIX, connection=q.redis)
+    tid = "repeat:nightly"  # the template's key is where a job of that id would live
+    job = Job(id=tid, name="nightly", data={})
+    job._ctx = JobContext(
+        redis=q.redis,
+        job_key=q.keys.job(tid),
+        events_key=q.keys.events,
+        logs_key=q.keys.logs(tid),
+        job_id=tid,
+        results_key=q.keys.results(tid),
+        cfail_key=q.keys.cfail(tid),
+        ccancel_key=q.keys.ccancel(tid),
+        update_progress=worker._update_progress,
+        append_log=worker._append_log,
+    )
+    await job.update_progress(50)
+    await job.log("a line")
+
+    assert await q.redis.hget(q.keys.scheduler("nightly"), "progress") is None
+    assert await q.redis.exists(q.keys.logs(tid)) == 0

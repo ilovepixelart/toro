@@ -1074,9 +1074,11 @@ return {outcome}
 # Report a running job's progress. Guarded: a removed job's processor may still run
 # its cleanup, and a blind HSET recreated the hash as a stub with no state, which no
 # listing shows, nothing can remove, and whose custom id then refuses every add().
+# A job hash is one stamped at its add, as REMOVE_JOB and get_job() read it: a
+# scheduler's template carries options too and is not one.
 # KEYS[1] job hash  KEYS[2] events channel  ARGV[1] progress (json)  ARGV[2] the event
 UPDATE_PROGRESS = """
-if redis.call("HEXISTS", KEYS[1], "opts") == 0 then return 0 end
+if redis.call("HEXISTS", KEYS[1], "timestamp") == 0 then return 0 end
 redis.call("HSET", KEYS[1], "progress", ARGV[1])
 redis.call("PUBLISH", KEYS[2], ARGV[2])
 return 1
@@ -1085,7 +1087,7 @@ return 1
 # Append a log line to a job that still exists, for the same reason.
 # KEYS[1] job hash  KEYS[2] logs list  ARGV[1] the line
 APPEND_LOG = """
-if redis.call("HEXISTS", KEYS[1], "opts") == 0 then return 0 end
+if redis.call("HEXISTS", KEYS[1], "timestamp") == 0 then return 0 end
 return redis.call("RPUSH", KEYS[2], ARGV[1])
 """
 
