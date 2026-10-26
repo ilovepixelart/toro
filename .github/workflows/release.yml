@@ -68,4 +68,4 @@ jobs:
         # It stays for what it does that `uv publish` does not: it generates the
         # PEP 740 attestations that every file of this package currently carries.
         # A release tag is therefore the strongest pin available for it.
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v1.14.3
