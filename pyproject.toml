@@ -45,7 +45,7 @@ build-backend = "hatchling.build"
 # gets, and it is published forever. It carries the package, its tests, its docs and
 # its benchmarks - enough to build it and check it. It does not carry how this
 # repository is worked on.
-exclude = [".github", ".vscode", ".pre-commit-config.yaml", "site"]
+exclude = [".claude", ".github", ".vscode", ".pre-commit-config.yaml", "site"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["toro"]
@@ -113,6 +113,8 @@ convention = "pep257"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Each test gets its own event loop, which is pytest-asyncio's documented default.
+asyncio_default_fixture_loop_scope = "function"
 # The test pyramid, by marker. Run a layer with `pytest -m unit` (fast, no Redis),
 # `-m integration` (needs Redis), or `-m load` (slow). conftest auto-marks by folder.
 addopts = "--strict-markers --import-mode=importlib -m 'not perf' -p pytester"
