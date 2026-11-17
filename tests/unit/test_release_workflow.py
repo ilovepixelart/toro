@@ -142,3 +142,30 @@ def test_a_pinned_commit_still_says_which_release_it_is(workflow: pathlib.Path):
         if re.search(r"uses:\s*\S+@[0-9a-f]{40}\s*$", line)
     ]
     assert bare == [], f"say which release these are, as `# vX.Y.Z`: {bare}"
+
+
+CI = next(w for w in WORKFLOWS if w.name == "pr-check.yaml")
+PYPROJECT = WORKFLOWS[0].parents[2] / "pyproject.toml"
+
+
+def test_the_ci_job_fails_unless_every_other_job_succeeded():
+    """The branch rules require only `CI`, so a job left out of its `needs` can fail
+    without blocking a merge."""
+    jobs = _jobs(CI)
+    needs = re.search(r"needs: \[(.*)\]", jobs["ci"])
+    assert needs, "the CI job needs nothing"
+    assert sorted(n.strip() for n in needs.group(1).split(",")) == sorted(set(jobs) - {"ci"})
+    assert "if: always()" in jobs["ci"], "CI is skipped, not failed, when a job fails"
+
+
+def test_ci_runs_every_python_the_package_claims():
+    """From the `requires-python` floor to the newest classifier, each one tested."""
+    text = PYPROJECT.read_text()
+    floor = re.search(r'requires-python = ">=(3\.\d+)"', text)
+    claimed = re.findall(r'"Programming Language :: Python :: (3\.\d+)"', text)
+    matrix = re.search(r"python-version: \[(.*)\]", CI.read_text())
+    assert floor, "requires-python has no floor"
+    assert matrix, "the CI matrix lists no Python versions"
+    tested = [v.strip().strip('"') for v in matrix.group(1).split(",")]
+    assert tested == claimed
+    assert tested[0] == floor.group(1)

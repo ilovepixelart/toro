@@ -171,7 +171,8 @@ def test_ci_runs_the_suite_on_the_redis_version_the_docs_name_as_the_floor():
     site = (ROOT / "site" / "web" / "templates" / "index.html").read_text()
     assert f"('Redis', '{floor['v']} and later')" in site
     workflow = (ROOT / ".github" / "workflows" / "pr-check.yaml").read_text()
-    assert f"image: redis:{floor['v']}-alpine" in workflow
+    # a patch release of the floor, pinned so the image cannot move under the job
+    assert re.search(rf"image: redis:{re.escape(floor['v'])}\.\d+-alpine\n", workflow)
 
 
 def test_ci_runs_the_suite_on_the_redis_py_floor_pyproject_declares():
