@@ -35,12 +35,12 @@ def valid_cron(cron: str) -> bool:
 
 def next_run(now_ms: int, *, every: int | None = None, cron: str | None = None) -> int:
     """Next occurrence (epoch ms) strictly after now_ms."""
-    if every:
+    if every is not None and every != 0:
         every = int(every)
         # Align to the interval grid so successive runs don't drift, and a late
         # tick catches up to the next slot instead of firing a backlog.
         return (now_ms // every + 1) * every
-    if cron:
+    if cron is not None and cron != "":
         try:
             # croniter is an optional dep, imported lazily.
             from croniter import croniter  # noqa: PLC0415

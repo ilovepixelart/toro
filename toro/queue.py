@@ -72,7 +72,7 @@ def _writes(method: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Corou
         await cast("Queue", args[0])._stamp_model()  # noqa: SLF001 - its own method
         return await method(*args, **kwargs)
 
-    guarded.__toro_writes__ = True  # ty: ignore[unresolved-attribute]
+    guarded.__toro_writes__ = True  # ty: ignore[missing-attribute]
     return guarded
 
 
@@ -275,7 +275,7 @@ class Queue:
                 f"{MAX_JOB_ID_CHARS} characters: it is a path segment wherever it is shown"
             )
         conflict = self.keys.job_id_conflict(job_id)
-        if conflict:
+        if conflict is not None:
             # the job's hash would BE that key: a queue broken with WRONGTYPE, or an
             # add() that finds the key and returns as if the job already existed
             raise ValueError(
@@ -519,7 +519,7 @@ class Queue:
             nodes[jid] = {"job": Job.from_hash(jid, h), "children": []}
             if (pid := parent_of.get(jid)) is not None:
                 nodes[pid]["children"].append(nodes[jid])
-            for cid in json.loads(h["children"]) if h.get("children") else []:
+            for cid in json.loads(h["children"]) if h.get("children", "") != "" else []:
                 parent_of[cid] = jid
                 next_level.append(cid)
         return next_level
@@ -827,7 +827,7 @@ class Queue:
         opts = self._job_options(merged).to_dict()
         template = {
             "name": name or scheduler_id,
-            "every": str(every) if every else "",
+            "every": str(every) if every is not None else "",
             "cron": cron or "",
             "data": json.dumps(data),
             "opts": json.dumps(opts),
@@ -928,7 +928,7 @@ class Queue:
                     "id": sid,
                     "name": t.get("name", sid),
                     "next": int(when),
-                    "every": int(t["every"]) if t.get("every") else None,
+                    "every": int(t["every"]) if t.get("every", "") != "" else None,
                     "cron": t.get("cron") or None,
                 }
             )
@@ -1136,12 +1136,12 @@ class Queue:
         since, ts, opts = await self.redis.hmget(
             self.keys.job(head[0]), "enqueuedOn", "timestamp", "opts"
         )
-        if not ts:  # the head job was removed between the two reads
+        if ts is None or len(ts) == 0:  # the head job was removed between the two reads
             return 0
-        if since:
+        if since is not None and len(since) > 0:
             return max(0, _now_ms() - int(since))
         # a job enqueued before 1.1.0 stamped it: the add and the delay it was given
-        delay = (json.loads(opts).get("delay") or 0) if opts else 0
+        delay = (json.loads(opts).get("delay") or 0) if opts is not None and len(opts) > 0 else 0
         return max(0, _now_ms() - int(ts) - int(delay))
 
     async def workers(self, *, stale_after: int = 30_000) -> list[dict[str, Any]]:
@@ -1303,7 +1303,9 @@ class Queue:
         """
         if state == "active":
             ids = _str_list(await self.redis.lrange(self.keys.active, 0, -1))
-            roots = [j for j in await self._hydrate_ids(ids) if not j.parent_id]
+            roots = [
+                j for j in await self._hydrate_ids(ids) if j.parent_id is None or j.parent_id == ""
+            ]
             stop = None if end < 0 else end + 1
             return len(roots), roots[start:stop]
         zset, newest = self._roots_zset(state)
@@ -1382,7 +1384,8 @@ class Queue:
         plain job. Pass a leaf child id to retry just that one job.
         """
         job = await self.get_job(job_id)
-        if job is not None and job.children_ids:  # a flow parent: recover the subtree
+        # a flow parent: recover the subtree
+        if job is not None and job.children_ids is not None and len(job.children_ids) > 0:
             return await self.retry_flow(job_id) > 0
         res = await self._retry_job(keys=self._retry_job_keys(job_id), args=[job_id, _now_ms()])
         return bool(res)

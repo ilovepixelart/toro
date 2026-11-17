@@ -25,7 +25,10 @@ class JobCancelledError(ToroError):
     """
 
     def __init__(self, job_id: str, reason: str | None = None) -> None:
-        super().__init__(f"job {job_id} was cancelled" + (f": {reason}" if reason else ""))
+        super().__init__(
+            f"job {job_id} was cancelled"
+            + (f": {reason}" if reason is not None and reason != "" else "")
+        )
         self.job_id = job_id
         self.reason = reason
 
