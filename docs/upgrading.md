@@ -2,6 +2,31 @@
 
 Breaking changes by release, newest first, each with what to do about it.
 
+## 1.1.1
+
+Nothing breaks. Two fixes and a warning.
+
+**A removed schedule no longer runs once more.** A worker mints the next occurrence in
+two writes: it moves the schedule to its next slot, then enqueues that slot's job. A
+`remove_scheduler()` landing between the two found no job at the new slot yet and
+dropped nothing, so the one enqueued right after ran with no schedule behind it. The
+enqueue now happens only while the schedule still points at that slot, and the
+removal is one script, so either order leaves no occurrence behind.
+
+**`close()` ends a listener a concurrent `result()` was starting.** The first
+`result()` starts the events listener in a subscribe round trip; a `close()` landing
+inside it found nothing to end, and the listener then started on a closed queue: a task
+and a pub/sub connection nothing would close, and a waiter that sat out its timeout.
+`close()` now waits for that start and ends what it began, and `result()` on a closed
+queue raises `RuntimeError("queue closed while waiting for a result")`.
+
+**A queue whose Redis may evict its keys says so.** Under an `allkeys-*`
+`maxmemory-policy` Redis drops any key under memory pressure, job hashes included, and
+a job evicted that way cannot be told from one never added. A queue's first write and a
+worker's start now read the policy once per connection pool and log a warning naming
+it. `noeviction` and the `volatile-*` policies pass; a server that hides `CONFIG`, as
+most managed offerings do, is left alone.
+
 ## 1.1.0
 
 Five things change for a caller, and two for a rolling upgrade. The rest are fixes.
