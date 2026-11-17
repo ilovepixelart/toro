@@ -150,7 +150,9 @@ jobs:
 
       - name: Install the redis-py floor
         if: matrix.redis_py != ''
-        run: uv pip install "redis==${{ matrix.redis_py }}"
+        env:
+          REDIS_PY: ${{ matrix.redis_py }}
+        run: uv pip install "redis==$REDIS_PY"
 
       - name: Tests (unit + integration)
         run: uv run --no-sync pytest -m "unit or integration"
