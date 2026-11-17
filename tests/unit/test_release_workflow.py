@@ -7,8 +7,11 @@ twine rejects the metadata version `uv build` writes). Both failed in CI after a
 green build, which is the most expensive place to find out.
 """
 
+import os
 import pathlib
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -16,6 +19,7 @@ WORKFLOWS = sorted(
     (pathlib.Path(__file__).resolve().parents[2] / ".github/workflows").glob("*.y*ml")
 )
 WORKFLOW = next(w for w in WORKFLOWS if w.name == "release.yml")
+TAG_CHECK = WORKFLOW.parent.parent / "scripts" / "check-release-tag.sh"
 # The one action that cannot be pinned to a commit. It is a composite action that
 # generates a Docker action at run time, and `create-docker-action.py` builds the
 # image reference as `ghcr.io/<repo>:<the ref you called it with>`. No image is
@@ -40,17 +44,98 @@ def test_the_publish_action_is_pinned_to_a_release():
     )
 
 
-def test_the_build_refuses_a_tag_that_does_not_match_what_it_built():
+def _check_tag(tmp_path: pathlib.Path, ref: str, wheel: str | None) -> subprocess.CompletedProcess:
+    """Run the build job's tag check against a dist/ holding `wheel`."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    if wheel:
+        (dist / wheel).write_bytes(b"")
+    sh = shutil.which("sh")
+    assert sh, "no sh on PATH"
+    # the command is a resolved executable and the repo's own script
+    return subprocess.run(  # noqa: S603
+        [sh, str(TAG_CHECK)],
+        cwd=tmp_path,
+        env=os.environ | {"REF": ref},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_the_build_refuses_a_tag_that_does_not_match_what_it_built(tmp_path):
     """The tag starts the release and the manifest supplies the version, and nothing
     made them agree. Tagging `v1.0.3` while the manifest still says 1.0.2 publishes
     1.0.2 under a 1.0.3 tag, and a PyPI upload cannot be taken back: the wrong file
-    is the release from then on. The build job compares the two before anything is
-    uploaded, so a mismatch fails while it is still free to fail.
+    is the release from then on.
     """
+    result = _check_tag(tmp_path, "refs/tags/v1.0.3", "toro_queue-1.0.2-py3-none-any.whl")
+    assert result.returncode == 1
+    assert "tag v1.0.3 does not match the built version 1.0.2" in result.stderr
+
+
+def test_the_build_accepts_the_tag_of_the_version_it_built(tmp_path):
+    result = _check_tag(tmp_path, "refs/tags/v1.0.3", "toro_queue-1.0.3-py3-none-any.whl")
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_build_refuses_a_run_from_a_branch(tmp_path):
+    """A manual run from a branch has no tag to compare with; the check used to be
+    skipped for it while the publish job still ran."""
+    result = _check_tag(tmp_path, "refs/heads/main", "toro_queue-1.0.3-py3-none-any.whl")
+    assert result.returncode == 1
+    assert "a release runs from a v* tag, not refs/heads/main" in result.stderr
+
+
+def test_the_build_refuses_when_nothing_was_built(tmp_path):
+    result = _check_tag(tmp_path, "refs/tags/v1.0.3", None)
+    assert result.returncode == 1
+    assert "no wheel in dist/" in result.stderr
+
+
+def test_the_tag_check_runs_on_every_release_before_publishing():
+    """The check is in the build job, which the publish job needs, and nothing in
+    the build job is conditional: a skipped check publishes whatever was built."""
+    build = _jobs(WORKFLOW)["build"]
+    assert TAG_CHECK.name in build, "the build job no longer checks the tag"
+    assert "if:" not in build, "a step of the build job can be skipped"
+
+
+def test_a_release_in_progress_is_never_cancelled():
     text = WORKFLOW.read_text()
-    assert "github.ref_name" in text, "nothing in the release reads the tag it was given"
-    build = text.split("publish:")[0]
-    assert "github.ref_name" in build, "the tag is checked after the build, not before"
+    assert "concurrency:" in text
+    assert "cancel-in-progress: false" in text
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_a_job_holding_an_oidc_token_restores_no_cache(workflow: pathlib.Path):
+    """A cache is writable by any workflow run on the repository, so whatever a job
+    holding id-token restores from one runs with that token."""
+    for name, body in _jobs(workflow).items():
+        if "id-token: write" not in body:
+            continue
+        assert "actions/cache" not in body, f"{workflow.name}: {name} restores a cache"
+        if "astral-sh/setup-uv@" in body:
+            assert "enable-cache: false" in body, f"{workflow.name}: {name} caches uv"
+
+
+def test_the_github_release_carries_the_files_and_their_provenance():
+    """The wheel and sdist go on the GitHub release with the build provenance that
+    actions/attest signed for them, as a Sigstore bundle and as in-toto JSON Lines."""
+    jobs = _jobs(WORKFLOW)
+    assert "actions/attest@" in jobs["build"]
+    assert ".sigstore.json" in jobs["build"]
+    assert ".intoto.jsonl" in jobs["build"]
+    release = jobs["github-release"]
+    assert "gh release create" in release
+    for files in ("dist/*.whl", "dist/*.tar.gz", "provenance/*"):
+        assert files in release
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda w: w.name)
+def test_only_the_release_job_can_write_to_the_repository(workflow: pathlib.Path):
+    writers = [name for name, body in _jobs(workflow).items() if "contents: write" in body]
+    assert writers == (["github-release"] if workflow == WORKFLOW else [])
 
 
 def test_the_workflows_are_linted_by_something():
