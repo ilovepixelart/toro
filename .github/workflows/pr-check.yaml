@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - feature*
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -33,12 +32,12 @@ jobs:
       fail-fast: false
       matrix:
         # Everything the classifiers claim to support.
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     permissions:
       contents: read
     services:
       redis:
-        image: redis:7-alpine
+        image: redis:7.4.12-alpine
         ports:
           - 6379:6379
         options: >-
@@ -118,10 +117,10 @@ jobs:
       matrix:
         include:
           - floor: Redis 6.2
-            image: redis:6.2-alpine
+            image: redis:6.2.24-alpine
             redis_py: ""
           - floor: redis-py 5.0.1
-            image: redis:7-alpine
+            image: redis:7.4.12-alpine
             redis_py: "5.0.1"
     permissions:
       contents: read
@@ -151,7 +150,29 @@ jobs:
 
       - name: Install the redis-py floor
         if: matrix.redis_py != ''
-        run: uv pip install "redis==${{ matrix.redis_py }}"
+        env:
+          REDIS_PY: ${{ matrix.redis_py }}
+        run: uv pip install "redis==$REDIS_PY"
 
       - name: Tests (unit + integration)
         run: uv run --no-sync pytest -m "unit or integration"
+
+  # The one check the branch rules require: it fails unless every job above
+  # succeeded, so adding or renaming a job never needs a ruleset change.
+  ci:
+    name: CI
+    needs: [check, floors]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if ! printf '%s' "$RESULTS" | jq -e 'all(.[]; . == "success")' > /dev/null; then
+            echo "a required job did not succeed" >&2
+            exit 1
+          fi
