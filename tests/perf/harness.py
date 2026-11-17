@@ -9,6 +9,7 @@ them pay:
 
 Run it:
 
+    export REDIS_URL=redis://localhost:6391             # a Redis you own
     uv run python tests/perf/harness.py                 # the whole matrix
     uv run python tests/perf/harness.py --check         # against the baselines
     uv run python tests/perf/harness.py --write         # record new baselines
@@ -26,6 +27,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -35,7 +37,8 @@ from redis.asyncio import Redis
 
 from toro import Queue, Worker
 
-URL = "redis://localhost:6379"
+# No default: port 6379 on a developer machine may be another project's Redis.
+URL = os.environ.get("REDIS_URL", "")
 PREFIX = "perf"
 BASELINES = pathlib.Path(__file__).with_name("baselines.json")
 # Enough that startup is not the measurement, small enough to run in a break.
@@ -236,6 +239,8 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="compare against the baselines")
     parser.add_argument("--write", action="store_true", help="record these as the baselines")
     args = parser.parse_args()
+    if not URL:
+        parser.error("set REDIS_URL to a Redis you own, e.g. redis://localhost:6391")
 
     results = matrix()
     _report(results)

@@ -72,7 +72,7 @@ async def test_stop_before_run_starts_ends_it(q):
 
 
 @pytest.mark.parametrize("own_pool", [True, False], ids=["own-pool", "caller-pool"])
-async def test_stop_while_run_is_starting_ends_it(q, monkeypatch, own_pool):
+async def test_stop_while_run_is_starting_ends_it(q, monkeypatch, own_pool, redis_url):
     """A shutdown hook can fire while run() is still in its first round trips. stop()
     then found nothing to cancel and finished its cleanup, and run() carried on: the
     stopped worker registered itself again, subscribed, and claimed jobs for good."""
@@ -84,7 +84,7 @@ async def test_stop_while_run_is_starting_ends_it(q, monkeypatch, own_pool):
         return await real_stamp(*args, **kwargs)
 
     monkeypatch.setattr(worker_module, "stamp_data_model", held_stamp)
-    conn = None if own_pool else connect("redis://localhost:6379")
+    conn = None if own_pool else connect(redis_url)
     processed: list[str] = []
     w = Worker(
         q.name,

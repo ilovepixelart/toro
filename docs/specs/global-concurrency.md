@@ -102,8 +102,8 @@ worker crash.
 - **False stalls.** The cap bounds claimed jobs. A job reclaimed after a false
   stall can run twice, exactly as it can today, which briefly exceeds the cap
   in real work while `active` stays within it.
-- **Silent skips.** Integration tests skip when no Redis answers on
-  `localhost:6379`. Every check above must run against a live Redis and the run
+- **Silent skips.** Integration tests skip when `REDIS_URL` is unset or no Redis
+  answers on it. Every check above must run against a live Redis and the run
   must show zero skips.
 
 ## Decisions

@@ -132,7 +132,7 @@ uv sync                          # venv + deps + dev group
 uv run ruff check .              # lint  (strict: select = ALL)
 uv run ruff format .             # format
 uv run ty check                  # type check
-uv run pytest -m "unit or integration"   # tests (integration needs Redis on :6379)
+REDIS_URL=redis://localhost:6391 uv run pytest -m "unit or integration"   # integration needs a Redis you own
 uv run python examples/basic.py
 ```
 

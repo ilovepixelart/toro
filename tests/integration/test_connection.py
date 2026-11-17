@@ -13,8 +13,8 @@ from toro.connection import connect
 PREFIX = "torotest"
 
 
-async def test_connect_pings_and_applies_tuning():
-    r = connect("redis://localhost:6379")
+async def test_connect_pings_and_applies_tuning(redis_url):
+    r = connect(redis_url)
     try:
         assert await r.ping() is True
         kw = r.connection_pool.connection_kwargs

@@ -75,7 +75,7 @@ async def _ping_sampler(url: str, stop: asyncio.Event) -> list[float]:
     return stalls
 
 
-async def test_a_claim_promotes_due_jobs_in_bounded_chunks(q, load_scale):
+async def test_a_claim_promotes_due_jobs_in_bounded_chunks(q, load_scale, redis_url):
     print("\n--- claim-path promotion, chunked drain (must not block Redis) ---")
     w = Worker(q.name, _noop, prefix=PREFIX, connection=q.redis)
     for m in (int(10_000 * load_scale), int(50_000 * load_scale)):
@@ -83,7 +83,7 @@ async def test_a_claim_promotes_due_jobs_in_bounded_chunks(q, load_scale):
         await _seed_delayed_due(q, m)
 
         stop = asyncio.Event()
-        sampler = asyncio.create_task(_ping_sampler("redis://localhost:6379", stop))
+        sampler = asyncio.create_task(_ping_sampler(redis_url, stop))
         await asyncio.sleep(0.05)  # let the sampler establish a baseline
         per_call: list[float] = []
         while await q.redis.zcard(q.keys.delayed):

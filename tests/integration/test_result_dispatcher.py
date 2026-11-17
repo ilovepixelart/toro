@@ -19,14 +19,14 @@ PREFIX = "torotest"
 
 
 async def test_a_waiter_outlives_channel_silence_longer_than_the_read_timeout(
-    q, run_worker, run_until
+    q, run_worker, run_until, redis_url
 ):
     """The events subscription read with no timeout, and on the declared redis-py
     floor (5.0.1) a read with none falls back to the connection's socket timeout:
     after that much silence on the channel the read raised, the dispatcher died
     and failed every waiter with a Redis TimeoutError, well inside the waiter's
     own timeout. The read is bounded under the socket timeout and loops."""
-    conn = aioredis.from_url("redis://localhost:6379", socket_timeout=0.5, decode_responses=True)
+    conn = aioredis.from_url(redis_url, socket_timeout=0.5, decode_responses=True)
     producer = Queue(q.name, prefix=PREFIX, connection=conn)
     started = asyncio.Event()
 

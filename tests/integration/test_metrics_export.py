@@ -101,13 +101,13 @@ async def test_a_leftover_job_on_the_counters_key_cannot_break_a_scrape(q):
     assert await q.metrics_text()  # and the exposition still renders
 
 
-async def test_the_counters_cost_three_commands_a_job(q, run_worker, run_until):
+async def test_the_counters_cost_three_commands_a_job(q, run_worker, run_until, redis_url):
     """OP-010: one write when a job is added, two when it finishes (its outcome and
     its duration). Counted on the wire rather than reasoned about, and pinned here so
     a fourth write cannot appear unnoticed. All three run inside scripts that already
     run, which is why they cost no round trip."""
     seen: list[str] = []
-    watcher = Redis.from_url("redis://localhost:6379", decode_responses=True)
+    watcher = Redis.from_url(redis_url, decode_responses=True)
     ready = asyncio.Event()
 
     async def watch() -> None:
