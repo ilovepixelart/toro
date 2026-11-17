@@ -122,7 +122,7 @@ def _now_ms() -> int:
 
 def _pairs(flat: list[str] | None) -> dict[str, str]:
     """Turn a flat HGETALL array [k, v, k, v, ...] into a dict."""
-    if not flat:
+    if flat is None:
         return {}
     it = iter(flat)
     return dict(zip(it, it, strict=False))
@@ -153,7 +153,7 @@ def compute_backoff(
     share of the delay at random, so jobs that failed together do not retry together.
     Pure function so it can be unit-tested without a Redis-bound Worker.
     """
-    if not backoff:
+    if backoff is None:
         return 0
     if isinstance(backoff, (int, float)):
         return int(backoff)
@@ -163,10 +163,10 @@ def compute_backoff(
         # the cap, which is applied after, so the exponent stops there.
         delay *= 2 ** min(attempts_made - 1, 62)
     cap = backoff.get("max")
-    if cap:
+    if cap is not None and cap != 0:
         delay = min(delay, float(cap))
     jitter = backoff.get("jitter")
-    if jitter:
+    if jitter is not None and jitter != 0:
         delay *= 1 + jitter * rand()
     return int(delay)
 
@@ -570,7 +570,7 @@ class Worker:
                 woke = await self.redis.bzpopmin(self.keys.marker, timeout)
                 self._loop_recovered("a claim")
                 pause = 0.1
-                if woke and not self._running:
+                if woke is not None and not self._running:
                     # Shutting down - don't claim a new job. A marker we popped was
                     # a wake for a worker that still can, so hand it on: swallowed,
                     # the work it signalled waits out someone's block_timeout.
@@ -664,7 +664,7 @@ class Worker:
         after the job has been taken.
         """
         self._due_ms = None
-        if not res:
+        if res is None or len(res) == 0:
             return None
         if res[0] == scripts.DUE_SENTINEL:
             self._due_ms = int(float(res[1]))
@@ -679,7 +679,7 @@ class Worker:
     ) -> tuple[str, dict[str, str]] | None:
         job_id, fields = loaded
         job = Job.from_hash(job_id, fields)
-        if fields.get("cancel"):
+        if fields.get("cancel", "") != "":
             # Claimed with a cancellation already pending: the stalled sweep re-queues
             # a job whose worker died, flag and all. Running it from the top only to
             # stop it at the first renewal repeats whatever the processor does before
@@ -703,7 +703,7 @@ class Worker:
         # stays on time regardless of how long (or whether) this run succeeds. Any
         # attempt may do it (see _schedule_next): a first attempt that died before
         # minting leaves it to the run that recovers it.
-        if fields.get("schedulerId"):
+        if fields.get("schedulerId", "") != "":
             await self._schedule_next(fields["schedulerId"], job_id)
         renewer = asyncio.create_task(self._renew_loop(job_id)) if self.renew_locks else None
         self._current.add(job_id)  # so the heartbeat reports what we're running
@@ -792,7 +792,7 @@ class Worker:
         """
         expired = [False]
         timeout = job.opts.timeout if self._async_processor else None
-        if not timeout:
+        if timeout is None or timeout == 0:
             return None, expired
 
         def expire() -> None:
@@ -1089,7 +1089,7 @@ class Worker:
         slot = int(occurrence_id.rsplit(":", 1)[1])
         if int(scheduled) != slot:
             return  # the chain has moved past this occurrence: an earlier attempt minted
-        every = int(template["every"]) if template.get("every") else None
+        every = int(template["every"]) if template.get("every", "") != "" else None
         cron = cast("str | None", template.get("cron") or None)
         now = _now_ms()
         when = next_run(max(now, slot), every=every, cron=cron)
@@ -1097,7 +1097,7 @@ class Worker:
         # between the reads above and this write would otherwise come back as an
         # entry with no template behind it, and run once more.
         moved = await self.redis.zadd(self.keys.repeat, {scheduler_id: when}, xx=True, ch=True)
-        if not moved:
+        if moved is None or moved == 0:
             return
         await self._add_scheduled(
             keys=[self.keys.delayed, self.keys.base, self.keys.repeat],

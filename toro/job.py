@@ -334,18 +334,20 @@ class Job:
         return cls(
             id=job_id,
             name=h.get("name", ""),
-            data=json.loads(h["data"]) if h.get("data") else None,
-            opts=JobOptions.from_dict(json.loads(h["opts"])) if h.get("opts") else JobOptions(),
+            data=json.loads(h["data"]) if h.get("data", "") != "" else None,
+            opts=JobOptions.from_dict(json.loads(h["opts"]))
+            if h.get("opts", "") != ""
+            else JobOptions(),
             attempts_made=int(h.get("attemptsMade", 0)),
-            timestamp=int(h["timestamp"]) if h.get("timestamp") else None,
-            returnvalue=json.loads(h["returnvalue"]) if h.get("returnvalue") else None,
+            timestamp=int(h["timestamp"]) if h.get("timestamp", "") != "" else None,
+            returnvalue=json.loads(h["returnvalue"]) if h.get("returnvalue", "") != "" else None,
             failed_reason=h.get("failedReason"),
             cancel_reason=h.get("cancelReason"),
             state=cast("JobState | None", h.get("state")),  # Redis stores it untyped
-            processed_on=int(h["processedOn"]) if h.get("processedOn") else None,
-            finished_on=int(h["finishedOn"]) if h.get("finishedOn") else None,
-            progress=json.loads(h["progress"]) if h.get("progress") else None,
+            processed_on=int(h["processedOn"]) if h.get("processedOn", "") != "" else None,
+            finished_on=int(h["finishedOn"]) if h.get("finishedOn", "") != "" else None,
+            progress=json.loads(h["progress"]) if h.get("progress", "") != "" else None,
             stacktrace=h.get("stacktrace"),
             parent_id=h.get("parentId"),
-            children_ids=json.loads(h["children"]) if h.get("children") else None,
+            children_ids=json.loads(h["children"]) if h.get("children", "") != "" else None,
         )
