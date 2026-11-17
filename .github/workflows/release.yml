@@ -2,21 +2,33 @@ name: Release
 
 # A version tag (v*) builds and publishes to PyPI via trusted publishing (OIDC)
 # - no API tokens stored. The publish job runs in the `pypi` environment, which
-# must match the trusted publisher registered on PyPI.
+# must match the trusted publisher registered on PyPI. A manual run is accepted only
+# from a v* tag: the build refuses any other ref before anything is uploaded.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
-# Nothing here needs to write to the repository; the publish job asks for the one
-# permission it does need (id-token) for itself.
+# Nothing here writes to the repository except the release job, which asks for
+# contents: write for itself; the build and publish jobs ask for their OIDC scopes.
 permissions:
   contents: read
+
+# One release at a time, and a running one is never cancelled: a publish stopped
+# halfway leaves PyPI and the GitHub release disagreeing.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write             # OIDC token for Sigstore keyless signing
+      attestations: write         # persist the build provenance attestation
+      artifact-metadata: write    # create the artifact storage record that backs the attestation
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,26 +37,47 @@ jobs:
           persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # This job holds an OIDC token; a cache restored here could have been
+          # written by any workflow run on the repository.
+          enable-cache: false
       - name: Build sdist + wheel
         run: uv build
-      # The tag starts the release and the manifest supplies the version; nothing
-      # else makes them agree. A PyPI upload cannot be taken back, so a mismatch has
-      # to fail here, while failing is still free. The tag arrives through the
-      # environment, never interpolated into the script.
-      - name: Refuse a tag that does not match the version built
-        if: startsWith(github.ref, 'refs/tags/v')
+      # The ref arrives through the environment, never interpolated into the script.
+      - name: Refuse a ref that is not the tag of the version built
         env:
-          TAG: ${{ github.ref_name }}
+          REF: ${{ github.ref }}
+        run: sh .github/scripts/check-release-tag.sh
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+      # One attestation covers both files. It goes on the GitHub release twice: the
+      # Sigstore bundle as actions/attest wrote it (certificate and Rekor inclusion
+      # proof, for `gh attestation verify --bundle`), and its DSSE envelope as an
+      # in-toto JSON Lines bundle (for slsa-verifier).
+      - name: Write the provenance sidecars
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          built=$(ls dist/*.whl | head -1 | awk -F- '{print $2}')
-          if [ "$built" != "${TAG#v}" ]; then
-            echo "tag $TAG does not match the built version $built" >&2
-            exit 1
-          fi
+          set -eu
+          mkdir provenance
+          sdist=$(basename dist/*.tar.gz .tar.gz)
+          cp "$BUNDLE_PATH" "provenance/$sdist.sigstore.json"
+          jq -c '.dsseEnvelope' "$BUNDLE_PATH" > "provenance/$sdist.intoto.jsonl"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provenance
+          path: provenance/
+          if-no-files-found: error
 
   publish:
     needs: build
@@ -69,3 +102,28 @@ jobs:
         # PEP 740 attestations that every file of this package currently carries.
         # A release tag is therefore the strongest pin available for it.
         uses: pypa/gh-action-pypi-publish@v1.14.3
+
+  # After PyPI accepted the files, so a GitHub release never announces a version
+  # that is not installable.
+  github-release:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write             # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: provenance
+          path: provenance/
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/*.whl dist/*.tar.gz provenance/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
