@@ -15,6 +15,7 @@ Each worker records {enq, proc, fin} per job into a Redis list (reliable across
 processes, unlike pub/sub timing); the harness drains it once at the end.
 
 Run, e.g.:
+    REDIS_URL=redis://localhost:6391 \
     uv run python tests/load/harness.py --rate 2000 --workers 4 --concurrency 50 \
         --duration 20 --warmup 5 --work-ms 0
 Sweep λ across runs to plot the throughput-vs-latency curve and find the knee.
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import multiprocessing as mp
+import os
 import time
 
 import redis.asyncio as aioredis
@@ -204,8 +206,10 @@ def main() -> None:
     ap.add_argument("--warmup", type=float, default=5, help="warm-up window to discard (s)")
     ap.add_argument("--work-ms", type=float, default=0, help="simulated per-job I/O work (ms)")
     ap.add_argument("--payload-bytes", type=int, default=64)
-    ap.add_argument("--url", default="redis://localhost:6379")
+    ap.add_argument("--url", default=os.environ.get("REDIS_URL"), help="default: $REDIS_URL")
     args = ap.parse_args()
+    if not args.url:
+        ap.error("set REDIS_URL to a Redis you own, e.g. redis://localhost:6391")
 
     procs = [
         mp.Process(target=_worker_entry, args=(args.url, args.concurrency, args.work_ms))

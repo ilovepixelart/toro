@@ -89,8 +89,8 @@ Keep-forever stays available, as an explicit choice.
   longer be read back. Awaiting a result while the job runs is unaffected.
 - **The dashboard.** matador's completed and failed tabs show at most the
   retained jobs. Metrics are separate counters and are unaffected.
-- **Silent skips.** Integration tests skip with no Redis on `localhost:6379`;
-  every gate must show zero skips.
+- **Silent skips.** Integration tests skip when `REDIS_URL` is unset or no Redis
+  answers on it; every gate must show zero skips.
 
 ## Decisions
 

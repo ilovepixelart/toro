@@ -5,6 +5,7 @@ it is the case that has to be proved rather than assumed. This runs the previous
 minor from PyPI and the working tree side by side, in both orders, and checks that
 every job is processed exactly once and that neither side refuses the other.
 
+    export REDIS_URL=redis://localhost:6391                   # a Redis you own
     uv run python tests/compat/rolling_upgrade.py             # against the default
     uv run python tests/compat/rolling_upgrade.py 0.11.0      # against a given version
 
@@ -15,13 +16,15 @@ first time and nothing afterwards.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 
 PREVIOUS = sys.argv[1] if len(sys.argv) > 1 else "0.11.0"
-URL = "redis://localhost:6379"
+# No default: port 6379 on a developer machine may be another project's Redis.
+URL = os.environ.get("REDIS_URL", "")
 PREFIX = "rolling"
 QUEUE = "upgrade"
 
@@ -139,6 +142,9 @@ def _round(first: tuple[str, str], second: tuple[str, str], count: int) -> dict:
 
 
 def main() -> int:
+    if not URL:
+        print("set REDIS_URL to a Redis you own, e.g. redis://localhost:6391", file=sys.stderr)
+        return 2
     published, working = _venv(PREVIOUS), sys.executable
     count = 25
 

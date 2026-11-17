@@ -1,6 +1,6 @@
 """Tests for the reliability core: locks, token guard, stalled recovery.
 
-Needs a Redis on localhost:6379. Uses an isolated prefix and cleans up after
+Needs the Redis REDIS_URL names. Uses an isolated prefix and cleans up after
 itself, so it won't touch other data.
 """
 

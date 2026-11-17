@@ -2,8 +2,11 @@
 
 Layout: tests/unit (pure, no I/O) · tests/integration (Redis-backed) · tests/load.
 Tests are auto-marked by their folder, so `pytest -m unit` runs the fast layer and
-`-m integration` the Redis layer. Integration/load tests skip cleanly when no Redis
-is reachable on localhost:6379.
+`-m integration` the Redis layer. The Redis layers (integration, load, perf) use the
+Redis named by the REDIS_URL environment variable and skip when it is unset; there is
+no default, since port 6379 on a developer machine may belong to another project and
+these tests write to it. Integration/load tests also skip when that Redis does not
+answer.
 
 The load layer runs CI-sized volumes by default; set TORO_LOAD_SCALE to multiply
 the dataset sizes for a real volume run (e.g. `TORO_LOAD_SCALE=10 pytest -m load -s`
@@ -18,15 +21,22 @@ import contextlib
 import os
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import pytest
 
 from toro import Queue, Worker
 
 PREFIX = "torotest"
+# The one place the suite learns which Redis to write to: opt-in, never defaulted.
+REDIS_URL = os.environ.get("REDIS_URL", "")
+_REDIS_LAYERS = ("integration", "load", "perf")
+_NO_REDIS_URL = pytest.mark.skip(
+    reason="set REDIS_URL to a Redis you own, e.g. redis://localhost:6391"
+)
 
 
-# ---- pyramid wiring: mark by folder, skip Redis layers when Redis is down --------
+# ---- pyramid wiring: mark by folder, skip Redis layers without REDIS_URL or Redis --
 
 
 def pytest_collection_modifyitems(config, items):
@@ -40,6 +50,9 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.load)
         elif "/perf/" in path:
             item.add_marker(pytest.mark.perf)
+        # Skipped before setup, so no fixture of a Redis layer ever builds a client.
+        if not REDIS_URL and any(item.get_closest_marker(layer) for layer in _REDIS_LAYERS):
+            item.add_marker(_NO_REDIS_URL)
 
 
 _redis_up: bool | None = None
@@ -51,7 +64,7 @@ def _redis_reachable() -> bool:
         try:
             import redis as _sync
 
-            _sync.from_url("redis://localhost:6379").ping()
+            _sync.from_url(REDIS_URL).ping()
             _redis_up = True
         except Exception:
             _redis_up = False
@@ -64,7 +77,36 @@ def _require_redis(request):
         "load"
     )
     if needs_redis and not _redis_reachable():
-        pytest.skip("needs a Redis on localhost:6379")
+        pytest.skip(f"no Redis answers on REDIS_URL ({REDIS_URL})")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _default_to_redis_url():
+    """A Queue or Worker built without `url` would reach the library default,
+    localhost:6379, whatever REDIS_URL says: every test's default is REDIS_URL.
+
+    A MonkeyPatch of its own, not a test's: a test that calls
+    `monkeypatch.undo()` must not put the library default back.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        if REDIS_URL:
+            for cls in (Queue, Worker):
+                patch.setattr(cls, "__init__", _with_url(cls.__init__))
+        yield
+
+
+def _with_url(init):
+    def with_url(self, *args, **kw):
+        kw.setdefault("url", REDIS_URL)
+        init(self, *args, **kw)
+
+    return with_url
+
+
+@pytest.fixture
+def redis_url() -> str:
+    """The Redis the Redis layers run against (REDIS_URL), for a client of its own."""
+    return REDIS_URL
 
 
 @pytest.fixture(scope="session")
@@ -287,7 +329,15 @@ def run_until():
 # ---- TCP proxies to Redis that lose a reply or a link, for the re-send paths ----
 
 
-async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379, command: bytes = b""):
+def _upstream(port: int | None) -> tuple[str, int]:
+    """Where a proxy forwards to: the given local port, or the REDIS_URL server."""
+    if port is not None:
+        return "localhost", port
+    url = urlsplit(REDIS_URL)
+    return url.hostname or "localhost", url.port or 6379
+
+
+async def _swallow_first_reply_to(sha: str, upstream_port: int | None = None, command: bytes = b""):
     """A TCP proxy to Redis that drops the reply to the first EVALSHA of `sha`:
     the command runs on the server, and the client never hears back.
 
@@ -321,7 +371,7 @@ async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379, command: 
             writer.close()
 
     async def handle(client_reader, client_writer):
-        server_reader, server_writer = await asyncio.open_connection("localhost", upstream_port)
+        server_reader, server_writer = await asyncio.open_connection(*_upstream(upstream_port))
         state: dict[str, bool] = {}
         await asyncio.gather(
             pipe(client_reader, server_writer, state, True),
@@ -331,7 +381,7 @@ async def _swallow_first_reply_to(sha: str, upstream_port: int = 6379, command: 
     return await asyncio.start_server(handle, "localhost", 0)
 
 
-async def _drop_link_after_first(sha: str, upstream_port: int = 6379):
+async def _drop_link_after_first(sha: str, upstream_port: int | None = None):
     """A TCP proxy to Redis that, for the first EVALSHA of `sha`, lets the command
     through and then cuts the client's connection before the reply reaches it: the
     command ran, and the client sees a dropped connection instead of an answer."""
@@ -355,7 +405,7 @@ async def _drop_link_after_first(sha: str, upstream_port: int = 6379):
             writer.close()
 
     async def handle(client_reader, client_writer):
-        server_reader, server_writer = await asyncio.open_connection("localhost", upstream_port)
+        server_reader, server_writer = await asyncio.open_connection(*_upstream(upstream_port))
         state: dict[str, bool] = {}
         await asyncio.gather(
             pipe(client_reader, server_writer, state, True),
