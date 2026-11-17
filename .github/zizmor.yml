@@ -8,3 +8,9 @@ rules:
         # attestations that every published file of this package carries.
         pypa/gh-action-pypi-publish: ref-pin
         "*": hash-pin
+  dangerous-triggers:
+    ignore:
+      # workflow_run re-scores after a Release run. The job checks out the default
+      # branch, runs only the Scorecard action and its SARIF upload, and reads
+      # nothing from the triggering run (no artifacts, no head ref or branch name).
+      - scorecard.yaml
