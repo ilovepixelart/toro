@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in toro is not working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not use this form for security issues. Report those privately via a [GitHub Security Advisory](https://github.com/ilovepixelart/toro/security/advisories/new); see SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, and what went wrong? Include the traceback and any worker log lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: For example, the state a job should have reached, when a retry or a schedule should have fired, or the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The producer and worker code, the job options, and the order of calls that triggers the bug.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: toro-queue, Python, redis-py, Redis server, and OS
+      placeholder: "toro-queue 1.1.1, Python 3.13.9, redis-py 6.4.0, Redis 7.4, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Concurrency, number of workers and processes, a managed or clustered Redis, sync or async processors, and so on.

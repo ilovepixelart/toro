@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an idea for toro
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is the problem or missing behavior?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: For example, a new job option, `Queue` or `Worker` method, event, or flow behavior.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, workarounds, or existing options you have tried.
