@@ -1,12 +1,24 @@
-# Raises the commit pins in .github/workflows. Pinning an action to a commit is the
-# only way to pin it immutably, and it also freezes that action's own fixes, so the
-# pin needs something to raise it: Dependabot rewrites the hash and the `# vX.Y.Z`
-# comment beside it together.
 version: 2
 updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Version updates only; security updates are never delayed.
+    cooldown:
+      semver-major-days: 7
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    commit-message:
-      prefix: ci
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
