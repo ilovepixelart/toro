@@ -105,6 +105,9 @@ ignore = [
 # The compatibility proof exists to run two interpreters against one Redis, so the
 # subprocess rules have nothing to tell it: the executables are ones it just built.
 "tests/compat/**" = ["S603", "S607"]
+# The wheel layer builds the package and the environments it installs into, then runs
+# their interpreters: every executable is uv, resolved on PATH, or one it just created.
+"tests/wheel/**" = ["S603"]
 "bench/**" = ["ANN", "D", "T201", "S311", "INP001", "PLC0415", "ARG"]
 "examples/**" = ["ANN", "D", "T201", "INP001", "ARG"]
 
@@ -116,8 +119,9 @@ asyncio_mode = "auto"
 # Each test gets its own event loop, which is pytest-asyncio's documented default.
 asyncio_default_fixture_loop_scope = "function"
 # The test pyramid, by marker. Run a layer with `pytest -m unit` (fast, no Redis),
-# `-m integration` (needs Redis), or `-m load` (slow). conftest auto-marks by folder.
-addopts = "--strict-markers --import-mode=importlib -m 'not perf' -p pytester"
+# `-m integration` (needs Redis), `-m load` (slow), or `-m wheel` (the built wheel,
+# installed beside the published release). conftest auto-marks by folder.
+addopts = "--strict-markers --import-mode=importlib -m 'not perf and not wheel' -p pytester"
 # A coroutine nobody awaited is a bug, not a warning: `lambda: counts() == 2` compares
 # a coroutine to an int, which is always false, and a poll on it would never hold.
 filterwarnings = ["error::RuntimeWarning"]
@@ -126,6 +130,7 @@ markers = [
     "integration: Redis-backed tests of real state transitions",
     "load: throughput / scalability tests (slow; opt-in)",
     "perf: the perf matrix's own guard (slow; opt-in)",
+    "wheel: the built wheel installed in a fresh environment, against Redis (opt-in)",
 ]
 
 [tool.coverage.run]

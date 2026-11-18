@@ -163,11 +163,55 @@ jobs:
       - name: Tests (unit + integration)
         run: uv run --no-sync pytest -m "unit or integration"
 
+  wheel:
+    # The unit and integration layers import the source tree. This one builds the
+    # wheel, installs it into a fresh environment outside the checkout, and runs the
+    # consumer scenarios in tests/wheel against it and against the release that
+    # tests/wheel/allowlist.json names, which must agree except where it says.
+    name: Installed wheel (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    permissions:
+      contents: read
+    # The Redis-backed layers run only against the Redis REDIS_URL names: the job's own.
+    env:
+      REDIS_URL: redis://localhost:6379
+    services:
+      redis:
+        image: redis:7.4.12-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Installed wheel against the published release
+        run: uv run pytest -m wheel
+
   # The one check the branch rules require: it fails unless every job above
   # succeeded, so adding or renaming a job never needs a ruleset change.
   ci:
     name: CI
-    needs: [check, floors]
+    needs: [check, floors, wheel]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
