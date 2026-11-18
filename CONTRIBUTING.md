@@ -46,15 +46,25 @@ marker):
 | `integration` | `tests/integration` | yes | in CI |
 | `load` | `tests/load` | yes | not in CI: `uv run pytest -m load` |
 | `perf` | `tests/perf` | yes | excluded by default; CI runs it as its own step: `uv run pytest -m perf` |
+| `wheel` | `tests/wheel` | yes | excluded by default; CI runs it as its own job: `uv run pytest -m wheel` |
 
-`-m unit` is fast and needs nothing running. The integration, load and perf
-layers skip when `REDIS_URL` is unset ("set REDIS_URL to a Redis you own"), and
-integration and load also skip when no Redis answers on it, so a green run
+`-m unit` is fast and needs nothing running. The integration, load, perf and
+wheel layers skip when `REDIS_URL` is unset ("set REDIS_URL to a Redis you own"),
+and integration, load and wheel also skip when no Redis answers on it, so a green run
 without `REDIS_URL` has not run them. The scripts in `tests/load/harness.py`,
 `tests/perf/harness.py` and `tests/compat/rolling_upgrade.py` read the same
 variable and refuse to start without it.
 CI also runs the unit and integration layers against the oldest Redis and
 redis-py the project supports.
+
+The `wheel` layer tests what a user installs rather than the source tree. It
+builds the wheel with `uv build`, installs it into a fresh virtual environment
+outside the repository, and runs the consumer scenarios in
+`tests/wheel/scenarios.py` there. It runs the same scenarios against the release
+`tests/wheel/allowlist.json` names, installed from PyPI, and fails on any
+difference that file does not list. A pull request that changes user-visible
+behavior adds an entry with its number; a release moves `baseline` forward and
+empties the list. It needs network access to install the release.
 
 ## Making a change
 

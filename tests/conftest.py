@@ -1,12 +1,13 @@
 """Shared test harness for the toro pyramid.
 
-Layout: tests/unit (pure, no I/O) · tests/integration (Redis-backed) · tests/load.
+Layout: tests/unit (pure, no I/O) · tests/integration (Redis-backed) · tests/load
+· tests/wheel (the built wheel, installed in a fresh environment).
 Tests are auto-marked by their folder, so `pytest -m unit` runs the fast layer and
-`-m integration` the Redis layer. The Redis layers (integration, load, perf) use the
+`-m integration` the Redis layer. The Redis layers (integration, load, perf, wheel) use the
 Redis named by the REDIS_URL environment variable and skip when it is unset; there is
 no default, since port 6379 on a developer machine may belong to another project and
-these tests write to it. Integration/load tests also skip when that Redis does not
-answer.
+these tests write to it. Integration/load/wheel tests also skip when that Redis does
+not answer.
 
 The load layer runs CI-sized volumes by default; set TORO_LOAD_SCALE to multiply
 the dataset sizes for a real volume run (e.g. `TORO_LOAD_SCALE=10 pytest -m load -s`
@@ -30,7 +31,7 @@ from toro import Queue, Worker
 PREFIX = "torotest"
 # The one place the suite learns which Redis to write to: opt-in, never defaulted.
 REDIS_URL = os.environ.get("REDIS_URL", "")
-_REDIS_LAYERS = ("integration", "load", "perf")
+_REDIS_LAYERS = ("integration", "load", "perf", "wheel")
 _NO_REDIS_URL = pytest.mark.skip(
     reason="set REDIS_URL to a Redis you own, e.g. redis://localhost:6391"
 )
@@ -50,6 +51,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.load)
         elif "/perf/" in path:
             item.add_marker(pytest.mark.perf)
+        elif "/wheel/" in path:
+            item.add_marker(pytest.mark.wheel)
         # Skipped before setup, so no fixture of a Redis layer ever builds a client.
         if not REDIS_URL and any(item.get_closest_marker(layer) for layer in _REDIS_LAYERS):
             item.add_marker(_NO_REDIS_URL)
@@ -73,8 +76,8 @@ def _redis_reachable() -> bool:
 
 @pytest.fixture(autouse=True)
 def _require_redis(request):
-    needs_redis = request.node.get_closest_marker("integration") or request.node.get_closest_marker(
-        "load"
+    needs_redis = any(
+        request.node.get_closest_marker(layer) for layer in ("integration", "load", "wheel")
     )
     if needs_redis and not _redis_reachable():
         pytest.skip(f"no Redis answers on REDIS_URL ({REDIS_URL})")

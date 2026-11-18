@@ -1,0 +1,38 @@
+{
+  "baseline": "1.1.1",
+  "changes": [
+    {
+      "scenario": "distribution_metadata",
+      "key": "classifiers",
+      "pr": 157,
+      "change": "Python 3.14 is a supported version: the classifier is added",
+      "published": [
+        "Development Status :: 5 - Production/Stable",
+        "Framework :: AsyncIO",
+        "Intended Audience :: Developers",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Topic :: Software Development :: Libraries",
+        "Topic :: System :: Distributed Computing",
+        "Typing :: Typed"
+      ],
+      "candidate": [
+        "Development Status :: 5 - Production/Stable",
+        "Framework :: AsyncIO",
+        "Intended Audience :: Developers",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+        "Topic :: Software Development :: Libraries",
+        "Topic :: System :: Distributed Computing",
+        "Typing :: Typed"
+      ]
+    }
+  ]
+}
